@@ -9,8 +9,7 @@ Frontend repo: https://github.com/nik-avadhoot/quote-gen-fe
 ## Structure
 
 ```
-├── server.py                     # Flask app — all routes
-├── api/index.py                  # Vercel WSGI entry point
+├── server.py                     # Flask app — all routes, and the Vercel entry point
 ├── vercel.json                   # Routes every path to the Flask app
 ├── requirements.txt              # Pinned Python dependencies
 ├── schema.sql                    # SQLite schema (design reference — unused, see below)
@@ -37,17 +36,24 @@ python server.py            # → http://localhost:3001
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `CORS_ORIGINS` | Production | Comma-separated allowed browser origins, e.g. `https://quote-gen-fe.vercel.app`. Defaults to the local Vite dev server when unset. |
+| `CORS_ORIGINS` | Optional | Comma-separated allowed browser origins. Defaults to `https://quote-gen-fe.vercel.app` plus the local Vite dev server. Set it to override — e.g. to add a custom domain or a preview URL. |
 
 ## Deploying to Vercel
 
-Import this repo — the Python runtime is detected automatically. `vercel.json`
-rewrites every path to `api/index.py`, which exposes the Flask `app` as a WSGI
-callable, so Flask's own routing table handles the URL.
+Import this repo — no configuration needed. `vercel.json` builds `server.py`
+with `@vercel/python` and routes every path to it.
 
-Set `CORS_ORIGINS` to the deployed frontend URL under Project Settings →
-Environment Variables, then redeploy. Verify with `GET /health` — it must report
-`"template": true`.
+Note the config uses `builds`/`routes` rather than `rewrites`. A `rewrite`
+*replaces* the request path, so the Flask app would receive the rewrite
+destination instead of `/health` or `/export` and match no route. `routes`
+hands the WSGI app the original path.
+
+The default CORS origins already cover `https://quote-gen-fe.vercel.app`. Set
+`CORS_ORIGINS` under Project Settings → Environment Variables only if the
+frontend lives somewhere else — a custom domain, or a preview deployment, which
+gets its own unique `*.vercel.app` domain.
+
+Verify with `GET /health` — it must report `"template": true`.
 
 Note: Vercel Hobby caps function execution at 10s. Loading and saving the 77 KB
 template fits comfortably, but a cold start plus that work can approach the

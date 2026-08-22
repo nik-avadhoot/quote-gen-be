@@ -42,7 +42,11 @@ app = Flask(__name__)
 
 # Allowed browser origins. In production set CORS_ORIGINS to the deployed
 # frontend URL(s), comma-separated. Falls back to the local Vite dev server.
-DEFAULT_ORIGINS = "http://localhost:5173,http://127.0.0.1:5173"
+DEFAULT_ORIGINS = ",".join([
+    "https://quote-gen-fe.vercel.app",   # production frontend
+    "http://localhost:5173",             # Vite dev server
+    "http://127.0.0.1:5173",
+])
 CORS_ORIGINS = [
     o.strip()
     for o in os.environ.get("CORS_ORIGINS", DEFAULT_ORIGINS).split(",")
@@ -100,24 +104,6 @@ def health():
         "template": os.path.exists(TEMPLATE_PATH),
         "path":     TEMPLATE_PATH,
     })
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# ROUTE: catch-all  — TEMPORARY diagnostic, reports the path Flask receives
-# ═══════════════════════════════════════════════════════════════════════════════
-
-@app.route("/", defaults={"unmatched": ""})
-@app.route("/<path:unmatched>")
-def _debug_catch_all(unmatched):
-    from flask import request as _rq
-    return jsonify({
-        "note":        "no route matched",
-        "path":        _rq.path,
-        "script_root": _rq.script_root,
-        "full_path":   _rq.full_path,
-        "url":         _rq.url,
-        "known":       sorted(str(r) for r in app.url_map.iter_rules()),
-    }), 404
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
