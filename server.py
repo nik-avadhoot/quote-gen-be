@@ -103,6 +103,24 @@ def health():
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# ROUTE: catch-all  — TEMPORARY diagnostic, reports the path Flask receives
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@app.route("/", defaults={"unmatched": ""})
+@app.route("/<path:unmatched>")
+def _debug_catch_all(unmatched):
+    from flask import request as _rq
+    return jsonify({
+        "note":        "no route matched",
+        "path":        _rq.path,
+        "script_root": _rq.script_root,
+        "full_path":   _rq.full_path,
+        "url":         _rq.url,
+        "known":       sorted(str(r) for r in app.url_map.iter_rules()),
+    }), 404
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # ROUTE: /export  — fill the Excel master template and send it to the browser
 # ═══════════════════════════════════════════════════════════════════════════════
 
