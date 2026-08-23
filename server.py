@@ -27,11 +27,15 @@ Template:
 # ═══════════════════════════════════════════════════════════════════════════════
 import os
 import io
+import secrets
 from datetime import datetime
 
-from flask import Flask, request, send_file, jsonify
+from flask import Flask, request, send_file, jsonify, g
 from flask_cors import CORS
 import openpyxl
+
+from supabase_client import get_supabase, get_supabase_admin
+from auth import require_auth, require_role
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -52,7 +56,7 @@ CORS_ORIGINS = [
     for o in os.environ.get("CORS_ORIGINS", DEFAULT_ORIGINS).split(",")
     if o.strip()
 ]
-CORS(app, origins=CORS_ORIGINS)
+CORS(app, origins=CORS_ORIGINS, allow_headers=["Content-Type", "Authorization"])
 
 # Path to the Excel master template — must sit beside this file
 TEMPLATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -95,14 +99,21 @@ def clear_row(ws, r, cols):
 @app.route("/health", methods=["GET"])
 def health():
     """
-    Frontend calls this on load to confirm the server is running and the
-    Excel template file is present.
-    Returns: { ok: true, template: true/false }
+    Frontend calls this on load to confirm the server is running, the Excel
+    template file is present, and Supabase is reachable.
+    Returns: { ok: true, template: true/false, supabase: true/false }
     """
+    try:
+        get_supabase()
+        supabase_ok = True
+    except Exception:
+        supabase_ok = False
+
     return jsonify({
         "ok":       True,
         "template": os.path.exists(TEMPLATE_PATH),
         "path":     TEMPLATE_PATH,
+        "supabase": supabase_ok,
     })
 
 
@@ -111,6 +122,7 @@ def health():
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @app.route("/export", methods=["POST"])
+@require_auth
 def export_xlsx():
     """
     Receives the complete quote data from the frontend, fills the Excel
@@ -366,6 +378,299 @@ def export_xlsx():
             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         ),
     )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ROUTES: /auth/*  — login / refresh / logout for the frontend.
+# The frontend never talks to Supabase directly; these are its only path to
+# an authenticated session.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _fetch_profile_or_none(user_id):
+    try:
+        resp = (
+            get_supabase_admin()
+            .table("profiles")
+            .select("*")
+            .eq("id", user_id)
+            .single()
+            .execute()
+        )
+        return resp.data
+    except Exception:
+        return None
+
+
+@app.route("/auth/login", methods=["POST"])
+def auth_login():
+    data = request.get_json(force=True) or {}
+    email = (data.get("email") or "").strip()
+    password = data.get("password") or ""
+    if not email or not password:
+        return jsonify({"error": "Email and password are required"}), 400
+
+    try:
+        auth_resp = get_supabase().auth.sign_in_with_password(
+            {"email": email, "password": password}
+        )
+    except Exception:
+        return jsonify({"error": "Invalid email or password"}), 401
+
+    session, user = auth_resp.session, auth_resp.user
+    if not session or not user:
+        return jsonify({"error": "Invalid email or password"}), 401
+
+    profile = _fetch_profile_or_none(user.id)
+    if not profile:
+        return jsonify({"error": "No profile found for this account"}), 401
+    if not profile.get("active", False):
+        return jsonify({"error": "Account is deactivated"}), 403
+
+    return jsonify({
+        "access_token": session.access_token,
+        "refresh_token": session.refresh_token,
+        "expires_at": session.expires_at,
+        "profile": {**profile, "email": user.email},
+    })
+
+
+@app.route("/auth/refresh", methods=["POST"])
+def auth_refresh():
+    data = request.get_json(force=True) or {}
+    refresh_token = data.get("refresh_token")
+    if not refresh_token:
+        return jsonify({"error": "refresh_token is required"}), 400
+
+    try:
+        auth_resp = get_supabase().auth.refresh_session(refresh_token)
+    except Exception:
+        return jsonify({"error": "Invalid or expired refresh token"}), 401
+
+    session, user = auth_resp.session, auth_resp.user
+    if not session or not user:
+        return jsonify({"error": "Invalid or expired refresh token"}), 401
+
+    profile = _fetch_profile_or_none(user.id)
+    if not profile:
+        return jsonify({"error": "No profile found for this account"}), 401
+    if not profile.get("active", False):
+        return jsonify({"error": "Account is deactivated"}), 403
+
+    return jsonify({
+        "access_token": session.access_token,
+        "refresh_token": session.refresh_token,
+        "expires_at": session.expires_at,
+        "profile": {**profile, "email": user.email},
+    })
+
+
+@app.route("/auth/logout", methods=["POST"])
+@require_auth
+def auth_logout():
+    # Best-effort — revoke every refresh token for this session. The frontend
+    # clears its own stored tokens regardless of whether this succeeds.
+    try:
+        get_supabase_admin().auth.admin.sign_out(g.access_token, "global")
+    except Exception:
+        pass
+    return jsonify({"ok": True})
+
+
+@app.route("/auth/me", methods=["PATCH"])
+@require_auth
+def auth_update_me():
+    """
+    Self-service profile edit — a user updating their own display_name/plant.
+    Deliberately does not accept role or active: those stay admin-only via
+    /admin/users/<uid>, even for a user editing their own row.
+    """
+    data = request.get_json(force=True) or {}
+    updates = {}
+    if "display_name" in data:
+        display_name = (data["display_name"] or "").strip()
+        if not display_name:
+            return jsonify({"error": "Display name cannot be empty"}), 400
+        updates["display_name"] = display_name
+    if "plant" in data:
+        updates["plant"] = (data["plant"] or "").strip() or None
+
+    if not updates:
+        return jsonify({"error": "No fields to update"}), 400
+
+    result = (
+        get_supabase_admin()
+        .table("profiles")
+        .update(updates)
+        .eq("id", g.current_user["id"])
+        .execute()
+    )
+    if not result.data:
+        return jsonify({"error": "Could not update profile"}), 400
+    return jsonify({**result.data[0], "email": g.current_user["email"]})
+
+
+@app.route("/auth/change-password", methods=["POST"])
+@require_auth
+def auth_change_password():
+    """
+    Self-service password change — any logged-in user, for their own account.
+    Requires the current password (re-verified via sign_in_with_password) so
+    a leftover valid access token on a shared machine can't be used to lock
+    the real owner out.
+    """
+    data             = request.get_json(force=True) or {}
+    current_password = data.get("current_password") or ""
+    new_password     = data.get("new_password") or ""
+
+    if not current_password or not new_password:
+        return jsonify({"error": "current_password and new_password are required"}), 400
+    if len(new_password) < 8:
+        return jsonify({"error": "New password must be at least 8 characters"}), 400
+
+    try:
+        get_supabase().auth.sign_in_with_password({
+            "email": g.current_user["email"],
+            "password": current_password,
+        })
+    except Exception:
+        return jsonify({"error": "Current password is incorrect"}), 401
+
+    try:
+        get_supabase_admin().auth.admin.update_user_by_id(
+            g.current_user["id"], {"password": new_password}
+        )
+    except Exception as e:
+        return jsonify({"error": f"Could not update password: {e}"}), 400
+
+    return jsonify({"ok": True})
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ROUTES: /admin/users*  — Admin-only user management.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+VALID_ROLES = ("maker", "checker", "admin")
+
+
+@app.route("/admin/users", methods=["GET"])
+@require_auth
+@require_role("admin")
+def list_users():
+    profiles_resp = get_supabase_admin().table("profiles").select("*").execute()
+    profiles_by_id = {p["id"]: p for p in profiles_resp.data}
+
+    auth_users = get_supabase_admin().auth.admin.list_users()
+    result = []
+    for u in auth_users:
+        profile = profiles_by_id.get(u.id)
+        if not profile:
+            continue
+        result.append({
+            **profile,
+            "email": u.email,
+            "last_sign_in_at": u.last_sign_in_at.isoformat() if u.last_sign_in_at else None,
+        })
+    return jsonify({"users": result})
+
+
+@app.route("/admin/users", methods=["POST"])
+@require_auth
+@require_role("admin")
+def create_user():
+    data = request.get_json(force=True) or {}
+    email        = (data.get("email") or "").strip()
+    display_name = (data.get("display_name") or "").strip()
+    role         = data.get("role", "maker")
+    plant        = data.get("plant") or None
+
+    if not email or not display_name:
+        return jsonify({"error": "email and display_name are required"}), 400
+    if role not in VALID_ROLES:
+        return jsonify({"error": f"role must be one of {VALID_ROLES}"}), 400
+
+    generated = not data.get("password")
+    password  = data.get("password") or secrets.token_urlsafe(9)
+
+    try:
+        created = get_supabase_admin().auth.admin.create_user({
+            "email": email,
+            "password": password,
+            "email_confirm": True,
+        })
+    except Exception as e:
+        return jsonify({"error": f"Could not create auth user: {e}"}), 400
+
+    uid = created.user.id
+    try:
+        get_supabase_admin().table("profiles").insert({
+            "id": uid,
+            "display_name": display_name,
+            "role": role,
+            "plant": plant,
+            "active": True,
+        }).execute()
+    except Exception as e:
+        # Don't leave an orphaned auth user with no profile row behind.
+        get_supabase_admin().auth.admin.delete_user(uid)
+        return jsonify({"error": f"Could not create profile: {e}"}), 400
+
+    resp = {
+        "id": uid, "email": email, "display_name": display_name,
+        "role": role, "plant": plant, "active": True,
+    }
+    if generated:
+        resp["temp_password"] = password
+    return jsonify(resp), 201
+
+
+@app.route("/admin/users/<uid>", methods=["PATCH"])
+@require_auth
+@require_role("admin")
+def update_user(uid):
+    data = request.get_json(force=True) or {}
+    updates = {}
+
+    if "display_name" in data:
+        updates["display_name"] = data["display_name"]
+    if "plant" in data:
+        updates["plant"] = data["plant"]
+    if "role" in data:
+        if data["role"] not in VALID_ROLES:
+            return jsonify({"error": f"role must be one of {VALID_ROLES}"}), 400
+        if uid == g.current_user["id"] and data["role"] != "admin":
+            return jsonify({"error": "You cannot change your own role"}), 400
+        updates["role"] = data["role"]
+    if "active" in data:
+        if uid == g.current_user["id"] and not data["active"]:
+            return jsonify({"error": "You cannot deactivate your own account"}), 400
+        updates["active"] = bool(data["active"])
+
+    if not updates:
+        return jsonify({"error": "No fields to update"}), 400
+
+    result = get_supabase_admin().table("profiles").update(updates).eq("id", uid).execute()
+    if not result.data:
+        return jsonify({"error": "User not found"}), 404
+    return jsonify(result.data[0])
+
+
+@app.route("/admin/users/<uid>/reset-password", methods=["POST"])
+@require_auth
+@require_role("admin")
+def reset_password(uid):
+    data = request.get_json(force=True) or {}
+    generated = not data.get("password")
+    password  = data.get("password") or secrets.token_urlsafe(9)
+
+    try:
+        get_supabase_admin().auth.admin.update_user_by_id(uid, {"password": password})
+    except Exception as e:
+        return jsonify({"error": f"Could not reset password: {e}"}), 400
+
+    resp = {"ok": True}
+    if generated:
+        resp["temp_password"] = password
+    return jsonify(resp)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

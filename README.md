@@ -27,7 +27,7 @@ Frontend repo: https://github.com/nik-avadhoot/quote-gen-fe
 ## Local development
 
 ```bash
-python -m venv venv && source venv/bin/activate
+python -m venv venv && venv\Scripts\activate.bat
 pip install -r requirements.txt
 python server.py            # → http://localhost:3001
 ```
