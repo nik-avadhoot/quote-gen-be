@@ -409,8 +409,19 @@ def auth_login():
     if not email or not password:
         return jsonify({"error": "Email and password are required"}), 400
 
+    # Build the client OUTSIDE the credential try/except below. get_supabase()
+    # raises RuntimeError when SUPABASE_URL / SUPABASE_PUBLISHABLE_KEY are
+    # missing; caught alongside a genuine auth failure it surfaced as "Invalid
+    # email or password", which sends you looking at the user record instead of
+    # the deployment. A config fault must never be reportable as bad credentials.
     try:
-        auth_resp = get_supabase().auth.sign_in_with_password(
+        supabase = get_supabase()
+    except RuntimeError as exc:
+        app.logger.error("Supabase client unavailable: %s", exc)
+        return jsonify({"error": "Auth backend is not configured"}), 500
+
+    try:
+        auth_resp = supabase.auth.sign_in_with_password(
             {"email": email, "password": password}
         )
     except Exception:
