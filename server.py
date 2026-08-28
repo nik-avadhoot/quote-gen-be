@@ -238,12 +238,32 @@ def export_xlsx():
     waste_pp = num(f0.get("wastePP"),    5)
     conv_pp  = num(f0.get("convRatePP"), 12.5)  # A1-04: consistent with engine and INIT_SPEC default
 
+    # D-18: BJ3/BJ4 are TWO slots the template offers, not one. Every data row
+    # computes IF(B7="Box",$BJ$3,$BJ$4), so BJ4 governs every Plate/Partition
+    # row. Both were written with the BOX row's interest, so PP rows were costed
+    # at the Box row's rate whenever the two differed.
+    #
+    # Its siblings already take proper pairs — conv_box/conv_pp, waste/waste_pp,
+    # margin/margin_pp. Interest was the one narrowed parameter, and it was
+    # narrowed identically in export/excel.js: two implementations, the same
+    # single mistake.
+    #
+    # ⚠️ THIS FILE AND quote-gen-fe/src/export/excel.js FILL THE SAME TEMPLATE
+    # AND MUST NOT DRIFT (§6 rule 3). excel.js uses `_ppSpec.interest ?? f0.interest`
+    # via the first PP item; this is the same lookup, and num()/_nv() share their
+    # fallback semantics — default only on None/undefined/"". Change one, change
+    # both, or a quote costs differently depending on whether the backend was
+    # reachable.
+    pp_spec = next((i["spec"] for i in items
+                    if (i["spec"].get("rowType") or "Box") in ("Plate", "Part-L", "Part-W")), {})
+    interest_pp = num(pp_spec.get("interest"), interest)
+
     ws_cbb["BA3"] = conv_box
     ws_cbb["BA4"] = conv_pp
     ws_cbb["AY3"] = waste    / 100
     ws_cbb["AY4"] = waste_pp / 100
-    ws_cbb["BJ3"] = interest / 100
-    ws_cbb["BJ4"] = interest / 100
+    ws_cbb["BJ3"] = interest    / 100
+    ws_cbb["BJ4"] = interest_pp / 100
 
     # Freight override (blank = use VLOOKUP matrix)
     freight_override = f0.get("freightOverride", "")
