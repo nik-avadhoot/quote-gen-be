@@ -81,6 +81,22 @@ def num(v, default=0):
         return default
 
 
+def first_set(*vals):
+    """
+    Mirrors JavaScript's `??` chain: returns the first value that is not None.
+
+    NOT the same as falsy-coalescing, and the difference is load-bearing here.
+    `??` falls through on null/undefined ONLY - it does NOT skip "" or 0. A blank
+    string is a real value and stops the chain; num()/_nv() then map it to the
+    default. Using `or` (Python's falsy coalesce) would skip "" AND skip a
+    legitimate 0, and several sectors set wastePP/convRatePP to 0.
+
+    Exists so the chains below can mirror export/excel.js operator-for-operator.
+    See the porting hazard recorded in the register against D-27.
+    """
+    return next((v for v in vals if v is not None), None)
+
+
 def set_val(ws, addr, val):
     """Set a worksheet cell value, preserving its existing style."""
     ws[addr].value = val
@@ -235,18 +251,27 @@ def export_xlsx():
     margin   = num(f0.get("margin"),     8)
     waste    = num(f0.get("waste"),      5)
     conv_box = num(f0.get("convRate"),   7)
-    waste_pp = num(f0.get("wastePP"),    5)
-    conv_pp  = num(f0.get("convRatePP"), 12.5)  # A1-04: consistent with engine and INIT_SPEC default
 
     # D-18: BJ3/BJ4 are TWO slots the template offers, not one. Every data row
     # computes IF(B7="Box",$BJ$3,$BJ$4), so BJ4 governs every Plate/Partition
     # row. Both were written with the BOX row's interest, so PP rows were costed
     # at the Box row's rate whenever the two differed.
     #
-    # Its siblings already take proper pairs — conv_box/conv_pp, waste/waste_pp,
-    # margin/margin_pp. Interest was the one narrowed parameter, and it was
-    # narrowed identically in export/excel.js: two implementations, the same
-    # single mistake.
+    # ⚠️ D-27 CORRECTS THIS COMMENT. It used to claim the siblings "already
+    # take proper pairs — conv_box/conv_pp, waste/waste_pp, margin/margin_pp", so
+    # that interest was the ONE narrowed parameter. That was FALSE for waste and
+    # conv, and the false claim is what stopped the defect being found with D-18.
+    #
+    # They took a pair of SLOTS but filled the PP slot from f0, the BOX row.
+    # useQuoteActions.js A1-02 writes a row-level override only to sp.wastePP /
+    # sp.convRatePP ON THE PP ROW ITSELF; a Box row's wastePP is never assigned
+    # one. So the PP slot held the profile default UNCONDITIONALLY — not merely
+    # when the two disagreed. Not the wrong row sometimes: a field that never
+    # carries an override.
+    #
+    # Only MARGIN was a genuine pair. Both exporters read the payload-level
+    # marginPP, and the template gives margin a per-row column (BM6 "Margin %")
+    # which waste, conv and interest deliberately do not have.
     #
     # ⚠️ THIS FILE AND quote-gen-fe/src/export/excel.js FILL THE SAME TEMPLATE
     # AND MUST NOT DRIFT (§6 rule 3). excel.js uses `_ppSpec.interest ?? f0.interest`
@@ -257,6 +282,14 @@ def export_xlsx():
     pp_spec = next((i["spec"] for i in items
                     if (i["spec"].get("rowType") or "Box") in ("Plate", "Part-L", "Part-W")), {})
     interest_pp = num(pp_spec.get("interest"), interest)
+    # D-27: waste_pp/conv_pp derive from the SAME pp_spec, mirroring
+    # export/excel.js:265,267 operator-for-operator. first_set() reproduces `??`
+    # exactly — fall through on None only, never on "" — because num() and _nv()
+    # both map "" to the default and `or` would additionally swallow a real 0.
+    waste_pp = num(first_set(pp_spec.get("wastePP"), pp_spec.get("waste"),
+                             f0.get("wastePP"), f0.get("waste")), 5)
+    conv_pp  = num(first_set(pp_spec.get("convRatePP"),
+                             f0.get("convRatePP")), 12.5)
 
     ws_cbb["BA3"] = conv_box
     ws_cbb["BA4"] = conv_pp
