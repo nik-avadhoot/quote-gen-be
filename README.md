@@ -32,6 +32,36 @@ pip install -r requirements.txt
 python server.py            # → http://localhost:3001
 ```
 
+### ⚠️ OPEN QUESTION — a running process cannot be identified, so backend verification is unfalsifiable
+
+**Read this before verifying any backend change.**
+
+Nothing exposed by a running server says *which code it is running*:
+
+* the startup banner prints `v2.0` — a **hardcoded constant**, unchanged across every commit
+* `/health` returns `ok`, `template`, `path`, `supabase` — **no version, no commit SHA**
+* there is no `__version__` anywhere in the codebase
+* `server.py` ends in `app.run(port=3001, debug=False)` — **the reloader is OFF**, so a running
+  process is frozen at whatever it loaded at startup and never picks up an edit on disk
+
+**The cost, stated plainly: without a version signal, *"I restarted it"* is an assertion nobody can
+check** — not the person who said it, and not a reviewer afterwards. A verification run against a
+stale process is indistinguishable from one against a fixed process, and both produce a
+confident-looking result.
+
+This is not hypothetical. During the 2026-08 defect pass a backend fix was about to be tested
+against a process that could not have contained it — the fix was uncommitted on disk and the
+reloader was off — and the test would have returned a clean "no difference" that read as evidence
+of a defect in correct code. It was caught by reading the `app.run` line, not by anything the server
+reported.
+
+**Suggested fix, trivial and NOT RULED:** put a commit SHA or build stamp in `/health` and in the
+startup banner. Left open deliberately — it is small but carries a design question (where the
+stamp comes from in a Vercel build versus a local run), and it was out of scope for the pass that
+found it.
+
+Until then: **restart before verifying, and treat every backend result as provisional on that.**
+
 ## Environment
 
 | Variable | Required | Description |
