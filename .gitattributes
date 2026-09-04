@@ -1,0 +1,5 @@
+# Migration files are byte-exact reconstructions of the SQL recorded in
+# supabase_migrations.schema_migrations. Their MD5 is verified against remote
+# history, so line endings must never be rewritten on checkout.
+# core.autocrlf=true would otherwise turn LF into CRLF and break that proof.
+supabase/migrations/*.sql text eol=lf
