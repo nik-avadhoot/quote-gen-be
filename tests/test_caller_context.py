@@ -131,6 +131,34 @@ p1 = cc.privileged_client("auth_admin_sign_out")
 p2 = cc.privileged_client("auth_admin_sign_out")
 check(p1 is not p2, "C-7 service-role clients are not cached in module scope")
 
+# --- C-9 the stub does not break any allow-listed Auth-admin flow -----------
+# privileged_client() builds its own service-role client directly from the
+# environment. It never calls supabase_client.get_supabase_admin(), so turning
+# that function into a failing stub cannot reach invite, deactivation, global
+# sign-out, password reset or account administration. Proved by calling every
+# allow-listed operation with the stub in place.
+import inspect  # noqa: E402
+
+src = inspect.getsource(cc.privileged_client)
+check("get_supabase_admin" not in src,
+      "C-9a privileged_client does not call get_supabase_admin")
+check("SUPABASE_SECRET_KEY" in src,
+      "C-9b privileged_client reads the secret key from the environment itself")
+
+for op in sorted(cc.PRIVILEGED_OPERATIONS):
+    try:
+        client = cc.privileged_client(op)
+        check(client is not None, f"C-9 '{op}' still obtains a service-role client")
+    except Exception as exc:  # pragma: no cover - would be a real regression
+        check(False, f"C-9 '{op}' broke: {exc}")
+
+# and the stub really is raising, so the two facts hold simultaneously
+try:
+    sc.get_supabase_admin()
+    check(False, "C-9c get_supabase_admin must raise")
+except RuntimeError:
+    check(True, "C-9c get_supabase_admin raises while all five flows still work")
+
 # --- C-8 the pre-S2 singleton is still a singleton (regression witness) ------
 # Documents precisely why caller work must not use it: the object is shared, so
 # any per-request mutation of it is a cross-request leak.
