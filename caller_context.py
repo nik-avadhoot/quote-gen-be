@@ -50,6 +50,11 @@ PRIVILEGED_OPERATIONS = {
     "auth_admin_sign_out":
         "Supabase Auth admin API - global sign-out on logout/deactivation. "
         "Required so deactivation takes effect before token expiry.",
+    "auth_admin_list_users":
+        "Supabase Auth admin API - email and last-sign-in live in Auth, not in any "
+        "table, so there is no caller-context equivalent. Row VISIBILITY is still "
+        "decided by RLS: the caller reads app_users first, and this only decorates "
+        "rows they were already allowed to see.",
 }
 
 
@@ -115,60 +120,119 @@ def privileged_client(operation: str) -> Client:
     )
 
 
-def resolve_app_user(access_token: str) -> dict | None:
+def get_supabase_anon() -> Client:
     """
-    Resolve the caller's application identity THROUGH RLS.
+    A fresh, unauthenticated client for the Auth endpoints that must run without
+    a caller token: login, refresh, and current-password verification.
 
-    Returns the caller's app_users row, or None when they have no active
-    identity. Because this runs as the caller, the app_users_select policy is
-    what decides visibility - a deactivated user resolves to None on their very
-    next request even while holding an unexpired token, without the backend
-    needing to re-check anything.
+    Also never cached. supabase_client.get_supabase() returns a shared singleton
+    and routes call sign_in_with_password on it, which mutates session state
+    every concurrent request can observe. Use this instead.
     """
-    client = get_supabase_for_caller(access_token)
-    resp = (
-        client.table("app_users")
-        .select("id, display_name, status")
-        .eq("status", "active")
-        .limit(1)
-        .execute()
+    return create_client(
+        _env("SUPABASE_URL"),
+        _env("SUPABASE_PUBLISHABLE_KEY"),
+        options=ClientOptions(auto_refresh_token=False, persist_session=False),
     )
-    rows = resp.data or []
-    return rows[0] if rows else None
 
 
-def caller_capabilities(access_token: str) -> dict:
+# Legacy `profiles.role` is a single column; the approved model expresses the same
+# thing as capabilities (CDM-05). The API keeps reporting a role so the frontend is
+# unchanged, but the DATABASE is the authority and the role is derived, never stored.
+def _derive_role(group_caps: list[str], plant_caps: dict) -> str:
+    if "administer_users" in group_caps:
+        return "admin"
+    for caps in plant_caps.values():
+        if "check_quote" in caps:
+            return "checker"
+    return "maker"
+
+
+def resolve_caller(access_token: str) -> dict | None:
     """
-    Read the caller's own capability grants through RLS.
+    Resolve the caller's application identity and authority THROUGH RLS.
 
-    The grant policies expose a caller their own rows, so this needs no
-    privileged access. Returns {"group": [...], "plant": {plant_id: [...]}}.
+    Returns None when the token maps to no ACTIVE application user. That covers
+    an unrecognised identity and a deactivated one holding a still-valid token:
+    both are refused on the very next request, because `status = 'active'` is
+    part of what the caller is allowed to see and of every capability helper.
+
+    Nothing here is cached. Every field comes from this request's own token.
+
+    The returned shape stays legacy-compatible (`id`, `display_name`, `role`,
+    `plant`, `active`) so the frontend contract is unchanged, but `role` and
+    `plant` are DERIVED from capability grants rather than read from a column.
     """
     client = get_supabase_for_caller(access_token)
+
+    users = (
+        client.table("app_users")
+        .select("id, auth_user_id, display_name, status")
+        .eq("status", "active")
+        .limit(2)
+        .execute()
+    ).data or []
+    # The app_users select policy shows a caller their own row; an administrator
+    # additionally sees everyone, so pick the row that is actually theirs.
+    me = None
+    if len(users) == 1:
+        me = users[0]
+    elif users:
+        auth_uid = _auth_uid(client, access_token)
+        me = next((u for u in users if u.get("auth_user_id") == auth_uid), None)
+    if not me:
+        return None
+
     group_rows = (
         client.table("group_capability_grants")
-        .select("capability_id, status, capabilities(capability_key)")
-        .eq("status", "active")
-        .execute()
+        .select("app_user_id, status, capabilities(capability_key)")
+        .eq("app_user_id", me["id"]).eq("status", "active").execute()
     ).data or []
     plant_rows = (
         client.table("plant_capability_grants")
-        .select("plant_id, status, capabilities(capability_key)")
-        .eq("status", "active")
-        .execute()
+        .select("app_user_id, plant_id, status, capabilities(capability_key), plants(plant_code)")
+        .eq("app_user_id", me["id"]).eq("status", "active").execute()
     ).data or []
 
-    plants: dict = {}
-    for row in plant_rows:
-        key = (row.get("capabilities") or {}).get("capability_key")
-        if key is not None:
-            plants.setdefault(row["plant_id"], []).append(key)
+    group_caps = sorted({
+        (r.get("capabilities") or {}).get("capability_key")
+        for r in group_rows if (r.get("capabilities") or {}).get("capability_key")
+    })
+    plant_caps: dict = {}
+    plant_codes: dict = {}
+    for r in plant_rows:
+        key = (r.get("capabilities") or {}).get("capability_key")
+        if key:
+            plant_caps.setdefault(r["plant_id"], []).append(key)
+        code = (r.get("plants") or {}).get("plant_code")
+        if code:
+            plant_codes[r["plant_id"]] = code
 
     return {
-        "group": sorted(
-            (r.get("capabilities") or {}).get("capability_key")
-            for r in group_rows
-            if (r.get("capabilities") or {}).get("capability_key")
-        ),
-        "plant": plants,
+        "id": me["id"],                       # app identity (bigint), not an auth uuid
+        "auth_user_id": me.get("auth_user_id"),
+        "display_name": me["display_name"],
+        "active": True,                       # non-active never resolves at all
+        "role": _derive_role(group_caps, plant_caps),
+        "plant": next(iter(plant_codes.values()), None),
+        "plants": sorted(plant_codes.values()),
+        "group_capabilities": group_caps,
+        "plant_capabilities": {plant_codes.get(k, str(k)): sorted(v)
+                               for k, v in plant_caps.items()},
     }
+
+
+def _auth_uid(client: Client, access_token: str):
+    try:
+        resp = client.auth.get_user(access_token)
+        return resp.user.id if resp and resp.user else None
+    except Exception:
+        return None
+
+
+def has_group_capability(caller: dict, capability: str) -> bool:
+    return capability in (caller or {}).get("group_capabilities", [])
+
+
+def has_plant_capability(caller: dict, plant_code: str, capability: str) -> bool:
+    return capability in (caller or {}).get("plant_capabilities", {}).get(plant_code, [])

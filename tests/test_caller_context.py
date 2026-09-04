@@ -116,8 +116,9 @@ except cc.PrivilegeError:
 
 check(set(cc.PRIVILEGED_OPERATIONS) == {
         "auth_admin_create_user", "auth_admin_delete_user",
-        "auth_admin_update_user", "auth_admin_sign_out"},
-      "C-6c allow-list contains exactly the four Auth-admin operations")
+        "auth_admin_update_user", "auth_admin_sign_out",
+        "auth_admin_list_users"},
+      "C-6c allow-list contains exactly the five Auth-admin operations")
 check(all(v.strip() for v in cc.PRIVILEGED_OPERATIONS.values()),
       "C-6d every allow-listed operation records why caller context cannot serve it")
 

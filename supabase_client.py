@@ -44,15 +44,23 @@ def get_supabase() -> Client:
 
 
 def get_supabase_admin() -> Client:
-    """Returns a cached secret-key (service role) Supabase client — bypasses RLS."""
-    global _admin_client
-    if _admin_client is None:
-        url = os.environ.get("SUPABASE_URL")
-        key = os.environ.get("SUPABASE_SECRET_KEY")
-        if not url or not key:
-            raise RuntimeError(
-                "SUPABASE_URL and SUPABASE_SECRET_KEY must be set "
-                "(check quote-gen-be/.env)"
-            )
-        _admin_client = create_client(url, key)
-    return _admin_client
+    """
+    REMOVED in S2. Kept as a failing stub so the escape hatch is closed
+    structurally rather than by convention.
+
+    This returned a cached service-role client that bypasses RLS. Any import of
+    it was an unreviewed, unlogged bypass of every access rule in the database,
+    and it was reachable from anywhere in the backend. Service-role access now
+    goes through caller_context.privileged_client(operation), which refuses any
+    operation absent from a small reviewed allow-list and names the reason each
+    one cannot run as the caller.
+
+    Ordinary database work must use caller_context.get_supabase_for_caller(token)
+    so that RLS is the authority.
+    """
+    raise RuntimeError(
+        "get_supabase_admin() was removed in S2. Use "
+        "caller_context.get_supabase_for_caller(access_token) for ordinary work, "
+        "or caller_context.privileged_client('<allow-listed operation>') for the "
+        "few Auth-admin calls that have no caller-context equivalent."
+    )

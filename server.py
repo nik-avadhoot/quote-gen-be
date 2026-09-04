@@ -34,7 +34,12 @@ from flask import Flask, request, send_file, jsonify, g
 from flask_cors import CORS
 import openpyxl
 
-from supabase_client import get_supabase, get_supabase_admin
+from caller_context import (
+    get_supabase_anon,
+    get_supabase_for_caller,
+    privileged_client,
+    resolve_caller,
+)
 from auth import require_auth, require_role
 
 
@@ -120,7 +125,7 @@ def health():
     Returns: { ok: true, template: true/false, supabase: true/false }
     """
     try:
-        get_supabase()
+        get_supabase_anon()
         supabase_ok = True
     except Exception:
         supabase_ok = False
@@ -439,17 +444,17 @@ def export_xlsx():
 # an authenticated session.
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _fetch_profile_or_none(user_id):
+def _identity_or_none(access_token):
+    """
+    Resolve the caller's application identity using THEIR OWN token, through RLS.
+
+    Replaces the previous service-role read of `profiles`. That read bypassed RLS,
+    so identity resolution was the one place the database was not the authority.
+    Returns None for an unrecognised or deactivated identity - the caller cannot
+    tell which, deliberately.
+    """
     try:
-        resp = (
-            get_supabase_admin()
-            .table("profiles")
-            .select("*")
-            .eq("id", user_id)
-            .single()
-            .execute()
-        )
-        return resp.data
+        return resolve_caller(access_token)
     except Exception:
         return None
 
@@ -462,13 +467,13 @@ def auth_login():
     if not email or not password:
         return jsonify({"error": "Email and password are required"}), 400
 
-    # Build the client OUTSIDE the credential try/except below. get_supabase()
+    # Build the client OUTSIDE the credential try/except below. get_supabase_anon()
     # raises RuntimeError when SUPABASE_URL / SUPABASE_PUBLISHABLE_KEY are
     # missing; caught alongside a genuine auth failure it surfaced as "Invalid
     # email or password", which sends you looking at the user record instead of
     # the deployment. A config fault must never be reportable as bad credentials.
     try:
-        supabase = get_supabase()
+        supabase = get_supabase_anon()
     except RuntimeError as exc:
         app.logger.error("Supabase client unavailable: %s", exc)
         return jsonify({"error": "Auth backend is not configured"}), 500
@@ -484,11 +489,10 @@ def auth_login():
     if not session or not user:
         return jsonify({"error": "Invalid email or password"}), 401
 
-    profile = _fetch_profile_or_none(user.id)
+    # Identity is resolved with the token just issued, so RLS decides.
+    profile = _identity_or_none(session.access_token)
     if not profile:
-        return jsonify({"error": "No profile found for this account"}), 401
-    if not profile.get("active", False):
-        return jsonify({"error": "Account is deactivated"}), 403
+        return jsonify({"error": "Account is not active"}), 403
 
     return jsonify({
         "access_token": session.access_token,
@@ -506,7 +510,7 @@ def auth_refresh():
         return jsonify({"error": "refresh_token is required"}), 400
 
     try:
-        auth_resp = get_supabase().auth.refresh_session(refresh_token)
+        auth_resp = get_supabase_anon().auth.refresh_session(refresh_token)
     except Exception:
         return jsonify({"error": "Invalid or expired refresh token"}), 401
 
@@ -514,11 +518,9 @@ def auth_refresh():
     if not session or not user:
         return jsonify({"error": "Invalid or expired refresh token"}), 401
 
-    profile = _fetch_profile_or_none(user.id)
+    profile = _identity_or_none(session.access_token)
     if not profile:
-        return jsonify({"error": "No profile found for this account"}), 401
-    if not profile.get("active", False):
-        return jsonify({"error": "Account is deactivated"}), 403
+        return jsonify({"error": "Account is not active"}), 403
 
     return jsonify({
         "access_token": session.access_token,
@@ -534,7 +536,8 @@ def auth_logout():
     # Best-effort — revoke every refresh token for this session. The frontend
     # clears its own stored tokens regardless of whether this succeeds.
     try:
-        get_supabase_admin().auth.admin.sign_out(g.access_token, "global")
+        privileged_client("auth_admin_sign_out").auth.admin.sign_out(
+            g.access_token, "global")
     except Exception:
         pass
     return jsonify({"ok": True})
@@ -555,22 +558,30 @@ def auth_update_me():
         if not display_name:
             return jsonify({"error": "Display name cannot be empty"}), 400
         updates["display_name"] = display_name
+
+    # CANONICAL CHANGE (CDM-05): plant is no longer a self-editable column. It is a
+    # capability grant, so only an administrator can change it. Reported explicitly
+    # rather than silently ignored.
     if "plant" in data:
-        updates["plant"] = (data["plant"] or "").strip() or None
+        return jsonify({
+            "error": "Plant is assigned by an administrator and cannot be self-edited"
+        }), 403
 
     if not updates:
         return jsonify({"error": "No fields to update"}), 400
 
+    # Runs as the caller. The column grant allows display_name and nothing else, so
+    # even a crafted request cannot reach status or auth_user_id.
     result = (
-        get_supabase_admin()
-        .table("profiles")
+        get_supabase_for_caller(g.access_token)
+        .table("app_users")
         .update(updates)
-        .eq("id", g.current_user["id"])
+        .eq("id", g.caller["id"])
         .execute()
     )
     if not result.data:
         return jsonify({"error": "Could not update profile"}), 400
-    return jsonify({**result.data[0], "email": g.current_user["email"]})
+    return jsonify({**g.caller, **updates, "email": g.current_user["email"]})
 
 
 @app.route("/auth/change-password", methods=["POST"])
@@ -592,7 +603,7 @@ def auth_change_password():
         return jsonify({"error": "New password must be at least 8 characters"}), 400
 
     try:
-        get_supabase().auth.sign_in_with_password({
+        get_supabase_anon().auth.sign_in_with_password({
             "email": g.current_user["email"],
             "password": current_password,
         })
@@ -600,8 +611,8 @@ def auth_change_password():
         return jsonify({"error": "Current password is incorrect"}), 401
 
     try:
-        get_supabase_admin().auth.admin.update_user_by_id(
-            g.current_user["id"], {"password": new_password}
+        privileged_client("auth_admin_update_user").auth.admin.update_user_by_id(
+            g.caller["auth_user_id"], {"password": new_password}
         )
     except Exception as e:
         return jsonify({"error": f"Could not update password: {e}"}), 400
@@ -615,24 +626,173 @@ def auth_change_password():
 
 VALID_ROLES = ("maker", "checker", "admin")
 
+# Legacy `profiles.role` was one column. The approved model expresses the same thing
+# as capability grants (CDM-05), so the API still reports a role but DERIVES it.
+def derive_role(group_caps, plant_caps):
+    if "administer_users" in (group_caps or []):
+        return "admin"
+    for caps in (plant_caps or {}).values():
+        if "check_quote" in caps:
+            return "checker"
+    return "maker"
+
+
+def _read_one_user(client, app_user_id):
+    """Re-read one identity as the caller, shaped like the legacy profile row."""
+    rows = (client.table("app_users")
+            .select("id, auth_user_id, display_name, status")
+            .eq("id", app_user_id).limit(1).execute()).data or []
+    if not rows:
+        return {}
+    u = rows[0]
+    gc = [ (r.get("capabilities") or {}).get("capability_key")
+           for r in (client.table("group_capability_grants")
+                     .select("capabilities(capability_key)")
+                     .eq("app_user_id", app_user_id).eq("status", "active")
+                     .execute()).data or [] ]
+    pc = {}
+    for r in (client.table("plant_capability_grants")
+              .select("capabilities(capability_key), plants(plant_code)")
+              .eq("app_user_id", app_user_id).eq("status", "active")
+              .execute()).data or []:
+        code = (r.get("plants") or {}).get("plant_code")
+        key  = (r.get("capabilities") or {}).get("capability_key")
+        if code:
+            pc.setdefault(code, [])
+            if key:
+                pc[code].append(key)
+    return {
+        "id": u["id"], "display_name": u["display_name"],
+        "active": u["status"] == "active", "status": u["status"],
+        "role": derive_role([c for c in gc if c], pc),
+        "plant": next(iter(pc), None), "plants": sorted(pc),
+    }
+
+
+def _apply_role_and_plant(client, app_user_id, role, plant_code):
+    """
+    Express a role/plant change as capability grants.
+
+    Every statement is an ordinary caller-context write: the grant tables' INSERT
+    and UPDATE policies already require administer_users, so a caller without it
+    is refused by the database rather than by a check here. Revocation sets
+    status='revoked' - grants are never deleted, so the history survives.
+    """
+    caps = (client.table("capabilities").select("id, capability_key").execute()).data or []
+    cap_id = {c["capability_key"]: c["id"] for c in caps}
+
+    if role is not None:
+        want_admin = (role == "admin")
+        existing = (client.table("group_capability_grants")
+                    .select("id, capability_id")
+                    .eq("app_user_id", app_user_id).eq("status", "active")
+                    .eq("capability_id", cap_id["administer_users"]).execute()).data or []
+        if want_admin and not existing:
+            client.table("group_capability_grants").insert({
+                "app_user_id": app_user_id,
+                "capability_id": cap_id["administer_users"],
+                "granted_by": g.caller["id"],
+            }).execute()
+        elif not want_admin and existing:
+            client.table("group_capability_grants").update({
+                "status": "revoked", "revoked_at": "now()", "revoked_by": g.caller["id"],
+            }).eq("id", existing[0]["id"]).execute()
+
+    if plant_code is not None:
+        plants = (client.table("plants").select("id, plant_code").execute()).data or []
+        by_code = {p["plant_code"]: p["id"] for p in plants}
+        if plant_code and plant_code not in by_code:
+            raise ValueError("unknown plant")
+
+        current = (client.table("plant_capability_grants")
+                   .select("id, plant_id").eq("app_user_id", app_user_id)
+                   .eq("status", "active").execute()).data or []
+        for row in current:
+            client.table("plant_capability_grants").update({
+                "status": "revoked", "revoked_at": "now()", "revoked_by": g.caller["id"],
+            }).eq("id", row["id"]).execute()
+
+        if plant_code:
+            wanted = ["plant_access",
+                      "check_quote" if role == "checker" else "make_quote"]
+            client.table("plant_capability_grants").insert([{
+                "app_user_id": app_user_id,
+                "plant_id": by_code[plant_code],
+                "capability_id": cap_id[w],
+                "granted_by": g.caller["id"],
+            } for w in wanted]).execute()
+
 
 @app.route("/admin/users", methods=["GET"])
 @require_auth
 @require_role("admin")
 def list_users():
-    profiles_resp = get_supabase_admin().table("profiles").select("*").execute()
-    profiles_by_id = {p["id"]: p for p in profiles_resp.data}
+    """
+    Administrator visibility is an RLS POLICY, not a service-role bypass.
 
-    auth_users = get_supabase_admin().auth.admin.list_users()
+    The app_users select policy already exposes every row to a caller holding
+    administer_users, so this reads as the caller. Emails and sign-in times are
+    not in the database at all - they live in Supabase Auth - so that one lookup
+    uses the allow-listed Auth-admin client.
+    """
+    client = get_supabase_for_caller(g.access_token)
+
+    users = (
+        client.table("app_users")
+        .select("id, auth_user_id, display_name, status")
+        .execute()
+    ).data or []
+    if not users:
+        return jsonify({"users": []})
+
+    ids = [u["id"] for u in users]
+    group_rows = (
+        client.table("group_capability_grants")
+        .select("app_user_id, capabilities(capability_key)")
+        .in_("app_user_id", ids).eq("status", "active").execute()
+    ).data or []
+    plant_rows = (
+        client.table("plant_capability_grants")
+        .select("app_user_id, capabilities(capability_key), plants(plant_code)")
+        .in_("app_user_id", ids).eq("status", "active").execute()
+    ).data or []
+
+    group_by_user, plant_by_user = {}, {}
+    for r in group_rows:
+        key = (r.get("capabilities") or {}).get("capability_key")
+        if key:
+            group_by_user.setdefault(r["app_user_id"], []).append(key)
+    for r in plant_rows:
+        key  = (r.get("capabilities") or {}).get("capability_key")
+        code = (r.get("plants") or {}).get("plant_code")
+        if code:
+            plant_by_user.setdefault(r["app_user_id"], {}).setdefault(code, [])
+            if key:
+                plant_by_user[r["app_user_id"]][code].append(key)
+
+    auth_by_id = {}
+    try:
+        for u in privileged_client("auth_admin_list_users").auth.admin.list_users():
+            auth_by_id[str(u.id)] = u
+    except Exception:
+        auth_by_id = {}
+
     result = []
-    for u in auth_users:
-        profile = profiles_by_id.get(u.id)
-        if not profile:
-            continue
+    for u in users:
+        gc = sorted(set(group_by_user.get(u["id"], [])))
+        pc = plant_by_user.get(u["id"], {})
+        au = auth_by_id.get(str(u.get("auth_user_id")))
         result.append({
-            **profile,
-            "email": u.email,
-            "last_sign_in_at": u.last_sign_in_at.isoformat() if u.last_sign_in_at else None,
+            "id":           u["id"],
+            "display_name": u["display_name"],
+            "active":       u["status"] == "active",
+            "status":       u["status"],
+            "role":         derive_role(gc, pc),
+            "plant":        next(iter(pc), None),
+            "plants":       sorted(pc),
+            "email":        au.email if au else None,
+            "last_sign_in_at": (au.last_sign_in_at.isoformat()
+                                if au and au.last_sign_in_at else None),
         })
     return jsonify({"users": result})
 
@@ -656,30 +816,40 @@ def create_user():
     password  = data.get("password") or secrets.token_urlsafe(9)
 
     try:
-        created = get_supabase_admin().auth.admin.create_user({
+        created = privileged_client("auth_admin_create_user").auth.admin.create_user({
             "email": email,
             "password": password,
             "email_confirm": True,
         })
-    except Exception as e:
-        return jsonify({"error": f"Could not create auth user: {e}"}), 400
+    except Exception:
+        return jsonify({"error": "Could not create the authentication account"}), 400
 
     uid = created.user.id
     try:
-        get_supabase_admin().table("profiles").insert({
-            "id": uid,
-            "display_name": display_name,
-            "role": role,
-            "plant": plant,
-            "active": True,
-        }).execute()
-    except Exception as e:
-        # Don't leave an orphaned auth user with no profile row behind.
-        get_supabase_admin().auth.admin.delete_user(uid)
-        return jsonify({"error": f"Could not create profile: {e}"}), 400
+        # app_users has no INSERT policy for any role: identity creation is not an
+        # ordinary table write. This RPC runs as the caller and checks
+        # administer_users itself, so the capability - not the service key - is
+        # what authorises it. It also creates the role/plant capability grants.
+        app_user_id = (
+            get_supabase_for_caller(g.access_token)
+            .rpc("admin_create_app_user", {
+                "p_auth_user_id": uid,
+                "p_display_name": display_name,
+                "p_role":         role,
+                "p_plant_code":   plant,
+            })
+            .execute()
+        ).data
+    except Exception:
+        # Don't leave an orphaned auth account with no application identity.
+        try:
+            privileged_client("auth_admin_delete_user").auth.admin.delete_user(uid)
+        except Exception:
+            pass
+        return jsonify({"error": "Could not create the application identity"}), 400
 
     resp = {
-        "id": uid, "email": email, "display_name": display_name,
+        "id": app_user_id, "email": email, "display_name": display_name,
         "role": role, "plant": plant, "active": True,
     }
     if generated:
@@ -691,31 +861,60 @@ def create_user():
 @require_auth
 @require_role("admin")
 def update_user(uid):
-    data = request.get_json(force=True) or {}
-    updates = {}
+    """
+    `uid` is now the application identity (app_users.id), not an Auth uuid.
+
+    Every write runs as the caller: display_name through the column grant, status
+    through a capability-checked RPC, and role/plant as ordinary grant rows whose
+    INSERT/UPDATE policies already require administer_users.
+    """
+    data   = request.get_json(force=True) or {}
+    client = get_supabase_for_caller(g.access_token)
+    try:
+        app_user_id = int(uid)
+    except (TypeError, ValueError):
+        return jsonify({"error": "User not found"}), 404
+
+    touched = False
 
     if "display_name" in data:
-        updates["display_name"] = data["display_name"]
-    if "plant" in data:
-        updates["plant"] = data["plant"]
-    if "role" in data:
-        if data["role"] not in VALID_ROLES:
-            return jsonify({"error": f"role must be one of {VALID_ROLES}"}), 400
-        if uid == g.current_user["id"] and data["role"] != "admin":
-            return jsonify({"error": "You cannot change your own role"}), 400
-        updates["role"] = data["role"]
-    if "active" in data:
-        if uid == g.current_user["id"] and not data["active"]:
-            return jsonify({"error": "You cannot deactivate your own account"}), 400
-        updates["active"] = bool(data["active"])
+        name = (data["display_name"] or "").strip()
+        if not name:
+            return jsonify({"error": "Display name cannot be empty"}), 400
+        r = client.table("app_users").update({"display_name": name}).eq("id", app_user_id).execute()
+        if not r.data:
+            return jsonify({"error": "User not found"}), 404
+        touched = True
 
-    if not updates:
+    if "active" in data:
+        if app_user_id == g.caller["id"] and not data["active"]:
+            return jsonify({"error": "You cannot deactivate your own account"}), 400
+        try:
+            client.rpc("admin_set_app_user_status", {
+                "p_app_user": app_user_id,
+                "p_status": "active" if data["active"] else "deactivated",
+            }).execute()
+        except Exception:
+            return jsonify({"error": "Could not update the account status"}), 400
+        touched = True
+
+    if "role" in data or "plant" in data:
+        if data.get("role") and data["role"] not in VALID_ROLES:
+            return jsonify({"error": f"role must be one of {VALID_ROLES}"}), 400
+        if app_user_id == g.caller["id"] and data.get("role") and data["role"] != "admin":
+            return jsonify({"error": "You cannot change your own role"}), 400
+        try:
+            _apply_role_and_plant(client, app_user_id, data.get("role"), data.get("plant"))
+        except PermissionError:
+            return jsonify({"error": "Forbidden"}), 403
+        except Exception:
+            return jsonify({"error": "Could not update role or plant"}), 400
+        touched = True
+
+    if not touched:
         return jsonify({"error": "No fields to update"}), 400
 
-    result = get_supabase_admin().table("profiles").update(updates).eq("id", uid).execute()
-    if not result.data:
-        return jsonify({"error": "User not found"}), 404
-    return jsonify(result.data[0])
+    return jsonify(_read_one_user(client, app_user_id))
 
 
 @app.route("/admin/users/<uid>/reset-password", methods=["POST"])
@@ -726,10 +925,25 @@ def reset_password(uid):
     generated = not data.get("password")
     password  = data.get("password") or secrets.token_urlsafe(9)
 
+    # `uid` is the application identity; the Auth account it maps to is read as
+    # the caller, so an administrator cannot reset a password for a row RLS would
+    # not show them.
     try:
-        get_supabase_admin().auth.admin.update_user_by_id(uid, {"password": password})
-    except Exception as e:
-        return jsonify({"error": f"Could not reset password: {e}"}), 400
+        app_user_id = int(uid)
+    except (TypeError, ValueError):
+        return jsonify({"error": "User not found"}), 404
+
+    rows = (get_supabase_for_caller(g.access_token)
+            .table("app_users").select("auth_user_id")
+            .eq("id", app_user_id).limit(1).execute()).data or []
+    if not rows or not rows[0].get("auth_user_id"):
+        return jsonify({"error": "User not found"}), 404
+
+    try:
+        privileged_client("auth_admin_update_user").auth.admin.update_user_by_id(
+            rows[0]["auth_user_id"], {"password": password})
+    except Exception:
+        return jsonify({"error": "Could not reset password"}), 400
 
     resp = {"ok": True}
     if generated:
