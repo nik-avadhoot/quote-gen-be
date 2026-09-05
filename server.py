@@ -25,6 +25,7 @@ Template:
 # All libraries this server needs. If any are missing, run:
 #   pip install -r requirements.txt
 # ═══════════════════════════════════════════════════════════════════════════════
+import hashlib
 import os
 import io
 import re
@@ -564,6 +565,20 @@ def auth_refresh():
     })
 
 
+def _auth_ref(auth_user_id):
+    """
+    A short, non-reversible reference to an authentication account.
+
+    Used anywhere an identifier would otherwise reach a log. It is enough to
+    match a log line against the corresponding row in the orphan report, and
+    useless for anything else: it is a truncated SHA-256 with no way back to the
+    uuid, let alone to an address.
+    """
+    if not auth_user_id:
+        return "unknown"
+    return hashlib.sha256(str(auth_user_id).encode()).hexdigest()[:8]
+
+
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s.]+(\.[^@\s.]+)+$")
 
 
@@ -764,6 +779,7 @@ def list_auth_orphans():
             return jsonify({"error": "Could not check outstanding invitations"}), 400
 
     orphans = [{
+        "ref":          _auth_ref(str(u.id)),   # matches the compensation log line
         "auth_user_id": str(u.id),
         "email":        getattr(u, "email", None),
         "created_at":   str(getattr(u, "created_at", "") or ""),
@@ -1292,13 +1308,17 @@ def create_user():
         try:
             privileged_client("auth_admin_delete_user").auth.admin.delete_user(uid)
         except Exception:
-            # The auth uuid is logged deliberately: this is the one failure that
-            # leaves state behind, and the record has to be actionable. It is an
-            # internal identifier, not an address, and it is what
-            # GET /admin/auth-orphans will surface.
+            # Redacted deliberately. An ordinary application log is the wrong
+            # place for a raw Auth uuid or an address - logs are copied, shipped
+            # and read by people who have no business with either. What is
+            # logged is a NON-REVERSIBLE short fingerprint, which is enough to
+            # correlate this line with the matching row in
+            # GET /admin/auth-orphans (which reports the same `ref`) without the
+            # log itself carrying an identifier.
             app.logger.error(
-                "ORPHANED AUTH ACCOUNT %s after a failed creation - visible at "
-                "GET /admin/auth-orphans, recoverable with POST /admin/users/adopt", uid)
+                "ORPHANED AUTH ACCOUNT ref=%s after a failed creation - visible at "
+                "GET /admin/auth-orphans, recoverable with POST /admin/users/adopt",
+                _auth_ref(uid))
             return jsonify({"error": "Could not create the user, and cleanup failed. "
                                      "Contact an administrator before retrying."}), 500
         return jsonify({"error": "Could not create the application identity"}), 400
