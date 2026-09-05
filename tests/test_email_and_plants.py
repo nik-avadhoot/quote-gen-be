@@ -449,6 +449,130 @@ STATE["delete_fails"] = False
 server.get_supabase_for_caller = fake_caller
 server.privileged_client = fake_priv
 
+
+# ───────────────────────────── orphan detection and recovery (O-*)
+#
+# Creating a user spans Auth and the database and cannot be one transaction. The
+# database half is atomic; the pair is not. These assert that what the pair can
+# leave behind is FINDABLE and FIXABLE rather than described away.
+
+
+class AuthUser:
+    def __init__(self, uid, email):
+        self.id, self.email = uid, email
+        self.created_at, self.last_sign_in_at = "2026-09-05", None
+
+
+class OrphanAdminAPI(FakeAdminAPI):
+    def list_users(self):
+        return STATE["auth_accounts"]
+
+
+class OrphanAuth(FakeAuth):
+    def __init__(self):
+        super().__init__()
+        self.admin = OrphanAdminAPI()
+
+
+class OrphanClient(FakeClient):
+    def __init__(self, token, kind):
+        super().__init__(token, kind)
+        self.auth = OrphanAuth()
+
+    def table(self, name):
+        if name == "app_users":
+            q = FakeQuery(self.token, name)
+            q.execute = lambda: type("R", (), {"data": STATE["linked_rows"]})()
+            return q
+        return FakeQuery(self.token, name)
+
+    def rpc(self, name, params):
+        STATE["rpc"].append((self.token, name, params))
+        if name == "admin_emails_with_open_invitation":
+            invited = [e for e in params["p_emails"] if e.lower() in STATE["invited"]]
+            return type("R", (), {"execute": lambda s=None: type("D", (), {"data": invited})()})()
+        if name == "admin_create_app_user":
+            if STATE.get("adopt_fails"):
+                raise RuntimeError("refused")
+            return type("R", (), {"execute": lambda s=None: type("D", (), {"data": 99})()})()
+        return type("R", (), {"execute": lambda s=None: type("D", (), {"data": 1})()})()
+
+
+def orphan_caller(token):
+    return OrphanClient(token, "caller")
+
+
+def orphan_priv(op):
+    if op not in cc.PRIVILEGED_OPERATIONS:
+        raise cc.PrivilegeError(op)
+    STATE["privileged"].append(op)
+    return OrphanClient("SERVICE-ROLE", "privileged")
+
+
+server.get_supabase_for_caller = orphan_caller
+server.privileged_client = orphan_priv
+
+STATE["auth_accounts"] = [
+    AuthUser("uid-linked",  "linked@example.invalid"),
+    AuthUser("uid-invited", "invited@example.invalid"),
+    AuthUser("uid-orphan",  "orphan@example.invalid"),
+]
+STATE["linked_rows"] = [{"auth_user_id": "uid-linked"}]
+STATE["invited"] = {"invited@example.invalid"}
+
+reset()
+with app.test_client() as c:
+    r = c.get("/admin/auth-orphans", headers=AUTH)
+body = r.get_json()
+check(r.status_code == 200, "O-1 the orphan report responds")
+check([o["auth_user_id"] for o in body["orphans"]] == ["uid-orphan"],
+      "O-2 exactly the unattached account is reported")
+check(body["count"] == 1, "O-3 with a count")
+check(all(o["auth_user_id"] != "uid-linked" for o in body["orphans"]),
+      "O-4 an account WITH an application identity is not an orphan")
+check(all(o["auth_user_id"] != "uid-invited" for o in body["orphans"]),
+      "O-5 an account with an OPEN INVITATION is a pending onboarding, not an orphan")
+check("adopt" in body.get("recovery", ""),
+      "O-6 the report states how to recover")
+inv = [x for x in STATE["rpc"] if x[1] == "admin_emails_with_open_invitation"]
+check(inv and set(inv[0][2]["p_emails"]) == {"invited@example.invalid", "orphan@example.invalid"},
+      "O-7 only the addresses already held are submitted - it cannot enumerate invitations")
+
+# O-8..O-11: recovery attaches an identity to the EXISTING account
+reset(); STATE["adopt_fails"] = False
+r = post("/admin/users/adopt", {"email": "orphan@example.invalid", "display_name": "Rescued",
+                                "role": "maker", "plants": ["NAG", "PUN"]})
+check(r.status_code == 201, "O-8 an orphan can be adopted into an application identity")
+creates = [x for x in STATE["rpc"] if x[1] == "admin_create_app_user"]
+check(creates and creates[0][2]["p_auth_user_id"] == "uid-orphan",
+      "O-9 the Auth uuid is RESOLVED from the address, never supplied by the caller")
+check(creates[0][2]["p_plant_codes"] == ["NAG", "PUN"],
+      "O-10 adoption uses the same single atomic grant call as ordinary creation")
+check(r.get_json().get("adopted") is True, "O-11 and the response says it was an adoption")
+
+reset()
+r = post("/admin/users/adopt", {"email": "nobody@example.invalid", "display_name": "X",
+                                "role": "maker", "plants": ["NAG"]})
+check(r.status_code == 404, "O-12 an address with no unattached account is refused")
+check(r.get_json() == {"error": "No unattached authentication account for that address"},
+      "O-12a with one answer for both 'absent' and 'already attached'")
+
+reset()
+r = post("/admin/users/adopt", {"email": "orphan@example.invalid", "display_name": "X",
+                                "role": "maker", "plants": []})
+check(r.status_code == 400, "O-13 adoption obeys the same plant rule - a Maker needs a plant")
+
+reset(); STATE["adopt_fails"] = True
+r = post("/admin/users/adopt", {"email": "orphan@example.invalid", "display_name": "X",
+                                "role": "maker", "plants": ["NAG"]})
+check(r.status_code == 400, "O-14 a refused adoption returns a truthful failure")
+check(STATE["deleted_auth"] == [],
+      "O-14a and deletes nothing - adoption creates no Auth account to compensate")
+STATE["adopt_fails"] = False
+
+server.get_supabase_for_caller = fake_caller
+server.privileged_client = fake_priv
+
 print()
 print(f"{PASSES} passed, {len(FAILURES)} failed")
 if FAILURES:

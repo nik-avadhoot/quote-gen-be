@@ -719,6 +719,133 @@ def admin_change_user_email(uid):
     })
 
 
+@app.route("/admin/auth-orphans", methods=["GET"])
+@require_auth
+@require_role("admin")
+def list_auth_orphans():
+    """
+    Authentication accounts with no application identity and no open invitation.
+
+    Creating a user spans two systems. The database half is atomic; the pair is
+    not, and cannot be - there is no transaction across GoTrue and Postgres. The
+    create route compensates by deleting the Auth account when the database half
+    fails, but a compensating delete can itself fail, and what survives then is
+    an Auth account nothing points at.
+
+    Such an account is harmless - every route resolves through `app_users` and
+    refuses anything that does not - but it should be findable rather than
+    argued away, which is what this is for. An account carrying an open
+    invitation is NOT an orphan: it is a pending onboarding.
+    """
+    client = get_supabase_for_caller(g.access_token)
+
+    try:
+        auth_users = privileged_client("auth_admin_list_users").auth.admin.list_users()
+    except Exception:
+        return jsonify({"error": "Could not read the authentication accounts"}), 400
+
+    linked = {
+        u.get("auth_user_id")
+        for u in (client.table("app_users").select("auth_user_id").execute()).data or []
+        if u.get("auth_user_id")
+    }
+    candidates = [u for u in auth_users if str(getattr(u, "id", "")) not in linked]
+    emails = [getattr(u, "email", None) for u in candidates if getattr(u, "email", None)]
+
+    invited = set()
+    if emails:
+        try:
+            invited = {
+                e.lower() for e in
+                (client.rpc("admin_emails_with_open_invitation",
+                            {"p_emails": emails}).execute()).data or []
+            }
+        except Exception:
+            return jsonify({"error": "Could not check outstanding invitations"}), 400
+
+    orphans = [{
+        "auth_user_id": str(u.id),
+        "email":        getattr(u, "email", None),
+        "created_at":   str(getattr(u, "created_at", "") or ""),
+        "last_sign_in_at": str(getattr(u, "last_sign_in_at", "") or ""),
+    } for u in candidates if (getattr(u, "email", "") or "").lower() not in invited]
+
+    return jsonify({
+        "orphans": orphans,
+        "count": len(orphans),
+        "recovery": ("Adopt the account with POST /admin/users/adopt to give it an "
+                     "application identity, or delete it in the Supabase Auth "
+                     "dashboard if it was never meant to exist."),
+    })
+
+
+@app.route("/admin/users/adopt", methods=["POST"])
+@require_auth
+@require_role("admin")
+def adopt_auth_account():
+    """
+    Give an EXISTING authentication account an application identity.
+
+    Two things need this. An orphan left by a failed compensation is one. The
+    other is any account that already exists in Auth and must not be recreated -
+    `POST /admin/users` always mints a NEW Auth account, so it fails on a
+    duplicate address and cannot be used to reconnect one.
+
+    The account is named by ADDRESS, not by Auth uuid: the uuid is resolved here
+    from the Auth listing, so a caller cannot aim this at an arbitrary uuid. The
+    database then refuses anything that is not genuinely unattached -
+    uk_app_users_auth makes a second identity for one account impossible - and
+    the grants land in the same single atomic RPC as ordinary creation.
+    """
+    data = request.get_json(force=True) or {}
+    email        = (data.get("email") or "").strip().lower()
+    display_name = (data.get("display_name") or "").strip()
+    role         = data.get("role", "maker")
+
+    if not _valid_email(email) or not display_name:
+        return jsonify({"error": "A valid email and display name are required"}), 400
+    if role not in VALID_ROLES:
+        return jsonify({"error": f"role must be one of {VALID_ROLES}"}), 400
+    try:
+        plant_codes = _normalise_plants(data) or []
+    except ValueError:
+        return jsonify({"error": "plants must be a list of plant codes"}), 400
+    problem = _plant_requirement_error(role, plant_codes)
+    if problem:
+        return jsonify({"error": problem}), 400
+
+    try:
+        auth_users = privileged_client("auth_admin_list_users").auth.admin.list_users()
+    except Exception:
+        return jsonify({"error": "Could not read the authentication accounts"}), 400
+
+    target = next((u for u in auth_users
+                   if (getattr(u, "email", "") or "").lower() == email), None)
+    if target is None:
+        # Same answer whether it does not exist or already has an identity.
+        return jsonify({"error": "No unattached authentication account for that address"}), 404
+
+    try:
+        app_user_id = (
+            get_supabase_for_caller(g.access_token)
+            .rpc("admin_create_app_user", {
+                "p_auth_user_id": str(target.id),
+                "p_display_name": display_name,
+                "p_role":         role,
+                "p_plant_codes":  plant_codes,
+            })
+            .execute()
+        ).data
+    except Exception:
+        # Nothing to compensate: no Auth account was created here.
+        return jsonify({"error": "Could not attach an application identity to that account"}), 400
+
+    return jsonify({
+        "id": app_user_id, "email": email, "display_name": display_name,
+        "role": role, "plants": plant_codes, "active": True, "adopted": True,
+    }), 201
+
+
 @app.route("/masters/plants", methods=["GET"])
 @require_auth
 def list_plants():
@@ -1165,8 +1292,13 @@ def create_user():
         try:
             privileged_client("auth_admin_delete_user").auth.admin.delete_user(uid)
         except Exception:
+            # The auth uuid is logged deliberately: this is the one failure that
+            # leaves state behind, and the record has to be actionable. It is an
+            # internal identifier, not an address, and it is what
+            # GET /admin/auth-orphans will surface.
             app.logger.error(
-                "orphaned auth account after a failed creation - manual cleanup needed")
+                "ORPHANED AUTH ACCOUNT %s after a failed creation - visible at "
+                "GET /admin/auth-orphans, recoverable with POST /admin/users/adopt", uid)
             return jsonify({"error": "Could not create the user, and cleanup failed. "
                                      "Contact an administrator before retrying."}), 500
         return jsonify({"error": "Could not create the application identity"}), 400
