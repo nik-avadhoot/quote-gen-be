@@ -35,6 +35,7 @@ from flask_cors import CORS
 import openpyxl
 
 from caller_context import (
+    bootstrap_caller,
     get_supabase_anon,
     get_supabase_for_caller,
     privileged_client,
@@ -491,6 +492,30 @@ def auth_login():
 
     # Identity is resolved with the token just issued, so RLS decides.
     profile = _identity_or_none(session.access_token)
+
+    # FIRST SIGN-IN. Authenticating proves who you are; it does not create an
+    # application identity. An invited user - including the very first
+    # administrator, who by definition cannot have been created by an existing
+    # administrator - authenticates successfully and resolves to nothing.
+    #
+    # Before this, that was a permanent 403: the invitation could only be
+    # claimed by app_private.bootstrap_app_user(), which PostgREST cannot route
+    # to, so the documented recovery did not exist in the running application.
+    #
+    # One attempt, with the caller's own token, only when they resolved to
+    # nothing. The database decides entirely - see bootstrap_caller(). We
+    # re-resolve afterwards and trust only that, never the RPC's own answer:
+    # bootstrap returns an existing id for a DEACTIVATED user too, and that user
+    # must still be refused. Re-resolving is also what makes a concurrent first
+    # login safe - the caller that loses the race for the invitation resolves
+    # the identity the winner just created, and uk_app_users_auth makes a second
+    # identity impossible regardless.
+    if not profile:
+        bootstrap_caller(session.access_token)
+        profile = _identity_or_none(session.access_token)
+
+    # One refusal for every cause - no account, no invitation, wrong email,
+    # deactivated. The caller must not be able to tell which.
     if not profile:
         return jsonify({"error": "Account is not active"}), 403
 
@@ -518,6 +543,12 @@ def auth_refresh():
     if not session or not user:
         return jsonify({"error": "Invalid or expired refresh token"}), 401
 
+    # Refresh deliberately does NOT bootstrap. It follows an identity that was
+    # already established; there is no first sign-in to complete here. A session
+    # that refreshes into nothing is a deactivated or removed user, and the only
+    # correct answer is to refuse. Attempting a bootstrap on this path would let
+    # a long-lived refresh token silently re-enter the system on any invitation
+    # that happened to match, which is not a login the user just authenticated.
     profile = _identity_or_none(session.access_token)
     if not profile:
         return jsonify({"error": "Account is not active"}), 403

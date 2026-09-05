@@ -222,6 +222,46 @@ def resolve_caller(access_token: str) -> dict | None:
     }
 
 
+def bootstrap_caller(access_token: str) -> bool:
+    """
+    Give an authenticated caller with no application identity ONE chance to claim
+    a pending invitation, using their own token.
+
+    This is the first-sign-in path. It exists because authentication and
+    authorization are separate: Supabase Auth will happily issue a token to an
+    invited administrator who has no `app_users` row yet, and every route then
+    refuses them. Without this the invitation is unreachable from the running
+    application - which is exactly the defect this fixes.
+
+    Everything that decides anything happens in the database. This function
+    supplies no identity, no email and no role: `public.bootstrap_app_user()` is
+    an unprivileged SECURITY INVOKER shim, and the SECURITY DEFINER
+    implementation in `app_private` reads auth.uid() and the verified `email`
+    claim from the caller's own token, matches them against the invitation, and
+    refuses everything else. So the backend cannot widen who gets in, and a
+    forged or edited request body changes nothing.
+
+    NOT the service-role client - deliberately. Bootstrapping with service-role
+    would mean the backend, not the database, deciding who becomes a user, and
+    it would bypass every RLS policy on the way. The caller's own token is the
+    whole point.
+
+    Returns True if the RPC completed, False on any refusal. The caller must
+    re-resolve either way and treat "still unresolved" as a refusal: a True here
+    means the database accepted the call, not that the caller is now active.
+    """
+    if not access_token or not isinstance(access_token, str):
+        return False
+    try:
+        get_supabase_for_caller(access_token).rpc("bootstrap_app_user", {}).execute()
+        return True
+    except Exception:
+        # Uninvited, wrong email, already-consumed invitation, deactivated
+        # account, a concurrent caller that won the race - all indistinguishable
+        # here on purpose. The route returns one refusal for every case.
+        return False
+
+
 def _auth_uid(client: Client, access_token: str):
     try:
         resp = client.auth.get_user(access_token)
