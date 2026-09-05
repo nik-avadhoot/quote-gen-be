@@ -48,9 +48,13 @@ CAPS = [
     {"id": 8, "capability_key": "make_quote"},
     {"id": 9, "capability_key": "check_quote"},
 ]
-PLANTS = [{"id": 10, "plant_code": "NAG"},
-          {"id": 11, "plant_code": "PUN"},
-          {"id": 12, "plant_code": "KOL"}]
+# `status` is present because a Plant Master record is only assignable while it
+# is ACTIVE (CDM-05-A / P2-12). A fixture without it would let this gate pass
+# against a rule the database enforces, which is worse than no fixture at all.
+PLANTS = [{"id": 10, "plant_code": "NAG", "status": "active"},
+          {"id": 11, "plant_code": "PUN", "status": "active"},
+          {"id": 12, "plant_code": "KOL", "status": "active"},
+          {"id": 13, "plant_code": "OLD", "status": "inactive"}]
 
 
 class FakeQuery:
@@ -232,6 +236,14 @@ except ValueError:
 c = FakeClient(state)
 check(c.log == [],
       "MPB-10a and the refusal happens before any grant is written")
+
+state = {"capabilities": CAPS, "plants": PLANTS, "plant_capability_grants": [],
+         "group_capability_grants": []}
+try:
+    apply(state, "maker", ["NAG", "OLD"])
+    check(False, "MPB-10b an INACTIVE Plant Master record is not assignable")
+except ValueError:
+    check(True, "MPB-10b an INACTIVE Plant Master record is not assignable")
 
 # --------------------------- MPB-11 role change does not disturb plant grants
 state = {"capabilities": CAPS, "plants": PLANTS, "plant_capability_grants": maker_held,

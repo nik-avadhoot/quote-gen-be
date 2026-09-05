@@ -18,8 +18,11 @@ BYPASSRLS). It is therefore not available as an ambient import here - it is
 reachable only through privileged_client(), which refuses any operation not on
 PRIVILEGED_OPERATIONS.
 """
+import json
 import os
 import threading
+import urllib.error
+import urllib.request
 
 from supabase import create_client, Client
 from supabase.client import ClientOptions
@@ -46,7 +49,11 @@ PRIVILEGED_OPERATIONS = {
     "auth_admin_delete_user":
         "Supabase Auth admin API - compensating delete when profile creation fails.",
     "auth_admin_update_user":
-        "Supabase Auth admin API - password reset by an administrator.",
+        "Supabase Auth admin API - password reset by an administrator, and an "
+        "administrator-initiated login email change. The login identity lives in "
+        "auth.users, not in any table, so there is no caller-context equivalent. "
+        "Who may do it is still decided by the database: the capability check and "
+        "the target's resolution both happen in app_private before this is called.",
     "auth_admin_sign_out":
         "Supabase Auth admin API - global sign-out on logout/deactivation. "
         "Required so deactivation takes effect before token expiry.",
@@ -260,6 +267,67 @@ def bootstrap_caller(access_token: str) -> bool:
         # account, a concurrent caller that won the race - all indistinguishable
         # here on purpose. The route returns one refusal for every case.
         return False
+
+
+def verify_current_password(email: str, password: str) -> bool:
+    """
+    Re-verify that whoever holds this session also knows the current password.
+
+    A valid access token proves the session was authenticated at some point, not
+    that the person at the keyboard is the account holder now. Changing the
+    login identity is exactly the operation where that difference matters, so
+    the current password is re-checked immediately before it.
+
+    Done with a throwaway anonymous client, so nothing is stored, cached or
+    attached to the caller's session. The password is used once and discarded;
+    it is never written to a table, a log or an audit row.
+    """
+    if not email or not password:
+        return False
+    try:
+        resp = get_supabase_anon().auth.sign_in_with_password(
+            {"email": email, "password": password})
+        return bool(resp and resp.session)
+    except Exception:
+        return False
+
+
+def update_caller_email(access_token: str, new_email: str) -> dict:
+    """
+    Ask Supabase Auth to change the CALLER's own login email.
+
+    This is the documented `updateUser({ email })` operation, called at its REST
+    endpoint with the caller's own bearer token. It is deliberately not an admin
+    call: the change is made by the user, as the user, and Supabase runs its own
+    verification flow. With "Secure email change" enabled the project sends a
+    confirmation to both the old and the new address and the change only lands
+    once confirmed - which is why the route reports a PENDING state rather than
+    claiming success.
+
+    supabase-py's auth.update_user() operates on a session the client object
+    holds internally; a caller-context client carries the token as a header and
+    has no such session, so the REST endpoint is called directly rather than
+    faking one.
+    """
+    if not access_token or not new_email:
+        raise ValueError("access_token and new_email are required")
+
+    req = urllib.request.Request(
+        _env("SUPABASE_URL").rstrip("/") + "/auth/v1/user",
+        data=json.dumps({"email": new_email}).encode(),
+        headers={
+            "apikey": _env("SUPABASE_PUBLISHABLE_KEY"),
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json",
+        },
+        method="PUT",
+    )
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        body = json.loads(resp.read().decode() or "{}")
+
+    # GoTrue reports an unconfirmed change as new_email / email_change.
+    pending = body.get("new_email") or body.get("email_change") or None
+    return {"pending_email": bool(pending), "current_email": body.get("email")}
 
 
 def _auth_uid(client: Client, access_token: str):

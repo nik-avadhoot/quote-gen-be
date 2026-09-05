@@ -27,6 +27,7 @@ Template:
 # ═══════════════════════════════════════════════════════════════════════════════
 import os
 import io
+import re
 import secrets
 from datetime import datetime
 
@@ -40,6 +41,8 @@ from caller_context import (
     get_supabase_for_caller,
     privileged_client,
     resolve_caller,
+    update_caller_email,
+    verify_current_password,
 )
 from auth import require_auth, require_role
 
@@ -561,6 +564,183 @@ def auth_refresh():
     })
 
 
+EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s.]+(\.[^@\s.]+)+$")
+
+
+def _valid_email(value):
+    return bool(value) and len(value) <= 254 and EMAIL_RE.match(value) is not None
+
+
+@app.route("/auth/me/email", methods=["POST"])
+@require_auth
+def change_my_email():
+    """
+    Self-service login-email change.
+
+    Email is the Supabase Auth login identity. It is not stored in `app_users`
+    and is not copied there by this route - the application identity, its audit
+    history, its plant grants and its capabilities are all keyed on the immutable
+    app_users row and are untouched by an address change.
+
+    The current password is re-verified immediately before the change. A valid
+    access token only proves the session authenticated at some point; changing
+    the login identity is precisely where that is not good enough.
+
+    The change itself is Supabase's own `updateUser({ email })` flow, made with
+    the caller's token. With Secure email change enabled the project confirms
+    with both addresses and the change lands only when confirmed, so this
+    reports PENDING rather than claiming success.
+    """
+    data = request.get_json(force=True) or {}
+    new_email = (data.get("new_email") or "").strip().lower()
+    password  = data.get("current_password") or ""
+
+    if not _valid_email(new_email):
+        return jsonify({"error": "Enter a valid email address"}), 400
+    if not password:
+        return jsonify({"error": "Your current password is required"}), 400
+
+    current_email = (g.current_user or {}).get("email")
+    if not current_email:
+        return jsonify({"error": "Could not start the email change"}), 400
+    if new_email == current_email.strip().lower():
+        return jsonify({"error": "That is already your email address"}), 400
+
+    if not verify_current_password(current_email, password):
+        # Deliberately not "wrong password" vs "account locked" etc.
+        return jsonify({"error": "Your current password is incorrect"}), 401
+
+    try:
+        result = update_caller_email(g.access_token, new_email)
+    except Exception:
+        # Never reveal whether the address already belongs to another account.
+        # Duplicate, rate-limited and rejected-address all answer the same way.
+        app.logger.warning("email change refused for app_user %s", g.caller["id"])
+        return jsonify({"error": "That email address cannot be used"}), 400
+
+    try:
+        get_supabase_for_caller(g.access_token).rpc("record_email_change", {
+            "p_app_user":   g.caller["id"],
+            "p_actor_kind": "self",
+            "p_reason":     None,
+            "p_old_email":  current_email,
+            "p_new_email":  new_email,
+        }).execute()
+    except Exception:
+        app.logger.warning("email change audit failed for app_user %s", g.caller["id"])
+
+    return jsonify({
+        "pending_verification": bool(result.get("pending_email")),
+        "message": ("Check your inbox - the change takes effect once the new "
+                    "address is confirmed."
+                    if result.get("pending_email")
+                    else "Your login email has been updated."),
+    })
+
+
+@app.route("/admin/users/<uid>/email", methods=["PATCH"])
+@require_auth
+@require_role("admin")
+def admin_change_user_email(uid):
+    """
+    Administrator-initiated login-email change.
+
+    The Auth identity is RESOLVED from the selected application identity by
+    `admin_prepare_email_change`, which also enforces `administer_users` and the
+    administrative reason. The route never accepts an Auth uuid, so an arbitrary
+    or guessed one cannot be targeted, and the capability check is the database's
+    to make rather than this decorator's.
+
+    No plant or capability grant is read or written anywhere in this route.
+    """
+    data = request.get_json(force=True) or {}
+    new_email = (data.get("new_email") or "").strip().lower()
+    reason    = (data.get("reason") or "").strip()
+
+    try:
+        app_user_id = int(uid)
+    except (TypeError, ValueError):
+        return jsonify({"error": "User not found"}), 404
+    if not _valid_email(new_email):
+        return jsonify({"error": "Enter a valid email address"}), 400
+    if not reason:
+        return jsonify({"error": "An administrative reason is required"}), 400
+
+    client = get_supabase_for_caller(g.access_token)
+
+    try:
+        auth_uid = (client.rpc("admin_prepare_email_change", {
+            "p_app_user": app_user_id, "p_reason": reason}).execute()).data
+    except Exception:
+        return jsonify({"error": "Could not change that user's email"}), 400
+    if not auth_uid:
+        return jsonify({"error": "User not found"}), 404
+
+    admin_api = privileged_client("auth_admin_update_user").auth.admin
+    try:
+        old_email = getattr(admin_api.get_user_by_id(auth_uid).user, "email", None)
+    except Exception:
+        old_email = None
+
+    try:
+        admin_api.update_user_by_id(auth_uid, {"email": new_email})
+    except Exception:
+        # Same answer whether the address is taken, malformed or rejected.
+        app.logger.warning("admin email change refused for app_user %s", app_user_id)
+        return jsonify({"error": "That email address cannot be used"}), 400
+
+    confirmed = None
+    try:
+        confirmed = getattr(admin_api.get_user_by_id(auth_uid).user,
+                            "email_confirmed_at", None) is not None
+    except Exception:
+        pass
+
+    try:
+        client.rpc("record_email_change", {
+            "p_app_user": app_user_id, "p_actor_kind": "admin", "p_reason": reason,
+            "p_old_email": old_email, "p_new_email": new_email}).execute()
+    except Exception:
+        app.logger.warning("admin email change audit failed for app_user %s", app_user_id)
+
+    revoked = 0
+    try:
+        revoked = (client.rpc("revoke_user_sessions",
+                              {"p_app_user": app_user_id}).execute()).data or 0
+    except Exception:
+        app.logger.warning("session revocation failed for app_user %s", app_user_id)
+
+    return jsonify({
+        "id": app_user_id,
+        "sessions_revoked": revoked,
+        "pending_verification": (confirmed is False),
+        "message": ("Email updated. The user's sessions were revoked and they "
+                    "must sign in again."),
+    })
+
+
+@app.route("/masters/plants", methods=["GET"])
+@require_auth
+def list_plants():
+    """
+    The Plant Master, read as the caller.
+
+    Read-only by design. The canonical brief seeds `plants` as a Family A table
+    and approves no create, edit or deactivate operation for it, so Plant Master
+    maintenance is DEFERRED rather than invented here. Retiring a plant is a
+    status change that needs an approved rule first, and physical deletion is
+    already refused by ON DELETE RESTRICT once a plant has been granted.
+    """
+    rows = (get_supabase_for_caller(g.access_token)
+            .table("plants").select("id, plant_code, name, status").execute()).data or []
+    rows.sort(key=lambda r: r.get("plant_code") or "")
+    return jsonify({
+        "plants": rows,
+        "active_codes": [r["plant_code"] for r in rows if r.get("status") == "active"],
+        "maintenance": "deferred",
+    })
+
+
 @app.route("/auth/logout", methods=["POST"])
 @require_auth
 def auth_logout():
@@ -733,6 +913,24 @@ def _normalise_plants(data):
     return out
 
 
+def _plant_requirement_error(role, plant_codes):
+    """
+    Operating access needs a plant; group-only administration does not.
+
+    A Maker or Checker whose authority is plant-scoped and who holds no plant
+    can sign in and do nothing, which reads as a broken account rather than a
+    deliberate one. An administrator may legitimately hold no plant at all -
+    `administer_users` is group-scoped - and only needs one if they are also
+    given plant-level work. Returns a message, or None when the selection is
+    acceptable.
+    """
+    if plant_codes is None:            # the request said nothing about plants
+        return None
+    if role in ("maker", "checker") and not plant_codes:
+        return "A Maker or Checker needs at least one plant"
+    return None
+
+
 def _apply_role_and_plant(client, app_user_id, role, plant_codes):
     """
     Express a role/plant change as capability grants.
@@ -777,8 +975,12 @@ def _apply_role_and_plant(client, app_user_id, role, plant_codes):
     if plant_codes is None:
         return
 
-    plants = (client.table("plants").select("id, plant_code").execute()).data or []
-    by_code = {p["plant_code"]: p["id"] for p in plants}
+    # Only ACTIVE Plant Master records are assignable. An inactive or unknown
+    # code is not "an unknown string" to be tolerated - it is a value that must
+    # never become a grant, so it is rejected here and, independently of this
+    # code, by the pgrant_active_plant_only trigger and the insert policy.
+    plants = (client.table("plants").select("id, plant_code, status").execute()).data or []
+    by_code = {p["plant_code"]: p["id"] for p in plants if p.get("status") == "active"}
     unknown = [c for c in plant_codes if c not in by_code]
     if unknown:
         raise ValueError("unknown plant")
@@ -909,6 +1111,9 @@ def create_user():
         plant_codes = _normalise_plants(data) or []
     except ValueError:
         return jsonify({"error": "plants must be a list of plant codes"}), 400
+    problem = _plant_requirement_error(role, plant_codes)
+    if problem:
+        return jsonify({"error": problem}), 400
     # The create RPC takes one plant code, because it is the minimal
     # capability-checked entry point and widening its signature is a database
     # change. Any further plants are applied immediately afterwards through the
@@ -1022,6 +1227,10 @@ def update_user(uid):
             plant_codes = _normalise_plants(data)
         except ValueError:
             return jsonify({"error": "plants must be a list of plant codes"}), 400
+        effective_role = data.get("role") or _read_one_user(client, app_user_id).get("role")
+        problem = _plant_requirement_error(effective_role, plant_codes)
+        if problem:
+            return jsonify({"error": problem}), 400
         try:
             _apply_role_and_plant(client, app_user_id, data.get("role"), plant_codes)
         except PermissionError:
