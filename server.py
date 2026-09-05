@@ -700,9 +700,54 @@ def _read_one_user(client, app_user_id):
     }
 
 
-def _apply_role_and_plant(client, app_user_id, role, plant_code):
+def _normalise_plants(data):
+    """
+    Read the requested plant assignment from a request body.
+
+    Returns None when the body says nothing about plants (leave them alone), or
+    a de-duplicated, order-preserving list of plant codes - possibly empty,
+    which means "revoke every plant assignment".
+
+    `plants` is the real field. `plant` is kept as a single-value alias because
+    the legacy `profiles.plant` column was one column and the frontend still
+    sends it; it is NOT the model. A user may hold any number of plants, and
+    collapsing that to one field is what CDM-05-A forbids.
+    """
+    if "plants" in data:
+        raw = data.get("plants") or []
+        if isinstance(raw, str):
+            raw = [raw]
+        if not isinstance(raw, list):
+            raise ValueError("plants must be a list of plant codes")
+        codes = [str(c).strip() for c in raw if str(c).strip()]
+    elif "plant" in data:
+        one = (data.get("plant") or "").strip()
+        codes = [one] if one else []
+    else:
+        return None
+    seen, out = set(), []
+    for c in codes:
+        if c not in seen:
+            seen.add(c)
+            out.append(c)
+    return out
+
+
+def _apply_role_and_plant(client, app_user_id, role, plant_codes):
     """
     Express a role/plant change as capability grants.
+
+    `plant_codes` is a LIST, or None to leave plant assignment untouched. An
+    empty list revokes every plant assignment. One user holding several plants
+    is the normal case, not an edge case: it is how the legacy `Group` value is
+    represented under CDM-05-A.
+
+    The reconciliation is set-based rather than replace-all. The previous version
+    revoked every active grant and re-inserted for a single plant, which made
+    multi-plant assignment unrepresentable and churned grant history on every
+    unrelated edit. Now only grants that are genuinely no longer wanted are
+    revoked, and only genuinely missing ones are inserted - so re-applying the
+    same assignment is a no-op and the audit trail stays meaningful.
 
     Every statement is an ordinary caller-context write: the grant tables' INSERT
     and UPDATE policies already require administer_users, so a caller without it
@@ -729,29 +774,48 @@ def _apply_role_and_plant(client, app_user_id, role, plant_code):
                 "status": "revoked", "revoked_at": "now()", "revoked_by": g.caller["id"],
             }).eq("id", existing[0]["id"]).execute()
 
-    if plant_code is not None:
-        plants = (client.table("plants").select("id, plant_code").execute()).data or []
-        by_code = {p["plant_code"]: p["id"] for p in plants}
-        if plant_code and plant_code not in by_code:
-            raise ValueError("unknown plant")
+    if plant_codes is None:
+        return
 
-        current = (client.table("plant_capability_grants")
-                   .select("id, plant_id").eq("app_user_id", app_user_id)
-                   .eq("status", "active").execute()).data or []
-        for row in current:
+    plants = (client.table("plants").select("id, plant_code").execute()).data or []
+    by_code = {p["plant_code"]: p["id"] for p in plants}
+    unknown = [c for c in plant_codes if c not in by_code]
+    if unknown:
+        raise ValueError("unknown plant")
+
+    current = (client.table("plant_capability_grants")
+               .select("id, plant_id, capability_id").eq("app_user_id", app_user_id)
+               .eq("status", "active").execute()).data or []
+
+    # The operational capability follows the role. When the caller is changing
+    # plants without naming a role, keep the one they already hold rather than
+    # silently demoting a Checker to Maker.
+    if role is not None:
+        operational = "check_quote" if role == "checker" else "make_quote"
+    elif any(r["capability_id"] == cap_id["check_quote"] for r in current):
+        operational = "check_quote"
+    else:
+        operational = "make_quote"
+
+    wanted = {(by_code[c], cap_id[w])
+              for c in plant_codes
+              for w in ("plant_access", operational)}
+    held = {(r["plant_id"], r["capability_id"]) for r in current}
+
+    for row in current:
+        if (row["plant_id"], row["capability_id"]) not in wanted:
             client.table("plant_capability_grants").update({
                 "status": "revoked", "revoked_at": "now()", "revoked_by": g.caller["id"],
             }).eq("id", row["id"]).execute()
 
-        if plant_code:
-            wanted = ["plant_access",
-                      "check_quote" if role == "checker" else "make_quote"]
-            client.table("plant_capability_grants").insert([{
-                "app_user_id": app_user_id,
-                "plant_id": by_code[plant_code],
-                "capability_id": cap_id[w],
-                "granted_by": g.caller["id"],
-            } for w in wanted]).execute()
+    missing = sorted(wanted - held)
+    if missing:
+        client.table("plant_capability_grants").insert([{
+            "app_user_id": app_user_id,
+            "plant_id": plant_id,
+            "capability_id": capability_id,
+            "granted_by": g.caller["id"],
+        } for plant_id, capability_id in missing]).execute()
 
 
 @app.route("/admin/users", methods=["GET"])
@@ -836,12 +900,21 @@ def create_user():
     email        = (data.get("email") or "").strip()
     display_name = (data.get("display_name") or "").strip()
     role         = data.get("role", "maker")
-    plant        = data.get("plant") or None
 
     if not email or not display_name:
         return jsonify({"error": "email and display_name are required"}), 400
     if role not in VALID_ROLES:
         return jsonify({"error": f"role must be one of {VALID_ROLES}"}), 400
+    try:
+        plant_codes = _normalise_plants(data) or []
+    except ValueError:
+        return jsonify({"error": "plants must be a list of plant codes"}), 400
+    # The create RPC takes one plant code, because it is the minimal
+    # capability-checked entry point and widening its signature is a database
+    # change. Any further plants are applied immediately afterwards through the
+    # same grant policies the PATCH route uses - so a user can be created
+    # holding several plants without the RPC growing a list parameter.
+    plant = plant_codes[0] if plant_codes else None
 
     generated = not data.get("password")
     password  = data.get("password") or secrets.token_urlsafe(9)
@@ -879,9 +952,20 @@ def create_user():
             pass
         return jsonify({"error": "Could not create the application identity"}), 400
 
+    if len(plant_codes) > 1:
+        # Same grant policies, same caller context - the RPC covered the first
+        # plant, this covers the rest. A failure here leaves a valid identity
+        # holding fewer plants than asked for, which an administrator can finish
+        # with a PATCH; it is not worth destroying the auth account over.
+        try:
+            _apply_role_and_plant(
+                get_supabase_for_caller(g.access_token), app_user_id, role, plant_codes)
+        except Exception:
+            app.logger.warning("created identity %s with a partial plant set", app_user_id)
+
     resp = {
         "id": app_user_id, "email": email, "display_name": display_name,
-        "role": role, "plant": plant, "active": True,
+        "role": role, "plant": plant, "plants": plant_codes, "active": True,
     }
     if generated:
         resp["temp_password"] = password
@@ -929,13 +1013,17 @@ def update_user(uid):
             return jsonify({"error": "Could not update the account status"}), 400
         touched = True
 
-    if "role" in data or "plant" in data:
+    if "role" in data or "plant" in data or "plants" in data:
         if data.get("role") and data["role"] not in VALID_ROLES:
             return jsonify({"error": f"role must be one of {VALID_ROLES}"}), 400
         if app_user_id == g.caller["id"] and data.get("role") and data["role"] != "admin":
             return jsonify({"error": "You cannot change your own role"}), 400
         try:
-            _apply_role_and_plant(client, app_user_id, data.get("role"), data.get("plant"))
+            plant_codes = _normalise_plants(data)
+        except ValueError:
+            return jsonify({"error": "plants must be a list of plant codes"}), 400
+        try:
+            _apply_role_and_plant(client, app_user_id, data.get("role"), plant_codes)
         except PermissionError:
             return jsonify({"error": "Forbidden"}), 403
         except Exception:
