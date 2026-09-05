@@ -143,9 +143,11 @@ def get_supabase_anon() -> Client:
     )
 
 
-# Legacy `profiles.role` is a single column; the approved model expresses the same
-# thing as capabilities (CDM-05). The API keeps reporting a role so the frontend is
-# unchanged, but the DATABASE is the authority and the role is derived, never stored.
+# The legacy `profiles.role` column WAS a single column. It no longer exists -
+# S3(c) removed the table - and the approved model expresses the same thing as
+# capabilities (CDM-05). The API keeps reporting a role so the frontend contract
+# is unchanged, but the DATABASE is the authority and the role is DERIVED from
+# grants on every request, never stored.
 def _derive_role(group_caps: list[str], plant_caps: dict) -> str:
     if "administer_users" in group_caps:
         return "admin"

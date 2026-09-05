@@ -9,8 +9,10 @@ S2 conversion. Two things changed and both matter:
    entirely - so every RLS defect in identity resolution was invisible, and the
    database was not actually the authority it was documented to be.
 
-2. Authorization is capability-based (`app_users` + group/plant grants), not the
-   single `profiles.role` column. `require_role` is kept as a thin shim over the
+2. Authorization is capability-based (`app_users` + group/plant grants). The
+   single legacy role column it replaced is gone entirely - S3(c) removed
+   `public.profiles` - so capabilities are now the only model there is.
+   `require_role` is kept as a thin shim over the
    derived role so existing route decorators keep working unchanged, and
    `require_group_capability` / `require_plant_capability` express the real model
    for anything new.
