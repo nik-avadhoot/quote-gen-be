@@ -1139,34 +1139,37 @@ def create_user():
         # ordinary table write. This RPC runs as the caller and checks
         # administer_users itself, so the capability - not the service key - is
         # what authorises it. It also creates the role/plant capability grants.
+        # The WHOLE plant set goes in one RPC, which PostgREST runs in a single
+        # transaction - so either every grant commits or none does. The previous
+        # version created the identity with the first plant and added the rest
+        # afterwards, which could leave a real, active user holding part of the
+        # requested access while this route still answered 201. There is now no
+        # interval in which a partially granted identity exists.
         app_user_id = (
             get_supabase_for_caller(g.access_token)
             .rpc("admin_create_app_user", {
                 "p_auth_user_id": uid,
                 "p_display_name": display_name,
                 "p_role":         role,
-                "p_plant_code":   plant,
+                "p_plant_codes":  plant_codes,
             })
             .execute()
         ).data
+        if not app_user_id:
+            raise RuntimeError("no application identity returned")
     except Exception:
-        # Don't leave an orphaned auth account with no application identity.
+        # Compensate COMPLETELY: the database rolled itself back, so the only
+        # thing that can survive is the auth account, and it must not. If even
+        # the compensation fails we say so rather than reporting a success we
+        # cannot stand behind.
         try:
             privileged_client("auth_admin_delete_user").auth.admin.delete_user(uid)
         except Exception:
-            pass
+            app.logger.error(
+                "orphaned auth account after a failed creation - manual cleanup needed")
+            return jsonify({"error": "Could not create the user, and cleanup failed. "
+                                     "Contact an administrator before retrying."}), 500
         return jsonify({"error": "Could not create the application identity"}), 400
-
-    if len(plant_codes) > 1:
-        # Same grant policies, same caller context - the RPC covered the first
-        # plant, this covers the rest. A failure here leaves a valid identity
-        # holding fewer plants than asked for, which an administrator can finish
-        # with a PATCH; it is not worth destroying the auth account over.
-        try:
-            _apply_role_and_plant(
-                get_supabase_for_caller(g.access_token), app_user_id, role, plant_codes)
-        except Exception:
-            app.logger.warning("created identity %s with a partial plant set", app_user_id)
 
     resp = {
         "id": app_user_id, "email": email, "display_name": display_name,

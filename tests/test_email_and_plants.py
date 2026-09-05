@@ -347,6 +347,108 @@ except Exception:
 check(server._normalise_plants({"plants": ["NAG", "PUN", "KOL"]}) == ["NAG", "PUN", "KOL"],
       "P-11 a multi-plant selection is carried through intact")
 
+
+# ───────────────────────────── atomic multi-plant creation (failure injection)
+#
+# The database proves the all-or-nothing grant behaviour (TX-1..TX-13). These
+# assert the ROUTE's half of the contract: one call carrying the whole set, and
+# complete compensation with a truthful failure when that call fails.
+
+STATE["rpc_fails"] = False
+STATE["deleted_auth"] = []
+
+
+class FailingAdminAPI(FakeAdminAPI):
+    def delete_user(self, uid):
+        if STATE.get("delete_fails"):
+            raise RuntimeError("auth delete unavailable")
+        STATE["deleted_auth"].append(uid)
+        return True
+
+
+class TxFakeAuth(FakeAuth):
+    def __init__(self):
+        super().__init__()
+        self.admin = FailingAdminAPI()
+
+
+class TxFakeClient(FakeClient):
+    def __init__(self, token, kind):
+        super().__init__(token, kind)
+        self.auth = TxFakeAuth()
+
+    def rpc(self, name, params):
+        STATE["rpc"].append((self.token, name, params))
+        if name == "admin_create_app_user" and STATE.get("rpc_fails"):
+            raise RuntimeError("plant is not active and cannot receive assignments")
+        data = "target-auth-uuid" if name == "admin_prepare_email_change" else 55
+        return type("R", (), {"execute": lambda s=None: type("D", (), {"data": data})()})()
+
+
+def tx_caller(token):
+    if not token or not isinstance(token, str):
+        raise ValueError("access_token is required")
+    return TxFakeClient(token, "caller")
+
+
+def tx_priv(op):
+    if op not in cc.PRIVILEGED_OPERATIONS:
+        raise cc.PrivilegeError(op)
+    STATE["privileged"].append(op)
+    return TxFakeClient("SERVICE-ROLE", "privileged")
+
+
+server.get_supabase_for_caller = tx_caller
+server.privileged_client = tx_priv
+
+# T-1..T-3: the happy path sends ONE call carrying all three plants
+reset(); STATE["rpc_fails"] = False; STATE["delete_fails"] = False
+STATE["deleted_auth"].clear()
+r = post("/admin/users", {"email": "n@example.invalid", "display_name": "N",
+                          "role": "maker", "plants": ["NAG", "PUN", "KOL"]})
+creates = [x for x in STATE["rpc"] if x[1] == "admin_create_app_user"]
+check(r.status_code == 201, "T-1 creating a Maker with NAG+PUN+KOL succeeds")
+check(len(creates) == 1,
+      "T-2 exactly ONE create call is made - the set is not applied in stages")
+check(creates[0][2].get("p_plant_codes") == ["NAG", "PUN", "KOL"],
+      "T-3 and that single call carries the WHOLE requested plant set")
+check(r.get_json().get("plants") == ["NAG", "PUN", "KOL"],
+      "T-4 the response reports the full set that was actually requested")
+check(STATE["deleted_auth"] == [],
+      "T-5 nothing is compensated on the success path")
+
+# T-6..T-9: failure part-way through must leave nothing and admit it
+reset(); STATE["rpc_fails"] = True; STATE["delete_fails"] = False
+STATE["deleted_auth"].clear()
+r = post("/admin/users", {"email": "n2@example.invalid", "display_name": "N2",
+                          "role": "maker", "plants": ["NAG", "PUN", "KOL"]})
+check(r.status_code == 400,
+      "T-6 a failure applying the plant set returns a TRUTHFUL failure, not 201")
+check("plants" not in (r.get_json() or {}),
+      "T-6a and reports no plant access it did not grant")
+check(STATE["deleted_auth"] == ["new-auth-uuid"],
+      "T-7 the Auth account is deleted - no orphan survives the failure")
+follow_up = [x for x in STATE["rpc"] if x[1] != "admin_create_app_user"]
+check(follow_up == [],
+      "T-8 no follow-up grant call is attempted after the failed creation")
+check(len([x for x in STATE["rpc"] if x[1] == "admin_create_app_user"]) == 1,
+      "T-9 and the creation is not retried into a partial state")
+
+# T-10: if compensation ITSELF fails, say so rather than claim success
+reset(); STATE["rpc_fails"] = True; STATE["delete_fails"] = True
+STATE["deleted_auth"].clear()
+r = post("/admin/users", {"email": "n3@example.invalid", "display_name": "N3",
+                          "role": "maker", "plants": ["NAG", "PUN"]})
+check(r.status_code == 500,
+      "T-10 a failed compensation is reported as a failure, never as success")
+check("Contact an administrator" in (r.get_json() or {}).get("error", ""),
+      "T-10a and says the account needs manual cleanup")
+
+STATE["rpc_fails"] = False
+STATE["delete_fails"] = False
+server.get_supabase_for_caller = fake_caller
+server.privileged_client = fake_priv
+
 print()
 print(f"{PASSES} passed, {len(FAILURES)} failed")
 if FAILURES:
