@@ -215,8 +215,12 @@ def expect_rpc_denied(persona, token, name, body):
 
 # ------------------------------------------------------ the probed surface
 S5_TABLES = [
+    # payment_interest_map_entries was here until S7-6 retired it. The fixed
+    # Payment Terms map is withdrawn (Canonical Amendment 01, A-03): one approved
+    # annual rate is the authority and the effective percentage is derived from
+    # it, so probing a second one would be probing a table that no longer exists.
     "sectors", "sector_versions", "calculation_default_versions",
-    "payment_interest_map_entries", "rate_sets", "rate_set_versions",
+    "rate_sets", "rate_set_versions",
     "rate_entries", "freight_sets", "freight_set_versions", "freight_entries",
     "pricing_basis_releases",
 ]
@@ -236,8 +240,6 @@ INSERT_BODY = {
     "sector_versions": {"sector_id": 1, "version_no": 9901, "margin_pct": 8.0, "created_by": 1},
     "calculation_default_versions": {"version_no": 9901, "engine_version": "probe",
                                      "rounding_rule_version": "probe", "created_by": 1},
-    "payment_interest_map_entries": {"calculation_default_version_id": 1, "credit_days": 30,
-                                     "interest_pct": 0.5, "created_by": 1},
     "rate_sets": {"plant_id": 1, "name": "probe", "created_by": 1},
     "rate_set_versions": {"rate_set_id": 1, "plant_id": 1, "version_no": 9901, "created_by": 1},
     "rate_entries": {"rate_set_version_id": 1, "plant_id": 1, "grade_code": "__PROBE",
@@ -273,7 +275,6 @@ PATCH_BODY = {
     "sectors": {"name": "probe"},
     "sector_versions": {"spec_lang": "probe"},
     "calculation_default_versions": {"engine_version": "probe"},
-    "payment_interest_map_entries": {"interest_pct": 0.5},
     "rate_sets": {"name": "probe"},
     "rate_set_versions": {"status": "draft"},
     "rate_entries": {"description": "probe"},
