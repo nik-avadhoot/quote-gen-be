@@ -34,6 +34,7 @@ from datetime import datetime
 
 from flask import Flask, request, send_file, jsonify, g
 from flask_cors import CORS
+from postgrest.exceptions import APIError
 import openpyxl
 
 from caller_context import (
@@ -904,14 +905,13 @@ def list_customer_families():
     (`has_group_cap`, not `has_plant_cap`) on all four tables, so there is no
     wrong-plant case for this screen to refuse.
 
-    No create/edit/merge/reassign/retire route exists here or anywhere else.
-    `app_private.merge_families`, `app_private.reassign_party_family` and
-    `app_private.graduate_party` are real, tested functions but have no
-    `public` invoker wrapper, so they are not reachable through PostgREST by
-    any caller today - not merely unrouted in Flask. Adding that wrapper is
-    its own reviewable migration (RLS-gated by `manage_customer_master`,
-    confirmed the same way), deliberately not done in this pass. See the U0
-    report S6 and the S13 answered-questions addendum.
+    U1 Customer Family mutations (post-U1-correction binding decisions) are
+    now governed: propose/edit/approve a Family, add/edit/retire an alias,
+    merge, reassign and graduate a Prospect all go through the
+    `app_private.*` operations below via their `public` invoker wrappers -
+    see `docs/u1-customer-family-mutations-packet.md` in quote-gen-fe for the
+    full design record and `tests.customer_family_mutations()` for the
+    DB-layer proof.
     """
     if "read_party_master" not in (g.caller.get("group_capabilities") or []):
         return jsonify({"error": "read_party_master capability is required"}), 403
@@ -935,8 +935,298 @@ def list_customer_families():
         "aliases": aliases,
         "memberships": memberships,
         "parties": parties,
-        "mutations": "not_yet_governed",
+        "mutations": "governed",
     })
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ROUTES: /masters/customer-families/*  — U1 Customer Family mutations.
+#
+# Every route below is a thin caller-context RPC forwarder: it validates the
+# request BODY SHAPE only (types, not RLS's job), calls the corresponding
+# `public.*` invoker wrapper exactly once with the caller's own token, and
+# maps the outcome through _rpc_call(). No route duplicates a capability or
+# state-transition check - app_private.* already enforces every one of those,
+# and duplicating it here would create two places that could drift (the
+# D-27/S6-14 class of defect). No route uses the service-role client.
+#
+# Error mapping is documented in full in
+# docs/u1-customer-family-mutations-packet.md §6 (quote-gen-fe). By the time
+# any of these routes runs, @require_auth has already resolved an ACTIVE
+# caller, so a 42501 raised here is always a capability denial (403), never
+# "unauthenticated" (401) - that case is already handled by require_auth
+# before the route body runs at all.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_RPC_ERROR_STATUS = {
+    "42501": 403,   # capability check failed inside app_private.*
+    "P0002": 404,   # Family / Party / alias not found
+    "40001": 409,   # stale content_version - the CAS check failed
+    "22023": 422,   # forbidden state transition, self-merge, merge-cycle,
+                     # double-retirement, retired target, or a required-field
+                     # check caught by the DB rather than by this route
+    "22007": 422,   # effective date precedes the current membership
+}
+
+
+def _rpc_call(client, name, params):
+    """
+    Call a governed `public.*` RPC and translate the outcome into a stable
+    HTTP error tuple, or (result, None) on success.
+
+    The Postgres message is safe to surface for every mapped code above - each
+    one is written to name no table or column (verified by reading every
+    RAISE in the migration, the same discipline `_valid_email` already uses
+    elsewhere in this file) - but an UNMAPPED error is never forwarded: it is
+    logged server-side only and the client gets a generic 500.
+    """
+    try:
+        return client.rpc(name, params).execute(), None
+    except APIError as exc:
+        status = _RPC_ERROR_STATUS.get(exc.code)
+        if status is not None:
+            return None, (jsonify({"error": exc.message}), status)
+        app.logger.error("unmapped RPC error from %s: %s %s", name, exc.code, exc.message)
+        return None, (jsonify({"error": "Could not complete that action"}), 500)
+    except Exception as exc:
+        app.logger.error("RPC call to %s failed: %s", name, exc)
+        return None, (jsonify({"error": "Could not complete that action"}), 500)
+
+
+def _int_field(data, key):
+    """Strict integer extraction — a bool is not an int, a float string is not either."""
+    v = data.get(key)
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, int):
+        return v
+    if isinstance(v, str) and v.strip().lstrip("-").isdigit():
+        return int(v.strip())
+    return None
+
+
+@app.route("/masters/customer-families", methods=["POST"])
+@require_auth
+def propose_customer_family():
+    """Propose a new Family. manage_customer_master OR make_quote at any active plant."""
+    data = request.get_json(force=True) or {}
+    name = (data.get("name") or "").strip()
+    if not name:
+        return jsonify({"error": "name is required"}), 400
+
+    result, err = _rpc_call(
+        get_supabase_for_caller(g.access_token),
+        "propose_customer_family", {"p_name": name})
+    if err:
+        return err
+    return jsonify({"id": result.data}), 201
+
+
+@app.route("/masters/customer-families/prospects", methods=["POST"])
+@require_auth
+def create_minimal_prospect():
+    """
+    Atomic minimal Prospect creation (CDM-06) - one governed DB operation:
+    reuses family_id if given, else silently proposes a new Family named
+    after the Prospect, inserts the Party and its current membership.
+    """
+    data = request.get_json(force=True) or {}
+    display_name = (data.get("display_name") or "").strip()
+    if not display_name:
+        return jsonify({"error": "display_name is required"}), 400
+    family_id = None
+    if data.get("family_id") is not None:
+        family_id = _int_field(data, "family_id")
+        if family_id is None:
+            return jsonify({"error": "family_id must be an integer"}), 400
+
+    result, err = _rpc_call(
+        get_supabase_for_caller(g.access_token),
+        "create_minimal_prospect",
+        {"p_display_name": display_name, "p_family_id": family_id})
+    if err:
+        return err
+    row = (result.data or [{}])[0]
+    return jsonify({"party_id": row.get("party_id"), "family_id": row.get("family_id")}), 201
+
+
+@app.route("/masters/customer-families/<int:family_id>", methods=["PATCH"])
+@require_auth
+def update_customer_family_name(family_id):
+    """Rename a Family. manage_customer_master. CAS via expected_content_version."""
+    data = request.get_json(force=True) or {}
+    name = (data.get("name") or "").strip()
+    expected = _int_field(data, "expected_content_version")
+    if not name:
+        return jsonify({"error": "name is required"}), 400
+    if expected is None:
+        return jsonify({"error": "expected_content_version is required"}), 400
+
+    _, err = _rpc_call(
+        get_supabase_for_caller(g.access_token),
+        "update_customer_family",
+        {"p_family": family_id, "p_expected_content_version": expected, "p_name": name})
+    if err:
+        return err
+    return jsonify({"ok": True})
+
+
+@app.route("/masters/customer-families/<int:family_id>/approve", methods=["POST"])
+@require_auth
+def approve_customer_family(family_id):
+    """Approve a proposed Family (proposed -> active). manage_customer_master."""
+    data = request.get_json(force=True) or {}
+    expected = _int_field(data, "expected_content_version")
+    if expected is None:
+        return jsonify({"error": "expected_content_version is required"}), 400
+
+    _, err = _rpc_call(
+        get_supabase_for_caller(g.access_token),
+        "approve_customer_family",
+        {"p_family": family_id, "p_expected_content_version": expected})
+    if err:
+        return err
+    return jsonify({"ok": True})
+
+
+@app.route("/masters/customer-families/<int:family_id>/aliases", methods=["POST"])
+@require_auth
+def add_family_alias(family_id):
+    """Add an alias to a Family. manage_customer_master."""
+    data = request.get_json(force=True) or {}
+    alias = (data.get("alias") or "").strip()
+    if not alias:
+        return jsonify({"error": "alias is required"}), 400
+
+    result, err = _rpc_call(
+        get_supabase_for_caller(g.access_token),
+        "add_family_alias", {"p_family": family_id, "p_alias": alias})
+    if err:
+        return err
+    return jsonify({"id": result.data}), 201
+
+
+@app.route("/masters/customer-family-aliases/<int:alias_id>", methods=["PATCH"])
+@require_auth
+def update_family_alias(alias_id):
+    """Rename an alias. manage_customer_master. CAS via expected_content_version."""
+    data = request.get_json(force=True) or {}
+    alias = (data.get("alias") or "").strip()
+    expected = _int_field(data, "expected_content_version")
+    if not alias:
+        return jsonify({"error": "alias is required"}), 400
+    if expected is None:
+        return jsonify({"error": "expected_content_version is required"}), 400
+
+    _, err = _rpc_call(
+        get_supabase_for_caller(g.access_token),
+        "update_family_alias",
+        {"p_alias_id": alias_id, "p_expected_content_version": expected, "p_alias": alias})
+    if err:
+        return err
+    return jsonify({"ok": True})
+
+
+@app.route("/masters/customer-family-aliases/<int:alias_id>/retire", methods=["POST"])
+@require_auth
+def retire_family_alias(alias_id):
+    """Retire an alias. manage_customer_master. CAS via expected_content_version."""
+    data = request.get_json(force=True) or {}
+    expected = _int_field(data, "expected_content_version")
+    if expected is None:
+        return jsonify({"error": "expected_content_version is required"}), 400
+
+    _, err = _rpc_call(
+        get_supabase_for_caller(g.access_token),
+        "retire_family_alias",
+        {"p_alias_id": alias_id, "p_expected_content_version": expected})
+    if err:
+        return err
+    return jsonify({"ok": True})
+
+
+@app.route("/masters/customer-families/merge", methods=["POST"])
+@require_auth
+def merge_customer_families():
+    """
+    Merge two Families. manage_customer_master. Dual-sided CAS - both
+    survivor and retired versions are required and validated before either
+    row changes. Irreversible: no un-merge operation exists.
+    """
+    data = request.get_json(force=True) or {}
+    survivor_id = _int_field(data, "survivor_id")
+    retired_id = _int_field(data, "retired_id")
+    expected_survivor = _int_field(data, "expected_survivor_version")
+    expected_retired = _int_field(data, "expected_retired_version")
+    if survivor_id is None or retired_id is None:
+        return jsonify({"error": "survivor_id and retired_id are required"}), 400
+    if expected_survivor is None or expected_retired is None:
+        return jsonify({"error": "expected_survivor_version and expected_retired_version are required"}), 400
+
+    _, err = _rpc_call(
+        get_supabase_for_caller(g.access_token),
+        "merge_customer_families", {
+            "p_survivor": survivor_id, "p_retired": retired_id,
+            "p_expected_survivor_version": expected_survivor,
+            "p_expected_retired_version": expected_retired,
+        })
+    if err:
+        return err
+    return jsonify({"ok": True})
+
+
+@app.route("/masters/customer-families/reassign", methods=["POST"])
+@require_auth
+def reassign_customer_family():
+    """
+    Reassign a Party to a different Family, with effective dating.
+    manage_customer_master. CAS on the Party protects against both a
+    concurrent reassignment and a concurrent unrelated edit to the Party.
+    """
+    data = request.get_json(force=True) or {}
+    party_id = _int_field(data, "party_id")
+    new_family_id = _int_field(data, "new_family_id")
+    expected = _int_field(data, "expected_content_version")
+    effective_date = data.get("effective_date")
+    if party_id is None or new_family_id is None:
+        return jsonify({"error": "party_id and new_family_id are required"}), 400
+    if expected is None:
+        return jsonify({"error": "expected_content_version is required"}), 400
+
+    params = {
+        "p_party": party_id, "p_new_family": new_family_id,
+        "p_expected_content_version": expected,
+    }
+    if effective_date:
+        params["p_effective"] = effective_date
+
+    _, err = _rpc_call(
+        get_supabase_for_caller(g.access_token),
+        "reassign_customer_family", params)
+    if err:
+        return err
+    return jsonify({"ok": True})
+
+
+@app.route("/masters/customer-families/graduate", methods=["POST"])
+@require_auth
+def graduate_customer_party():
+    """
+    Graduate a Prospect to a Customer, minting the permanent Customer Code.
+    manage_customer_master. Idempotent - a repeat call returns the same code
+    unchanged rather than conflicting, so no CAS is needed here.
+    """
+    data = request.get_json(force=True) or {}
+    party_id = _int_field(data, "party_id")
+    if party_id is None:
+        return jsonify({"error": "party_id is required"}), 400
+
+    result, err = _rpc_call(
+        get_supabase_for_caller(g.access_token),
+        "graduate_customer_party", {"p_party": party_id})
+    if err:
+        return err
+    return jsonify({"customer_code": result.data})
 
 
 @app.route("/auth/logout", methods=["POST"])

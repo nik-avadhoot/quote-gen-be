@@ -157,8 +157,8 @@ check([f["group_customer_code"] for f in body["families"]] == ["F-005"],
 check(body["aliases"][0]["alias"] == "Acme Corp", "CF-4b with its alias")
 check(body["memberships"][0]["is_current"] is True, "CF-4c its current membership")
 check(body["parties"][0]["customer_code"] == "C-009", "CF-4d and the Party it points at")
-check(body["mutations"] == "not_yet_governed",
-      "CF-4e the response states mutations are not governed - no dead action implied")
+check(body["mutations"] == "governed",
+      "CF-4e the response states mutations are governed, now that the U1 mutation routes exist")
 
 # ------------------------------------------------- CF-5 no service-role client
 check(all(t != "SERVICE-ROLE" for t, _ in CALLS), "CF-5 no service-role client is used at any point")

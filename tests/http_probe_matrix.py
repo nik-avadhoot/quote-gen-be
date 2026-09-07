@@ -313,6 +313,26 @@ S6_RPCS = {
     "revise_batch_profile": {"p_batch": 1, "p_expected_content_version": 1},
 }
 
+# U1 Customer Family mutations (post-U1-correction binding decisions) - the ten
+# public invoker wrappers added alongside app_private.* CAS-protected
+# operations. Every well-formed value here is arbitrary but correctly typed,
+# same discipline as S5_RPCS/S6_RPCS above: anon must never reach
+# authorization regardless of whether the ids resolve to real rows, so a
+# refusal here proves nothing about which ids exist.
+U1_FAMILY_B_RPCS = {
+    "propose_customer_family": {"p_name": "__probe"},
+    "create_minimal_prospect": {"p_display_name": "__probe", "p_family_id": None},
+    "update_customer_family": {"p_family": 1, "p_expected_content_version": 1, "p_name": "__probe"},
+    "approve_customer_family": {"p_family": 1, "p_expected_content_version": 1},
+    "add_family_alias": {"p_family": 1, "p_alias": "__probe"},
+    "update_family_alias": {"p_alias_id": 1, "p_expected_content_version": 1, "p_alias": "__probe"},
+    "retire_family_alias": {"p_alias_id": 1, "p_expected_content_version": 1},
+    "merge_customer_families": {"p_survivor": 1, "p_retired": 2,
+                                "p_expected_survivor_version": 1, "p_expected_retired_version": 1},
+    "reassign_customer_family": {"p_party": 1, "p_new_family": 1, "p_expected_content_version": 1},
+    "graduate_customer_party": {"p_party": 1},
+}
+
 # Private implementations and the helper, which must not be routable at all.
 UNROUTABLE = [
     ("/rest/v1/rpc/has_any_plant_cap", {"p_cap": "make_quote"}),
@@ -385,6 +405,7 @@ def main():
 
     anon_matrix(S5_TABLES, S5_RPCS, "S5 surface - Family D and E")
     anon_matrix(S6_TABLES, S6_RPCS, "S6 surface - Family F")
+    anon_matrix([], U1_FAMILY_B_RPCS, "U1 surface - Customer Family mutations")
     unroutable_matrix()
 
     if not args.anon_only:
