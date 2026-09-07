@@ -16,11 +16,16 @@ Auth JWTs locally once the backend has routes that need to check a user's
 access token.
 """
 import os
+from pathlib import Path
 
 from dotenv import load_dotenv
 from supabase import create_client, Client
 
-load_dotenv()
+# Resolved relative to this file, not the process's working directory, so the
+# backend finds its .env regardless of where it's launched from. load_dotenv's
+# default override=False means already-set process/deployment env vars win;
+# .env only fills in what's missing.
+load_dotenv(Path(__file__).resolve().parent / ".env")
 
 SUPABASE_JWKS_URL = os.environ.get("SUPABASE_JWKS_URL")
 

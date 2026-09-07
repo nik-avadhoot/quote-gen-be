@@ -31,6 +31,17 @@ import io
 import re
 import secrets
 from datetime import datetime
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+# Resolved relative to this file, not the process's working directory, so
+# local dev finds quote-gen-be/.env no matter where the server is launched
+# from (e.g. `python quote-gen-be/server.py` from the repo root). Runs before
+# caller_context/auth are imported, since their env lookups need this done
+# first. override=False (the default) means an already-set process/Vercel
+# env var always wins — .env is only the local fallback.
+load_dotenv(Path(__file__).resolve().parent / ".env")
 
 from flask import Flask, request, send_file, jsonify, g
 from flask_cors import CORS
