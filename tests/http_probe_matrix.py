@@ -176,6 +176,25 @@ def expect_anon_refused(persona, method, path, body=None):
     record(persona, method, path, note, status, text, ok)
 
 
+def expect_service_role_rpc_refused(name, body):
+    """
+    U1-CF-C1. service_role bypasses RLS (BYPASSRLS) but that is a DIFFERENT
+    control from function EXECUTE privilege - this proves the latter directly
+    over real HTTP, calling the RPC with the service-role key exactly the way
+    `svc()` does for fixture setup, and expects PostgREST to refuse it the
+    same way it refuses anon: 401/403/404, never a successful call. A 400 is
+    not accepted here either, for the same reason expect_anon_refused
+    excludes it - it would mean the request never reached authorization.
+    """
+    path = "/rest/v1/rpc/" + name
+    status, text = http("POST", path, token=SECRET_KEY, body=body, key=SECRET_KEY)
+    ok = status in (401, 403, 404)
+    note = "401/403/404 (service_role: EXECUTE explicitly revoked, U1-CF-C1)"
+    if status == 400:
+        note += " (400 = malformed, proves nothing)"
+    record("service_role", "POST", path, note, status, text, ok)
+
+
 def expect_empty_read(persona, token, path):
     status, text = http("GET", path, token=token)
     rows = rows_of(text)
@@ -406,6 +425,9 @@ def main():
     anon_matrix(S5_TABLES, S5_RPCS, "S5 surface - Family D and E")
     anon_matrix(S6_TABLES, S6_RPCS, "S6 surface - Family F")
     anon_matrix([], U1_FAMILY_B_RPCS, "U1 surface - Customer Family mutations")
+    print("\n=== U1 surface - Customer Family mutations: persona service_role (U1-CF-C1) ===")
+    for name, body in U1_FAMILY_B_RPCS.items():
+        expect_service_role_rpc_refused(name, body)
     unroutable_matrix()
 
     if not args.anon_only:

@@ -19,6 +19,19 @@ the SAME 42501 the database would raise and confirming the route maps it to
 403, not by a pre-RPC short-circuit (that pattern belongs to the read-only
 GET /masters/customer-families route tested separately, which pre-resolves
 group_capabilities at no extra query cost; none of these mutation routes do).
+
+U1-CF-C2 correction. server.py's _rpc_call() used to return the raw Postgres
+exception message (`exc.message`) for every mapped SQLSTATE - a violation of
+the binding instruction not to surface raw database text. The error-mapping
+section below now injects a Postgres message SHAPED LIKE A REAL ONE (naming a
+schema-qualified table, a column and a function) for every mapped code, not
+only the unmapped case, and asserts none of that text - table name, column
+name, function name, the SQLSTATE itself, or any fragment of the exception
+text - reaches the response body for any of them. It also asserts each
+mapped code produces the deterministic application-owned `error_code` and a
+message identical to server.py's own fixed `_ERROR_MESSAGE` text, and that
+`server.py._RPC_ERROR_MAP`'s full key set is exercised here (catching a code
+added to one dict and not the other).
 """
 import os
 import sys
@@ -219,32 +232,78 @@ for label, method, path, body in MISSING_FIELD_CASES:
         r = c.open(path, method=method, json=body, headers=AUTH)
     check(r.status_code == 400, f"{label}: rejected 400 before any RPC is attempted")
     check(len(RPC_CALLS) == 0, f"{label}: no RPC call was made")
+    check((r.get_json() or {}).get("error_code") == "INVALID_INPUT",
+          f"{label}: carries the deterministic error_code INVALID_INPUT")
 
-# ------------------------------------------- Postgres error code -> HTTP status
+# ------------------------------------------- Postgres error code -> stable identifier
+# U1-CF-C2. Every case injects a Postgres message shaped like a REAL one
+# would be - naming a schema-qualified table, a column, and a function, the
+# exact things a raw `exc.message` would leak - and proves none of that text,
+# nor the raw SQLSTATE, reaches the response body for ANY mapped code, not
+# only the unmapped one. Each mapped code must also produce the deterministic
+# application-owned error_code and a message identical to server.py's own
+# fixed _ERROR_MESSAGE text - proving the response is backend-authored, not a
+# passthrough that merely happens not to contain today's leak strings.
+LEAKY_MESSAGE = (
+    'update or delete on table "public.customer_families" violates foreign key '
+    'constraint "party_family_memberships_family_id_fkey" on column '
+    '"party_family_memberships.family_id" - function app_private.merge_families '
+    'raised this at line 42'
+)
+
 ERROR_MAPPING_CASES = [
-    ("no capability", "42501", 403, "approve", "POST", "/masters/customer-families/7/approve",
+    ("no capability", "42501", 403, "CAPABILITY_REQUIRED", "approve", "POST",
+     "/masters/customer-families/7/approve",
      {"expected_content_version": 1}, "approve_customer_family"),
-    ("not found", "P0002", 404, "update-name", "PATCH", "/masters/customer-families/999",
+    ("not found", "P0002", 404, "RECORD_NOT_FOUND", "update-name", "PATCH",
+     "/masters/customer-families/999",
      {"name": "X", "expected_content_version": 1}, "update_customer_family"),
-    ("stale version", "40001", 409, "update-name", "PATCH", "/masters/customer-families/7",
+    ("stale version", "40001", 409, "STALE_VERSION", "update-name", "PATCH",
+     "/masters/customer-families/7",
      {"name": "X", "expected_content_version": 1}, "update_customer_family"),
-    ("forbidden transition", "22023", 422, "approve", "POST", "/masters/customer-families/7/approve",
+    ("forbidden transition", "22023", 422, "TRANSITION_NOT_ALLOWED", "approve", "POST",
+     "/masters/customer-families/7/approve",
      {"expected_content_version": 1}, "approve_customer_family"),
-    ("effective date precedes membership", "22007", 422, "reassign", "POST",
+    ("effective date precedes membership", "22007", 422, "INVALID_EFFECTIVE_DATE", "reassign", "POST",
      "/masters/customer-families/reassign",
      {"party_id": 9, "new_family_id": 8, "expected_content_version": 1}, "reassign_customer_family"),
-    ("unmapped code", "XXNEW", 500, "approve", "POST", "/masters/customer-families/7/approve",
+    ("unmapped code", "XXNEW", 500, "INTERNAL_ERROR", "approve", "POST",
+     "/masters/customer-families/7/approve",
      {"expected_content_version": 1}, "approve_customer_family"),
 ]
-for desc, code, expected_status, label, method, path, body, rpc_name in ERROR_MAPPING_CASES:
-    reset(rpc_name, api_error(code, "some internal detail that must not leak on 500"))
+
+import server as _server_mod  # noqa: E402
+
+for desc, code, expected_status, expected_error_code, label, method, path, body, rpc_name in ERROR_MAPPING_CASES:
+    reset(rpc_name, api_error(code, LEAKY_MESSAGE))
     with app.test_client() as c:
         r = c.open(path, method=method, json=body, headers=AUTH)
+    data = r.get_json() or {}
+    raw_text = r.get_data(as_text=True)
+
     check(r.status_code == expected_status,
           f"{label}: Postgres {code} ({desc}) maps to HTTP {expected_status}")
-    if expected_status == 500:
-        check("some internal detail" not in (r.get_json() or {}).get("error", ""),
-              f"{label}: an unmapped Postgres error never leaks its raw message to the client")
+    check(data.get("error_code") == expected_error_code,
+          f"{label}: response carries the deterministic error_code {expected_error_code} "
+          f"(got {data.get('error_code')!r})")
+    check(data.get("error") == _server_mod._ERROR_MESSAGE.get(expected_error_code),
+          f"{label}: the message is server.py's own fixed text for {expected_error_code}, "
+          "not anything derived from the exception")
+    check(code not in raw_text,
+          f"{label}: the raw SQLSTATE {code} does not appear anywhere in the response")
+    check("customer_families" not in raw_text and "party_family_memberships" not in raw_text,
+          f"{label}: no table name leaks into the response")
+    check("family_id" not in raw_text,
+          f"{label}: no column name leaks into the response")
+    check("app_private.merge_families" not in raw_text,
+          f"{label}: no function name leaks into the response")
+    check("violates foreign key constraint" not in raw_text and "line 42" not in raw_text,
+          f"{label}: no fragment of the raw Postgres exception text leaks into the response")
+
+# every SQLSTATE in server.py's own map produces a status this test actually
+# exercised above - catches a code added to one dict and not the other
+check(set(_server_mod._RPC_ERROR_MAP) == {c for _, c, *_ in ERROR_MAPPING_CASES if c != "XXNEW"},
+      "every mapped SQLSTATE in server.py's _RPC_ERROR_MAP is covered by a case above")
 
 # --------------------------------------------------------- no service-role client
 check(all(tok != "SERVICE-ROLE" for tok, _, _ in RPC_CALLS),

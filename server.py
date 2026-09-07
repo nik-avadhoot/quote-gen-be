@@ -956,17 +956,58 @@ def list_customer_families():
 # caller, so a 42501 raised here is always a capability denial (403), never
 # "unauthenticated" (401) - that case is already handled by require_auth
 # before the route body runs at all.
+#
+# U1-CF-C2 correction. The first pass forwarded `exc.message` (the raw
+# Postgres exception text) to the client for every mapped SQLSTATE. That
+# contradicts the binding instruction not to pass raw Postgres exception text
+# to the frontend - a future RAISE naming a table or column would leak it with
+# no code change on this side to catch. Every response from this file now
+# carries an application-owned `error_code` and a fixed, backend-authored
+# message; the SQLSTATE and the database's own message are logged server-side
+# only, never returned.
 # ═══════════════════════════════════════════════════════════════════════════════
 
-_RPC_ERROR_STATUS = {
-    "42501": 403,   # capability check failed inside app_private.*
-    "P0002": 404,   # Family / Party / alias not found
-    "40001": 409,   # stale content_version - the CAS check failed
-    "22023": 422,   # forbidden state transition, self-merge, merge-cycle,
-                     # double-retirement, retired target, or a required-field
-                     # check caught by the DB rather than by this route
-    "22007": 422,   # effective date precedes the current membership
+_RPC_ERROR_MAP = {
+    "42501": "CAPABILITY_REQUIRED",   # capability check failed inside app_private.*
+    "P0002": "RECORD_NOT_FOUND",      # Family / Party / alias not found
+    "40001": "STALE_VERSION",         # stale content_version - the CAS check failed
+    "22023": "TRANSITION_NOT_ALLOWED",  # forbidden state transition, self-merge,
+                                         # merge-cycle, double-retirement, retired target
+    "22007": "INVALID_EFFECTIVE_DATE",  # effective date precedes the current membership
 }
+
+_ERROR_STATUS = {
+    "CAPABILITY_REQUIRED": 403,
+    "RECORD_NOT_FOUND": 404,
+    "STALE_VERSION": 409,
+    "TRANSITION_NOT_ALLOWED": 422,
+    "INVALID_EFFECTIVE_DATE": 422,
+    "INVALID_INPUT": 400,
+    "INTERNAL_ERROR": 500,
+}
+
+_ERROR_MESSAGE = {
+    "CAPABILITY_REQUIRED": "You do not have permission to perform this action.",
+    "RECORD_NOT_FOUND": "The requested record could not be found.",
+    "STALE_VERSION": "This record changed since you last read it. Reload and try again.",
+    "TRANSITION_NOT_ALLOWED": "That action is not allowed for this record's current state.",
+    "INVALID_EFFECTIVE_DATE": "The effective date is not valid for this change.",
+    "INTERNAL_ERROR": "Could not complete that action.",
+}
+
+
+def _error(code, message=None):
+    """
+    One stable JSON error shape for every route in this section:
+    {"error_code": "<APPLICATION_OWNED_CONSTANT>", "error": "<fixed or route-authored text>"}.
+    `message` is only ever text THIS FILE wrote (a field-required message, or
+    one of the fixed _ERROR_MESSAGE strings) - never database-supplied text.
+    """
+    return jsonify({"error_code": code, "error": message or _ERROR_MESSAGE[code]}), _ERROR_STATUS[code]
+
+
+def _invalid_input(message):
+    return _error("INVALID_INPUT", message)
 
 
 def _rpc_call(client, name, params):
@@ -974,23 +1015,23 @@ def _rpc_call(client, name, params):
     Call a governed `public.*` RPC and translate the outcome into a stable
     HTTP error tuple, or (result, None) on success.
 
-    The Postgres message is safe to surface for every mapped code above - each
-    one is written to name no table or column (verified by reading every
-    RAISE in the migration, the same discipline `_valid_email` already uses
-    elsewhere in this file) - but an UNMAPPED error is never forwarded: it is
-    logged server-side only and the client gets a generic 500.
+    The Postgres SQLSTATE decides which application-owned error_code and HTTP
+    status come back; the database's own exception message is logged
+    server-side only (`app.logger`) and never reaches the response body, for
+    both mapped and unmapped codes alike.
     """
     try:
         return client.rpc(name, params).execute(), None
     except APIError as exc:
-        status = _RPC_ERROR_STATUS.get(exc.code)
-        if status is not None:
-            return None, (jsonify({"error": exc.message}), status)
+        code = _RPC_ERROR_MAP.get(exc.code)
+        if code is not None:
+            app.logger.info("RPC %s refused: %s %s -> %s", name, exc.code, exc.message, code)
+            return None, _error(code)
         app.logger.error("unmapped RPC error from %s: %s %s", name, exc.code, exc.message)
-        return None, (jsonify({"error": "Could not complete that action"}), 500)
+        return None, _error("INTERNAL_ERROR")
     except Exception as exc:
         app.logger.error("RPC call to %s failed: %s", name, exc)
-        return None, (jsonify({"error": "Could not complete that action"}), 500)
+        return None, _error("INTERNAL_ERROR")
 
 
 def _int_field(data, key):
@@ -1012,7 +1053,7 @@ def propose_customer_family():
     data = request.get_json(force=True) or {}
     name = (data.get("name") or "").strip()
     if not name:
-        return jsonify({"error": "name is required"}), 400
+        return _invalid_input("name is required")
 
     result, err = _rpc_call(
         get_supabase_for_caller(g.access_token),
@@ -1033,12 +1074,12 @@ def create_minimal_prospect():
     data = request.get_json(force=True) or {}
     display_name = (data.get("display_name") or "").strip()
     if not display_name:
-        return jsonify({"error": "display_name is required"}), 400
+        return _invalid_input("display_name is required")
     family_id = None
     if data.get("family_id") is not None:
         family_id = _int_field(data, "family_id")
         if family_id is None:
-            return jsonify({"error": "family_id must be an integer"}), 400
+            return _invalid_input("family_id must be an integer")
 
     result, err = _rpc_call(
         get_supabase_for_caller(g.access_token),
@@ -1058,9 +1099,9 @@ def update_customer_family_name(family_id):
     name = (data.get("name") or "").strip()
     expected = _int_field(data, "expected_content_version")
     if not name:
-        return jsonify({"error": "name is required"}), 400
+        return _invalid_input("name is required")
     if expected is None:
-        return jsonify({"error": "expected_content_version is required"}), 400
+        return _invalid_input("expected_content_version is required")
 
     _, err = _rpc_call(
         get_supabase_for_caller(g.access_token),
@@ -1078,7 +1119,7 @@ def approve_customer_family(family_id):
     data = request.get_json(force=True) or {}
     expected = _int_field(data, "expected_content_version")
     if expected is None:
-        return jsonify({"error": "expected_content_version is required"}), 400
+        return _invalid_input("expected_content_version is required")
 
     _, err = _rpc_call(
         get_supabase_for_caller(g.access_token),
@@ -1096,7 +1137,7 @@ def add_family_alias(family_id):
     data = request.get_json(force=True) or {}
     alias = (data.get("alias") or "").strip()
     if not alias:
-        return jsonify({"error": "alias is required"}), 400
+        return _invalid_input("alias is required")
 
     result, err = _rpc_call(
         get_supabase_for_caller(g.access_token),
@@ -1114,9 +1155,9 @@ def update_family_alias(alias_id):
     alias = (data.get("alias") or "").strip()
     expected = _int_field(data, "expected_content_version")
     if not alias:
-        return jsonify({"error": "alias is required"}), 400
+        return _invalid_input("alias is required")
     if expected is None:
-        return jsonify({"error": "expected_content_version is required"}), 400
+        return _invalid_input("expected_content_version is required")
 
     _, err = _rpc_call(
         get_supabase_for_caller(g.access_token),
@@ -1134,7 +1175,7 @@ def retire_family_alias(alias_id):
     data = request.get_json(force=True) or {}
     expected = _int_field(data, "expected_content_version")
     if expected is None:
-        return jsonify({"error": "expected_content_version is required"}), 400
+        return _invalid_input("expected_content_version is required")
 
     _, err = _rpc_call(
         get_supabase_for_caller(g.access_token),
@@ -1159,9 +1200,9 @@ def merge_customer_families():
     expected_survivor = _int_field(data, "expected_survivor_version")
     expected_retired = _int_field(data, "expected_retired_version")
     if survivor_id is None or retired_id is None:
-        return jsonify({"error": "survivor_id and retired_id are required"}), 400
+        return _invalid_input("survivor_id and retired_id are required")
     if expected_survivor is None or expected_retired is None:
-        return jsonify({"error": "expected_survivor_version and expected_retired_version are required"}), 400
+        return _invalid_input("expected_survivor_version and expected_retired_version are required")
 
     _, err = _rpc_call(
         get_supabase_for_caller(g.access_token),
@@ -1189,9 +1230,9 @@ def reassign_customer_family():
     expected = _int_field(data, "expected_content_version")
     effective_date = data.get("effective_date")
     if party_id is None or new_family_id is None:
-        return jsonify({"error": "party_id and new_family_id are required"}), 400
+        return _invalid_input("party_id and new_family_id are required")
     if expected is None:
-        return jsonify({"error": "expected_content_version is required"}), 400
+        return _invalid_input("expected_content_version is required")
 
     params = {
         "p_party": party_id, "p_new_family": new_family_id,
@@ -1219,7 +1260,7 @@ def graduate_customer_party():
     data = request.get_json(force=True) or {}
     party_id = _int_field(data, "party_id")
     if party_id is None:
-        return jsonify({"error": "party_id is required"}), 400
+        return _invalid_input("party_id is required")
 
     result, err = _rpc_call(
         get_supabase_for_caller(g.access_token),
