@@ -95,12 +95,13 @@ WITH_CAP_FIXTURE_ROWS = {
     ],
     "plant_capability_grants": [],
     "customer_families": [{"id": 5, "group_customer_code": "F-005", "name": "Acme",
-                            "status": "active", "surviving_family_id": None}],
-    "customer_family_aliases": [{"id": 1, "family_id": 5, "alias": "Acme Corp"}],
+                            "status": "active", "surviving_family_id": None, "content_version": 3}],
+    "customer_family_aliases": [{"id": 1, "family_id": 5, "alias": "Acme Corp",
+                                  "status": "active", "content_version": 1}],
     "party_family_memberships": [{"id": 1, "party_id": 9, "family_id": 5, "effective_from": "2026-01-01",
                                    "effective_until": None, "is_current": True}],
     "parties": [{"id": 9, "customer_code": "C-009", "display_name": "Acme Ltd",
-                 "lifecycle_state": "customer", "status": "active"}],
+                 "lifecycle_state": "customer", "status": "active", "content_version": 2}],
 }
 
 ROWS = NO_CAP_ROWS  # swapped per-scenario below
@@ -157,6 +158,9 @@ check([f["group_customer_code"] for f in body["families"]] == ["F-005"],
 check(body["aliases"][0]["alias"] == "Acme Corp", "CF-4b with its alias")
 check(body["memberships"][0]["is_current"] is True, "CF-4c its current membership")
 check(body["parties"][0]["customer_code"] == "C-009", "CF-4d and the Party it points at")
+check(body["families"][0]["content_version"] == 3 and body["parties"][0]["content_version"] == 2
+      and body["aliases"][0]["content_version"] == 1,
+      "CF-4f every mutable record's content_version is exposed - the frontend needs it for CAS")
 check(body["mutations"] == "governed",
       "CF-4e the response states mutations are governed, now that the U1 mutation routes exist")
 

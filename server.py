@@ -918,15 +918,15 @@ def list_customer_families():
 
     client = get_supabase_for_caller(g.access_token)
     families = (client.table("customer_families")
-                .select("id, group_customer_code, name, status, surviving_family_id")
+                .select("id, group_customer_code, name, status, surviving_family_id, content_version")
                 .execute()).data or []
     aliases = (client.table("customer_family_aliases")
-               .select("id, family_id, alias").execute()).data or []
+               .select("id, family_id, alias, status, content_version").execute()).data or []
     memberships = (client.table("party_family_memberships")
                    .select("id, party_id, family_id, effective_from, effective_until, is_current")
                    .execute()).data or []
     parties = (client.table("parties")
-               .select("id, customer_code, display_name, lifecycle_state, status")
+               .select("id, customer_code, display_name, lifecycle_state, status, content_version")
                .execute()).data or []
 
     families.sort(key=lambda r: r.get("group_customer_code") or r.get("name") or "")
