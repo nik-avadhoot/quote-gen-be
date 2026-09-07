@@ -1281,6 +1281,37 @@ def graduate_customer_party():
     return jsonify({"customer_code": result.data})
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# ROUTE: /masters/parties/<id>  — U1 Slice A Party editing (display_name only).
+#
+# Authorised by docs/u1-customer-foundation-authorization-packet.md (quote-gen-fe),
+# Slice A. Same thin caller-context RPC forwarder shape as every route above -
+# validates body SHAPE only, calls public.update_customer_party exactly once
+# with the caller's own token, maps the outcome through _rpc_call(). No new
+# error code: 42501/P0002/40001/22023 already cover every condition this
+# function raises.
+# ═══════════════════════════════════════════════════════════════════════════════
+@app.route("/masters/parties/<int:party_id>", methods=["PATCH"])
+@require_auth
+def update_customer_party(party_id):
+    """Rename a Party's display_name. manage_customer_master. CAS via expected_content_version."""
+    data = request.get_json(force=True) or {}
+    display_name = (data.get("display_name") or "").strip()
+    expected = _int_field(data, "expected_content_version")
+    if not display_name:
+        return _invalid_input("display_name is required")
+    if expected is None:
+        return _invalid_input("expected_content_version is required")
+
+    _, err = _rpc_call(
+        get_supabase_for_caller(g.access_token),
+        "update_customer_party",
+        {"p_party": party_id, "p_expected_content_version": expected, "p_display_name": display_name})
+    if err:
+        return err
+    return jsonify({"ok": True})
+
+
 @app.route("/auth/logout", methods=["POST"])
 @require_auth
 def auth_logout():

@@ -352,6 +352,12 @@ U1_FAMILY_B_RPCS = {
     "graduate_customer_party": {"p_party": 1},
 }
 
+# U1 Slice A - Party editing (docs/u1-customer-foundation-authorization-
+# packet.md, quote-gen-fe). One new public wrapper.
+U1_SLICE_A_RPCS = {
+    "update_customer_party": {"p_party": 1, "p_expected_content_version": 1, "p_display_name": "__probe"},
+}
+
 # Private implementations and the helper, which must not be routable at all.
 UNROUTABLE = [
     ("/rest/v1/rpc/has_any_plant_cap", {"p_cap": "make_quote"}),
@@ -427,6 +433,10 @@ def main():
     anon_matrix([], U1_FAMILY_B_RPCS, "U1 surface - Customer Family mutations")
     print("\n=== U1 surface - Customer Family mutations: persona service_role (U1-CF-C1) ===")
     for name, body in U1_FAMILY_B_RPCS.items():
+        expect_service_role_rpc_refused(name, body)
+    anon_matrix([], U1_SLICE_A_RPCS, "U1 Slice A surface - Party editing")
+    print("\n=== U1 Slice A surface - Party editing: persona service_role ===")
+    for name, body in U1_SLICE_A_RPCS.items():
         expect_service_role_rpc_refused(name, body)
     unroutable_matrix()
 
