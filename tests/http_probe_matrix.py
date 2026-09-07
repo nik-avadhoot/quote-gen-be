@@ -358,6 +358,21 @@ U1_SLICE_A_RPCS = {
     "update_customer_party": {"p_party": 1, "p_expected_content_version": 1, "p_display_name": "__probe"},
 }
 
+# U1 Slice C - Customer Location proposal/version/approval/retirement
+# (docs/u1-customer-foundation-authorization-packet.md, quote-gen-fe). No
+# eligibility-change RPC exists - post-proposal eligibility change is
+# Product-Owner-blocked, not built.
+U1_SLICE_C_RPCS = {
+    "propose_customer_location": {"p_party": 1, "p_location_type": None, "p_address_text": None,
+                                   "p_contact_name": None, "p_notes": None,
+                                   "p_bill_to_eligible": True, "p_ship_to_eligible": False},
+    "update_customer_location": {"p_location": 1, "p_expected_content_version": 1,
+                                  "p_address_text": "__probe", "p_contact_name": None, "p_notes": None},
+    "approve_customer_location": {"p_location": 1, "p_expected_content_version": 1},
+    "retire_customer_location": {"p_location": 1, "p_expected_content_version": 1},
+    "assign_customer_location_code": {"p_location": 1},
+}
+
 # Private implementations and the helper, which must not be routable at all.
 UNROUTABLE = [
     ("/rest/v1/rpc/has_any_plant_cap", {"p_cap": "make_quote"}),
@@ -437,6 +452,10 @@ def main():
     anon_matrix([], U1_SLICE_A_RPCS, "U1 Slice A surface - Party editing")
     print("\n=== U1 Slice A surface - Party editing: persona service_role ===")
     for name, body in U1_SLICE_A_RPCS.items():
+        expect_service_role_rpc_refused(name, body)
+    anon_matrix([], U1_SLICE_C_RPCS, "U1 Slice C surface - Customer Location mutations")
+    print("\n=== U1 Slice C surface - Customer Location mutations: persona service_role ===")
+    for name, body in U1_SLICE_C_RPCS.items():
         expect_service_role_rpc_refused(name, body)
     unroutable_matrix()
 

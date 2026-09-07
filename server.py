@@ -939,6 +939,17 @@ def list_customer_families():
     parties = (client.table("parties")
                .select("id, customer_code, display_name, lifecycle_state, status, content_version")
                .execute()).data or []
+    # U1 Slice C addition - additive, same read_party_master gate, no RLS
+    # change. Lets the frontend show a Party's Locations, including
+    # descriptive version history, without a second round-trip.
+    locations = (client.table("customer_locations")
+                 .select("id, party_id, location_code, bill_to_eligible, ship_to_eligible, "
+                         "status, content_version")
+                 .execute()).data or []
+    location_versions = (client.table("customer_location_versions")
+                          .select("id, location_id, version_no, location_type, address_text, "
+                                  "contact_name, notes, status")
+                          .execute()).data or []
 
     families.sort(key=lambda r: r.get("group_customer_code") or r.get("name") or "")
     return jsonify({
@@ -946,6 +957,8 @@ def list_customer_families():
         "aliases": aliases,
         "memberships": memberships,
         "parties": parties,
+        "locations": locations,
+        "location_versions": location_versions,
         "mutations": "governed",
     })
 
@@ -1310,6 +1323,119 @@ def update_customer_party(party_id):
     if err:
         return err
     return jsonify({"ok": True})
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ROUTES: /masters/parties/<id>/locations, /masters/customer-locations/*
+# — U1 Slice C Customer Location proposal/version/approval/retirement.
+#
+# Authorised by docs/u1-customer-foundation-authorization-packet.md
+# (quote-gen-fe), Slice C. Same thin caller-context RPC forwarder shape as
+# every route above. No eligibility-change route exists here - post-proposal
+# eligibility change is Product-Owner-blocked, not built (see the packet).
+# No new error code: 42501/P0002/40001/22023 already cover every condition.
+# ═══════════════════════════════════════════════════════════════════════════════
+@app.route("/masters/parties/<int:party_id>/locations", methods=["POST"])
+@require_auth
+def propose_customer_location(party_id):
+    """Propose a Customer Location. manage_customer_master OR make_quote at any active plant."""
+    data = request.get_json(force=True) or {}
+    bill_to = bool(data.get("bill_to_eligible"))
+    ship_to = bool(data.get("ship_to_eligible"))
+    if not (bill_to or ship_to):
+        return _invalid_input("a Location must be Bill-to, Ship-to or both")
+
+    result, err = _rpc_call(
+        get_supabase_for_caller(g.access_token),
+        "propose_customer_location", {
+            "p_party": party_id,
+            "p_location_type": data.get("location_type"),
+            "p_address_text": data.get("address_text"),
+            "p_contact_name": data.get("contact_name"),
+            "p_notes": data.get("notes"),
+            "p_bill_to_eligible": bill_to,
+            "p_ship_to_eligible": ship_to,
+        })
+    if err:
+        return err
+    return jsonify({"id": result.data}), 201
+
+
+@app.route("/masters/customer-locations/<int:location_id>", methods=["PATCH"])
+@require_auth
+def update_customer_location(location_id):
+    """Edit a Location's descriptive detail (new version). manage_customer_master. CAS."""
+    data = request.get_json(force=True) or {}
+    expected = _int_field(data, "expected_content_version")
+    if expected is None:
+        return _invalid_input("expected_content_version is required")
+
+    _, err = _rpc_call(
+        get_supabase_for_caller(g.access_token),
+        "update_customer_location", {
+            "p_location": location_id,
+            "p_expected_content_version": expected,
+            "p_address_text": data.get("address_text"),
+            "p_contact_name": data.get("contact_name"),
+            "p_notes": data.get("notes"),
+        })
+    if err:
+        return err
+    return jsonify({"ok": True})
+
+
+@app.route("/masters/customer-locations/<int:location_id>/approve", methods=["POST"])
+@require_auth
+def approve_customer_location(location_id):
+    """Approve a proposed Location (proposed -> active). manage_customer_master."""
+    data = request.get_json(force=True) or {}
+    expected = _int_field(data, "expected_content_version")
+    if expected is None:
+        return _invalid_input("expected_content_version is required")
+
+    _, err = _rpc_call(
+        get_supabase_for_caller(g.access_token),
+        "approve_customer_location",
+        {"p_location": location_id, "p_expected_content_version": expected})
+    if err:
+        return err
+    return jsonify({"ok": True})
+
+
+@app.route("/masters/customer-locations/<int:location_id>/retire", methods=["POST"])
+@require_auth
+def retire_customer_location(location_id):
+    """Retire an active Location (active -> inactive). manage_customer_master."""
+    data = request.get_json(force=True) or {}
+    expected = _int_field(data, "expected_content_version")
+    if expected is None:
+        return _invalid_input("expected_content_version is required")
+
+    _, err = _rpc_call(
+        get_supabase_for_caller(g.access_token),
+        "retire_customer_location",
+        {"p_location": location_id, "p_expected_content_version": expected})
+    if err:
+        return err
+    return jsonify({"ok": True})
+
+
+@app.route("/masters/customer-locations/<int:location_id>/assign-code", methods=["POST"])
+@require_auth
+def assign_customer_location_code(location_id):
+    """
+    Mint the permanent Location Code. manage_customer_master. Idempotent - a
+    repeat call returns the same code unchanged, so no CAS is needed here.
+    Refuses P0002 if the owning Party is not yet graduated (no Customer Code
+    to nest beneath) - a distinct, explicit action, not auto-called from
+    approve (see the packet's reasoning).
+    """
+    result, err = _rpc_call(
+        get_supabase_for_caller(g.access_token),
+        "assign_customer_location_code", {"p_location": location_id})
+    if err:
+        return err
+    return jsonify({"location_code": result.data})
 
 
 @app.route("/auth/logout", methods=["POST"])
