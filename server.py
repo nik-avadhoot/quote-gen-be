@@ -893,8 +893,16 @@ def list_customer_families():
     Read-only by design, same as /masters/plants above. RLS gates SELECT on
     all four tables behind the group capability `read_party_master` -
     confirmed directly from `pg_policies`, not assumed - so a caller without
-    it gets an empty result from every one of these four queries, not an
-    error; the frontend must not read that as "no families exist".
+    it would get an empty result from every one of these four queries, not
+    an error, if the route relied on RLS alone. **It does not**: `require_auth`
+    already resolved the caller's `group_capabilities` through
+    `caller_context.resolve_caller()` before this body runs (`g.caller`), at
+    no extra query cost, so the route checks it explicitly and returns 403 -
+    genuine access denial is never presented as "no families exist".
+
+    Group-wide, not plant-scoped: `read_party_master` is a GROUP capability
+    (`has_group_cap`, not `has_plant_cap`) on all four tables, so there is no
+    wrong-plant case for this screen to refuse.
 
     No create/edit/merge/reassign/retire route exists here or anywhere else.
     `app_private.merge_families`, `app_private.reassign_party_family` and
@@ -905,6 +913,9 @@ def list_customer_families():
     confirmed the same way), deliberately not done in this pass. See the U0
     report S6 and the S13 answered-questions addendum.
     """
+    if "read_party_master" not in (g.caller.get("group_capabilities") or []):
+        return jsonify({"error": "read_party_master capability is required"}), 403
+
     client = get_supabase_for_caller(g.access_token)
     families = (client.table("customer_families")
                 .select("id, group_customer_code, name, status, surviving_family_id")
