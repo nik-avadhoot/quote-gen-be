@@ -884,6 +884,50 @@ def list_plants():
     })
 
 
+@app.route("/masters/customer-families", methods=["GET"])
+@require_auth
+def list_customer_families():
+    """
+    Customer Families, read as the caller (U1, post-S7 handover S9.4).
+
+    Read-only by design, same as /masters/plants above. RLS gates SELECT on
+    all four tables behind the group capability `read_party_master` -
+    confirmed directly from `pg_policies`, not assumed - so a caller without
+    it gets an empty result from every one of these four queries, not an
+    error; the frontend must not read that as "no families exist".
+
+    No create/edit/merge/reassign/retire route exists here or anywhere else.
+    `app_private.merge_families`, `app_private.reassign_party_family` and
+    `app_private.graduate_party` are real, tested functions but have no
+    `public` invoker wrapper, so they are not reachable through PostgREST by
+    any caller today - not merely unrouted in Flask. Adding that wrapper is
+    its own reviewable migration (RLS-gated by `manage_customer_master`,
+    confirmed the same way), deliberately not done in this pass. See the U0
+    report S6 and the S13 answered-questions addendum.
+    """
+    client = get_supabase_for_caller(g.access_token)
+    families = (client.table("customer_families")
+                .select("id, group_customer_code, name, status, surviving_family_id")
+                .execute()).data or []
+    aliases = (client.table("customer_family_aliases")
+               .select("id, family_id, alias").execute()).data or []
+    memberships = (client.table("party_family_memberships")
+                   .select("id, party_id, family_id, effective_from, effective_until, is_current")
+                   .execute()).data or []
+    parties = (client.table("parties")
+               .select("id, customer_code, display_name, lifecycle_state, status")
+               .execute()).data or []
+
+    families.sort(key=lambda r: r.get("group_customer_code") or r.get("name") or "")
+    return jsonify({
+        "families": families,
+        "aliases": aliases,
+        "memberships": memberships,
+        "parties": parties,
+        "mutations": "not_yet_governed",
+    })
+
+
 @app.route("/auth/logout", methods=["POST"])
 @require_auth
 def auth_logout():
