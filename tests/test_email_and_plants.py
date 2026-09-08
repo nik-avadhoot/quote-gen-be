@@ -312,37 +312,40 @@ reset()
 r = post("/admin/users", {"email": "n@example.invalid", "display_name": "N",
                           "role": "maker", "plants": []})
 check(r.status_code == 400, "P-6 a Maker with no plant is refused")
+# UA-4. P-7/P-8 asserted a rule of the ROLE model - "a Checker must hold a
+# plant" - enforced by the PATCH branch that has been removed. The capability
+# model has no such rule: a user may legitimately hold no plant capability at
+# all, and holding one is expressed by granting it, not by naming a role. What
+# replaces those assertions is that PATCH no longer accepts role or plant at
+# all, so it cannot silently rewrite grants it could not represent.
 reset()
 r = patch("/admin/users/42", {"role": "checker", "plants": []})
-check(r.status_code == 400, "P-7 a Checker cannot be left with no plant")
+check(r.status_code == 422 and r.get_json().get("error_code") == "TRANSITION_NOT_ALLOWED",
+      "P-7 PATCH no longer accepts a role change - it cannot rewrite capability grants")
 reset()
-r = patch("/admin/users/42", {"role": "admin", "plants": []})
-check(r.status_code != 400,
-      "P-8 a group-only administrator MAY hold no plant assignment")
-
+r = patch("/admin/users/42", {"plants": ["NAG"]})
+check(r.status_code == 422,
+      "P-8 PATCH no longer accepts a plant assignment either")
 reset()
-client = FakeClient("tok-alpha", "caller")
-try:
-    from flask import g as flask_g
-    with app.test_request_context():
-        flask_g.caller = {"id": 7}
-        server._apply_role_and_plant(client, 42, "maker", ["OLD"])
-    check(False, "P-9 an INACTIVE plant cannot be assigned")
-except ValueError:
-    check(True, "P-9 an INACTIVE plant cannot be assigned")
-except Exception:
-    check(False, "P-9 an INACTIVE plant cannot be assigned")
+r = patch("/admin/users/42", {"display_name": "Renamed"})
+check(r.status_code == 200,
+      "P-8a PATCH still handles the fields it legitimately owns")
 
-try:
-    with app.test_request_context():
-        from flask import g as fg
-        fg.caller = {"id": 7}
-        server._apply_role_and_plant(FakeClient("tok-alpha", "caller"), 42, "maker", ["ZZZ"])
-    check(False, "P-10 arbitrary text cannot become a plant assignment")
-except ValueError:
-    check(True, "P-10 arbitrary text cannot become a plant assignment")
-except Exception:
-    check(False, "P-10 arbitrary text cannot become a plant assignment")
+# P-9/P-10 moved to the capability route, which resolves codes against ACTIVE
+# plants only. An inactive or unknown code never becomes a grant - and the
+# database function re-validates inside its own transaction regardless.
+reset()
+r = post("/admin/users/42/capabilities",
+         {"expected_content_version": 1, "group_capabilities": [],
+          "plant_capabilities": {"OLD": ["plant_access"]}})
+check(r.status_code == 422 and r.get_json().get("error_code") == "TRANSITION_NOT_ALLOWED",
+      "P-9 an INACTIVE plant cannot be assigned")
+reset()
+r = post("/admin/users/42/capabilities",
+         {"expected_content_version": 1, "group_capabilities": [],
+          "plant_capabilities": {"ZZZ": ["plant_access"]}})
+check(r.status_code == 422 and r.get_json().get("error_code") == "TRANSITION_NOT_ALLOWED",
+      "P-10 arbitrary text cannot become a plant assignment")
 
 check(server._normalise_plants({"plants": ["NAG", "PUN", "KOL"]}) == ["NAG", "PUN", "KOL"],
       "P-11 a multi-plant selection is carried through intact")

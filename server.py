@@ -62,7 +62,7 @@ from caller_context import (
     update_caller_email,
     verify_current_password,
 )
-from auth import require_auth, require_role
+from auth import require_auth, require_group_capability, require_role
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1771,95 +1771,6 @@ def _plant_requirement_error(role, plant_codes):
     return None
 
 
-def _apply_role_and_plant(client, app_user_id, role, plant_codes):
-    """
-    Express a role/plant change as capability grants.
-
-    `plant_codes` is a LIST, or None to leave plant assignment untouched. An
-    empty list revokes every plant assignment. One user holding several plants
-    is the normal case, not an edge case: it is how the legacy `Group` value is
-    represented under CDM-05-A.
-
-    The reconciliation is set-based rather than replace-all. The previous version
-    revoked every active grant and re-inserted for a single plant, which made
-    multi-plant assignment unrepresentable and churned grant history on every
-    unrelated edit. Now only grants that are genuinely no longer wanted are
-    revoked, and only genuinely missing ones are inserted - so re-applying the
-    same assignment is a no-op and the audit trail stays meaningful.
-
-    Every statement is an ordinary caller-context write: the grant tables' INSERT
-    and UPDATE policies already require administer_users, so a caller without it
-    is refused by the database rather than by a check here. Revocation sets
-    status='revoked' - grants are never deleted, so the history survives.
-    """
-    caps = (client.table("capabilities").select("id, capability_key").execute()).data or []
-    cap_id = {c["capability_key"]: c["id"] for c in caps}
-
-    if role is not None:
-        want_admin = (role == "admin")
-        existing = (client.table("group_capability_grants")
-                    .select("id, capability_id")
-                    .eq("app_user_id", app_user_id).eq("status", "active")
-                    .eq("capability_id", cap_id["administer_users"]).execute()).data or []
-        if want_admin and not existing:
-            client.table("group_capability_grants").insert({
-                "app_user_id": app_user_id,
-                "capability_id": cap_id["administer_users"],
-                "granted_by": g.caller["id"],
-            }).execute()
-        elif not want_admin and existing:
-            client.table("group_capability_grants").update({
-                "status": "revoked", "revoked_at": "now()", "revoked_by": g.caller["id"],
-            }).eq("id", existing[0]["id"]).execute()
-
-    if plant_codes is None:
-        return
-
-    # Only ACTIVE Plant Master records are assignable. An inactive or unknown
-    # code is not "an unknown string" to be tolerated - it is a value that must
-    # never become a grant, so it is rejected here and, independently of this
-    # code, by the pgrant_active_plant_only trigger and the insert policy.
-    plants = (client.table("plants").select("id, plant_code, status").execute()).data or []
-    by_code = {p["plant_code"]: p["id"] for p in plants if p.get("status") == "active"}
-    unknown = [c for c in plant_codes if c not in by_code]
-    if unknown:
-        raise ValueError("unknown plant")
-
-    current = (client.table("plant_capability_grants")
-               .select("id, plant_id, capability_id").eq("app_user_id", app_user_id)
-               .eq("status", "active").execute()).data or []
-
-    # The operational capability follows the role. When the caller is changing
-    # plants without naming a role, keep the one they already hold rather than
-    # silently demoting a Checker to Maker.
-    if role is not None:
-        operational = "check_quote" if role == "checker" else "make_quote"
-    elif any(r["capability_id"] == cap_id["check_quote"] for r in current):
-        operational = "check_quote"
-    else:
-        operational = "make_quote"
-
-    wanted = {(by_code[c], cap_id[w])
-              for c in plant_codes
-              for w in ("plant_access", operational)}
-    held = {(r["plant_id"], r["capability_id"]) for r in current}
-
-    for row in current:
-        if (row["plant_id"], row["capability_id"]) not in wanted:
-            client.table("plant_capability_grants").update({
-                "status": "revoked", "revoked_at": "now()", "revoked_by": g.caller["id"],
-            }).eq("id", row["id"]).execute()
-
-    missing = sorted(wanted - held)
-    if missing:
-        client.table("plant_capability_grants").insert([{
-            "app_user_id": app_user_id,
-            "plant_id": plant_id,
-            "capability_id": capability_id,
-            "granted_by": g.caller["id"],
-        } for plant_id, capability_id in missing]).execute()
-
-
 @app.route("/admin/users", methods=["GET"])
 @require_auth
 @require_role("admin")
@@ -1876,7 +1787,7 @@ def list_users():
 
     users = (
         client.table("app_users")
-        .select("id, auth_user_id, display_name, status")
+        .select("id, auth_user_id, display_name, status, content_version")
         .execute()
     ).data or []
     if not users:
@@ -1924,6 +1835,13 @@ def list_users():
             "display_name": u["display_name"],
             "active":       u["status"] == "active",
             "status":       u["status"],
+            # UA-1 read contract. `role` is a DERIVED PRESENTATION LABEL and
+            # nothing more - the capability sets below are the authority, and
+            # the frontend renders the label read-only. `content_version` is
+            # required for the capability editor's CAS.
+            "content_version":     u.get("content_version"),
+            "group_capabilities":  gc,
+            "plant_capabilities":  {code: sorted(keys) for code, keys in pc.items()},
             "role":         derive_role(gc, pc),
             "plant":        next(iter(pc), None),
             "plants":       sorted(pc),
@@ -2070,31 +1988,95 @@ def update_user(uid):
             return jsonify({"error": "Could not update the account status"}), 400
         touched = True
 
+    # UA-4. The legacy role/plant mutation branch is GONE, not bridged. It could
+    # express only administer_users and one operational capability per plant, so
+    # translating a partial request into a complete desired set would have
+    # silently revoked the nine capabilities it cannot represent. Capability
+    # changes now go to POST /admin/users/<id>/capabilities, which is the single
+    # permission authority. An editable role must never rewrite grants.
     if "role" in data or "plant" in data or "plants" in data:
-        if data.get("role") and data["role"] not in VALID_ROLES:
-            return jsonify({"error": f"role must be one of {VALID_ROLES}"}), 400
-        if app_user_id == g.caller["id"] and data.get("role") and data["role"] != "admin":
-            return jsonify({"error": "You cannot change your own role"}), 400
-        try:
-            plant_codes = _normalise_plants(data)
-        except ValueError:
-            return jsonify({"error": "plants must be a list of plant codes"}), 400
-        effective_role = data.get("role") or _read_one_user(client, app_user_id).get("role")
-        problem = _plant_requirement_error(effective_role, plant_codes)
-        if problem:
-            return jsonify({"error": problem}), 400
-        try:
-            _apply_role_and_plant(client, app_user_id, data.get("role"), plant_codes)
-        except PermissionError:
-            return jsonify({"error": "Forbidden"}), 403
-        except Exception:
-            return jsonify({"error": "Could not update role or plant"}), 400
-        touched = True
+        return _error("TRANSITION_NOT_ALLOWED",
+                      "Role and plant assignment are no longer edited here. "
+                      "Use POST /admin/users/<id>/capabilities, which replaces the "
+                      "complete capability set in one governed operation.")
 
     if not touched:
         return jsonify({"error": "No fields to update"}), 400
 
     return jsonify(_read_one_user(client, app_user_id))
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ROUTE: /admin/users/<id>/capabilities  - UA-3, the single permission authority.
+#
+# Replaces the COMPLETE capability set in one governed database operation. It is
+# the only application path that mutates grants: `authenticated` no longer holds
+# INSERT/UPDATE on the grant tables, so a direct write is refused by the database
+# rather than by a check here.
+#
+# require_group_capability, not require_role: a derived label must not gate a
+# route. The database re-checks administer_users itself regardless.
+# ═══════════════════════════════════════════════════════════════════════════
+@app.route("/admin/users/<uid>/capabilities", methods=["POST"])
+@require_auth
+@require_group_capability("administer_users")
+def set_user_capabilities_route(uid):
+    data = request.get_json(force=True) or {}
+    try:
+        app_user_id = int(uid)
+    except (TypeError, ValueError):
+        return _error("RECORD_NOT_FOUND")
+
+    expected = _int_field(data, "expected_content_version")
+    if expected is None:
+        return _invalid_input("expected_content_version is required")
+
+    group_caps = data.get("group_capabilities")
+    plant_caps = data.get("plant_capabilities")
+    if not isinstance(group_caps, list) or not all(isinstance(k, str) for k in group_caps):
+        return _invalid_input("group_capabilities must be a list of capability keys")
+    if not isinstance(plant_caps, dict):
+        return _invalid_input("plant_capabilities must be an object keyed by plant code")
+
+    client = get_supabase_for_caller(g.access_token)
+
+    # Codes at the HTTP boundary, immutable ids in the database contract. The
+    # function re-validates each id as an active plant INSIDE its transaction,
+    # so this lookup is a convenience, not the authority.
+    plants = (client.table("plants").select("id, plant_code, status").execute()).data or []
+    by_code = {p["plant_code"]: p["id"] for p in plants if p.get("status") == "active"}
+
+    resolved, seen = {}, {}
+    for code, caps in plant_caps.items():
+        if not isinstance(code, str) or not isinstance(caps, list) \
+           or not all(isinstance(c, str) for c in caps):
+            return _invalid_input("each plant_capabilities value must be a list of capability keys")
+        folded = code.strip().casefold()
+        if folded in seen:
+            return _invalid_input("plant codes must be distinct")
+        seen[folded] = code
+        if code not in by_code:
+            return _error("TRANSITION_NOT_ALLOWED", "Unknown or inactive plant code.")
+        resolved[str(by_code[code])] = caps
+
+    result, err = _rpc_call(client, "set_user_capabilities", {
+        "p_app_user": app_user_id,
+        "p_expected_content_version": expected,
+        "p_group_caps": group_caps,
+        "p_plant_caps": resolved,
+    })
+    if err:
+        return err
+
+    # The operation returns plant capabilities keyed by plant id; the client
+    # speaks codes, so translate back on the way out.
+    payload = result.data or {}
+    by_id = {str(p["id"]): p["plant_code"] for p in plants}
+    payload["plant_capabilities"] = {
+        by_id.get(pid, pid): keys
+        for pid, keys in (payload.get("plant_capabilities") or {}).items()
+    }
+    return jsonify(payload)
 
 
 @app.route("/admin/users/<uid>/reset-password", methods=["POST"])

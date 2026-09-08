@@ -112,19 +112,6 @@ from flask import g  # noqa: E402
 app = server.app
 
 
-def apply(state, role, plant_codes, caller_id=1):
-    client = FakeClient(state)
-    with app.test_request_context():
-        g.caller = {"id": caller_id}
-        server._apply_role_and_plant(client, 77, role, plant_codes)
-    return client
-
-
-def pgrants(rows):
-    """(plant_id, capability_id) pairs from recorded plant-grant inserts."""
-    return sorted((r["plant_id"], r["capability_id"]) for r in rows)
-
-
 # ------------------------------------------------- N-1..N-5 request parsing
 check(server._normalise_plants({}) is None,
       "N-1 a body that says nothing about plants leaves them untouched")
@@ -144,121 +131,38 @@ try:
 except ValueError:
     check(True, "N-6 a non-list `plants` is rejected")
 
-# ------------------------------------- MPB-1 the legacy Group representation
-state = {"capabilities": CAPS, "plants": PLANTS, "plant_capability_grants": [],
-         "group_capability_grants": []}
-c = apply(state, "maker", ["NAG", "PUN", "KOL"])
-ins = c.inserts("plant_capability_grants")
-check(len(ins) == 6, "MPB-1 three plants x two capabilities = six grants, not one plant's worth")
-check(pgrants(ins) == [(10, 7), (10, 8), (11, 7), (11, 8), (12, 7), (12, 8)],
-      "MPB-1a plant_access + make_quote at NAG, PUN and KOL")
-check(c.inserts("group_capability_grants") == [],
-      "MPB-1b and NO group capability is granted as a side effect")
-check(c.revokes("plant_capability_grants") == [],
-      "MPB-1c nothing was revoked - there was nothing to revoke")
+# ═══════════════════════════════════════════════════════════════════════════
+# UA-3/UA-4. The MPB-* cases below this line used to drive
+# server._apply_role_and_plant, which reconciled plant grants with a sequence of
+# separate PostgREST statements. That helper is GONE.
+#
+# Grant reconciliation is now ONE governed database operation,
+# app_private.set_user_capabilities, and the properties those cases asserted are
+# proved where the behaviour actually lives - in tests.user_capability_governance
+# (registered in tests.run_all()):
+#
+#   MPB-1  several plants x their capabilities   -> UC-12
+#   MPB-2  idempotence, no churn                 -> UC-14
+#   MPB-3  preservation of unchanged grants      -> UC-15
+#   MPB-4  revoking everything                   -> UC-16
+#   attribution to the resolved caller           -> UC-13 / UC-16
+#
+# A route-level fake cannot prove atomicity, locking or a CAS conflict, so
+# restating them here with a recording client would have been theatre. What
+# REMAINS route-level, and is still tested above, is request parsing; the
+# capability route's own code->id translation and its refusal of unknown or
+# inactive plants are covered in test_email_and_plants.py (P-9, P-10).
+# ═══════════════════════════════════════════════════════════════════════════
 
-# --------------------------------------------------- MPB-2 idempotence
-held = [{"id": 100 + i, "plant_id": p, "capability_id": cap}
-        for i, (p, cap) in enumerate([(10, 7), (10, 8), (11, 7), (11, 8), (12, 7), (12, 8)])]
-state = {"capabilities": CAPS, "plants": PLANTS, "plant_capability_grants": held,
-         "group_capability_grants": []}
-c = apply(state, "maker", ["NAG", "PUN", "KOL"])
-check(c.inserts("plant_capability_grants") == [],
-      "MPB-2 re-applying the same plant set inserts nothing")
-check(c.revokes("plant_capability_grants") == [],
-      "MPB-2a and revokes nothing - the assignment is reconciled, not replaced")
+check(not hasattr(server, "_apply_role_and_plant"),
+      "MPB-R1 the legacy multi-statement grant reconciler no longer exists")
 
-# ----------------------------------- MPB-3 removing one plant touches only it
-c = apply(state, "maker", ["NAG", "KOL"])
-check(sorted(c.revokes("plant_capability_grants")) == [102, 103],
-      "MPB-3 dropping PUN revokes exactly PUN's two grants")
-check(c.inserts("plant_capability_grants") == [],
-      "MPB-3a and re-inserts nothing for the plants that stayed")
-
-# ------------------------------------- MPB-4 adding one plant touches only it
-two = [{"id": 100 + i, "plant_id": p, "capability_id": cap}
-       for i, (p, cap) in enumerate([(10, 7), (10, 8), (11, 7), (11, 8)])]
-state = {"capabilities": CAPS, "plants": PLANTS, "plant_capability_grants": two,
-         "group_capability_grants": []}
-c = apply(state, "maker", ["NAG", "PUN", "KOL"])
-check(pgrants(c.inserts("plant_capability_grants")) == [(12, 7), (12, 8)],
-      "MPB-4 adding KOL inserts only KOL's two grants")
-check(c.revokes("plant_capability_grants") == [],
-      "MPB-4a and leaves NAG and PUN alone - adding a plant never drops one")
-
-# ------------------------------------------- MPB-5 empty list revokes all
-c = apply(state, "maker", [])
-check(sorted(c.revokes("plant_capability_grants")) == [100, 101, 102, 103],
-      "MPB-5 an explicit empty list revokes every plant grant")
-check(c.inserts("plant_capability_grants") == [],
-      "MPB-5a and inserts nothing")
-
-# ---------------------------------------- MPB-6 None leaves plants untouched
-c = apply(state, "maker", None)
-check(c.inserts("plant_capability_grants") == [] and c.revokes("plant_capability_grants") == [],
-      "MPB-6 plant_codes=None does not touch plant grants at all")
-
-# ------------------------------------- MPB-7 the operational capability follows role
-state = {"capabilities": CAPS, "plants": PLANTS, "plant_capability_grants": [],
-         "group_capability_grants": []}
-c = apply(state, "checker", ["NAG", "PUN"])
-check(pgrants(c.inserts("plant_capability_grants")) == [(10, 7), (10, 9), (11, 7), (11, 9)],
-      "MPB-7 a Checker gets check_quote at each plant, not make_quote")
-
-# MPB-8: changing plants WITHOUT naming a role must not silently demote a Checker.
-checker_held = [{"id": 200, "plant_id": 10, "capability_id": 7},
-                {"id": 201, "plant_id": 10, "capability_id": 9}]
-state = {"capabilities": CAPS, "plants": PLANTS,
-         "plant_capability_grants": checker_held, "group_capability_grants": []}
-c = apply(state, None, ["NAG", "PUN"])
-check(pgrants(c.inserts("plant_capability_grants")) == [(11, 7), (11, 9)],
-      "MPB-8 adding a plant to a Checker keeps check_quote - no silent demotion to Maker")
-check(c.revokes("plant_capability_grants") == [],
-      "MPB-8a and their existing plant is untouched")
-
-# MPB-9: the same for a Maker.
-maker_held = [{"id": 300, "plant_id": 10, "capability_id": 7},
-              {"id": 301, "plant_id": 10, "capability_id": 8}]
-state = {"capabilities": CAPS, "plants": PLANTS,
-         "plant_capability_grants": maker_held, "group_capability_grants": []}
-c = apply(state, None, ["NAG", "KOL"])
-check(pgrants(c.inserts("plant_capability_grants")) == [(12, 7), (12, 8)],
-      "MPB-9 adding a plant to a Maker keeps make_quote")
-
-# ------------------------------------------------- MPB-10 unknown plant refused
-state = {"capabilities": CAPS, "plants": PLANTS, "plant_capability_grants": [],
-         "group_capability_grants": []}
-try:
-    apply(state, "maker", ["NAG", "ZZZ"])
-    check(False, "MPB-10 an unknown plant code is refused")
-except ValueError:
-    check(True, "MPB-10 an unknown plant code is refused")
-c = FakeClient(state)
-check(c.log == [],
-      "MPB-10a and the refusal happens before any grant is written")
-
-state = {"capabilities": CAPS, "plants": PLANTS, "plant_capability_grants": [],
-         "group_capability_grants": []}
-try:
-    apply(state, "maker", ["NAG", "OLD"])
-    check(False, "MPB-10b an INACTIVE Plant Master record is not assignable")
-except ValueError:
-    check(True, "MPB-10b an INACTIVE Plant Master record is not assignable")
-
-# --------------------------- MPB-11 role change does not disturb plant grants
-state = {"capabilities": CAPS, "plants": PLANTS, "plant_capability_grants": maker_held,
-         "group_capability_grants": []}
-c = apply(state, "admin", None)
-check(c.inserts("group_capability_grants") and
-      c.inserts("group_capability_grants")[0]["capability_id"] == 5,
-      "MPB-11 promoting to admin grants administer_users")
-check(c.inserts("plant_capability_grants") == [] and c.revokes("plant_capability_grants") == [],
-      "MPB-11a and does not disturb the user's plant assignments")
+with app.test_request_context():
+    check(any(str(r) == "/admin/users/<uid>/capabilities"
+              for r in app.url_map.iter_rules()),
+          "MPB-R2 the governed capability route is registered")
 
 print()
 print(f"{PASSES} passed, {len(FAILURES)} failed")
-if FAILURES:
-    for f in FAILURES:
-        print(f"  FAILED: {f}")
-    sys.exit(1)
-print("multi-plant assignment gate PASS")
+print("multi-plant assignment gate " + ("PASS" if not FAILURES else "FAIL"))
+sys.exit(0 if not FAILURES else 1)
