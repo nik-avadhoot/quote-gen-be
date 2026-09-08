@@ -31,6 +31,7 @@ from functools import wraps
 from flask import request, jsonify, g
 
 from caller_context import (
+    timed,
     get_supabase_for_caller,
     resolve_caller,
     has_group_capability,
@@ -54,16 +55,21 @@ def require_auth(f):
 
         # Verify the token against Supabase Auth using a per-request client.
         try:
-            client = get_supabase_for_caller(token)
-            user_resp = client.auth.get_user(token)
+            with timed("auth.verify_token"):
+                client = get_supabase_for_caller(token)
+                user_resp = client.auth.get_user(token)
         except Exception:
             return jsonify({"error": "Invalid or expired token"}), 401
         if not user_resp or not user_resp.user:
             return jsonify({"error": "Invalid or expired token"}), 401
 
         # Resolve the application identity as the caller, through RLS.
+        # The Auth uuid was just verified above, so hand it over rather than
+        # making resolve_caller re-fetch it (D1: that was a second full
+        # auth.get_user() round-trip on every administrator request).
         try:
-            caller = resolve_caller(token)
+            with timed("auth.resolve_caller"):
+                caller = resolve_caller(token, known_auth_uid=user_resp.user.id)
         except Exception:
             # Never leak the database error: it can carry table and column names.
             return jsonify({"error": "Could not resolve account"}), 403

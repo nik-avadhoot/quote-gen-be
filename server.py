@@ -49,6 +49,9 @@ from postgrest.exceptions import APIError
 import openpyxl
 
 from caller_context import (
+    TIMING_ENABLED,
+    UPSTREAM_TIMEOUT_SECONDS,
+    timed,
     bootstrap_caller,
     get_supabase_anon,
     get_supabase_for_caller,
@@ -79,6 +82,27 @@ CORS_ORIGINS = [
     if o.strip()
 ]
 CORS(app, origins=CORS_ORIGINS, allow_headers=["Content-Type", "Authorization"])
+
+
+# D1 - whole-request timing, so the phase numbers can be reconciled against the
+# wall clock rather than assumed to account for it. Off unless QOS_TIMING is set.
+if TIMING_ENABLED:
+    import time as _t
+    from flask import request as _rq
+
+    @app.before_request
+    def _qos_t0():
+        g._qos_t0 = _t.perf_counter()
+
+    @app.after_request
+    def _qos_t1(resp):
+        t0 = getattr(g, "_qos_t0", None)
+        if t0 is not None:
+            app.logger.warning("TIMING %-28s %8.1f ms  [%s %s -> %s]",
+                               "request.total", (_t.perf_counter() - t0) * 1000,
+                               _rq.method, _rq.path, resp.status_code)
+        return resp
+
 
 # Path to the Excel master template — must sit beside this file
 TEMPLATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -928,28 +952,65 @@ def list_customer_families():
         return jsonify({"error": "read_party_master capability is required"}), 403
 
     client = get_supabase_for_caller(g.access_token)
-    families = (client.table("customer_families")
-                .select("id, group_customer_code, name, status, surviving_family_id, content_version")
-                .execute()).data or []
-    aliases = (client.table("customer_family_aliases")
-               .select("id, family_id, alias, status, content_version").execute()).data or []
-    memberships = (client.table("party_family_memberships")
-                   .select("id, party_id, family_id, effective_from, effective_until, is_current")
-                   .execute()).data or []
-    parties = (client.table("parties")
-               .select("id, customer_code, display_name, lifecycle_state, status, content_version")
-               .execute()).data or []
-    # U1 Slice C addition - additive, same read_party_master gate, no RLS
-    # change. Lets the frontend show a Party's Locations, including
-    # descriptive version history, without a second round-trip.
-    locations = (client.table("customer_locations")
-                 .select("id, party_id, location_code, bill_to_eligible, ship_to_eligible, "
-                         "status, content_version")
-                 .execute()).data or []
-    location_versions = (client.table("customer_location_versions")
-                          .select("id, location_id, version_no, location_type, address_text, "
-                                  "contact_name, notes, status")
-                          .execute()).data or []
+
+    # D1 - these six reads are independent of one another, so running them
+    # concurrently is the obvious win. It was TRIED and REVERTED, and the reason
+    # is recorded here so it is not retried blind:
+    #
+    #   supabase-py talks HTTP/2, which multiplexes every request over ONE TCP
+    #   connection. Sharing the per-request client across a ThreadPoolExecutor
+    #   therefore drives concurrent streams down a single socket through
+    #   httpcore's SYNC h2 implementation, and it fails -
+    #   `httpx.ReadError: [WinError 10035] A non-blocking socket operation could
+    #   not be completed immediately`, raised from httpcore/_sync/http2.py.
+    #   Worse, it leaves the pooled connection wedged, so the NEXT request on it
+    #   hangs until the timeout. Measured, with a stack trace, not theorised.
+    #
+    # Safe ways to get the concurrency back, both of which are more than a
+    # defect fix and are therefore proposed rather than taken here: give each
+    # concurrent read its own client (measured ~1.0 s wall vs ~2.7 s
+    # sequential), or force HTTP/1.1 so the pool hands each thread its own
+    # connection. Sequential on ONE reused, already-warm client is what runs.
+    #
+    # Authority is unchanged either way: every read goes through the caller's
+    # own token, RLS decides visibility, and the explicit read_party_master
+    # check above still runs first.
+    #
+    # U1 Slice C addition (locations, location_versions) - additive, same
+    # read_party_master gate, no RLS change. Lets the frontend show a Party's
+    # Locations, including descriptive version history, without a second
+    # round-trip from the browser.
+    _READS = (
+        ("families", "customer_families",
+         "id, group_customer_code, name, status, surviving_family_id, content_version"),
+        ("aliases", "customer_family_aliases",
+         "id, family_id, alias, status, content_version"),
+        ("memberships", "party_family_memberships",
+         "id, party_id, family_id, effective_from, effective_until, is_current"),
+        ("parties", "parties",
+         "id, customer_code, display_name, lifecycle_state, status, content_version"),
+        ("locations", "customer_locations",
+         "id, party_id, location_code, bill_to_eligible, ship_to_eligible, status, content_version"),
+        ("location_versions", "customer_location_versions",
+         "id, location_id, version_no, location_type, address_text, contact_name, notes, status"),
+    )
+
+    try:
+        with timed("families.six_reads"):
+            results = {key: (client.table(table).select(cols).execute()).data or []
+                       for key, table, cols in _READS}
+    except Exception as exc:
+        if _is_upstream_timeout(exc):
+            app.logger.error("customer-families read timed out upstream: %s", exc)
+            return _error("UPSTREAM_TIMEOUT")
+        raise
+
+    families = results["families"]
+    aliases = results["aliases"]
+    memberships = results["memberships"]
+    parties = results["parties"]
+    locations = results["locations"]
+    location_versions = results["location_versions"]
 
     families.sort(key=lambda r: r.get("group_customer_code") or r.get("name") or "")
     return jsonify({
@@ -994,6 +1055,23 @@ def list_customer_families():
 _RPC_ERROR_MAP = {
     "42501": "CAPABILITY_REQUIRED",   # capability check failed inside app_private.*
     "P0002": "RECORD_NOT_FOUND",      # Family / Party / alias not found
+    # KNOWN DEFECT, measured 2026-09-08, fix NOT taken here (needs approval).
+    # 40001 is serialization_failure, and PostgREST AUTOMATICALLY RETRIES it -
+    # that SQLSTATE conventionally means "transient, safe to retry". A stale
+    # content_version is deterministic, so every retry re-raises it and the
+    # request never returns: the caller hangs until its own timeout. Proven by
+    # calling one governed RPC three ways against the same persona, where the
+    # ONLY difference was the SQLSTATE raised:
+    #     P0002 (not found)  -> HTTP 500 in 468 ms
+    #     40001 (stale CAS)  -> no response; 25-40 s, client timeout
+    # ...identical through raw urllib/HTTP1.1 and supabase-py/HTTP2, so it is
+    # PostgREST, not the client. Direct SQL raises the same 40001 in 49 ms.
+    #
+    # This is why a stale save currently surfaces as UPSTREAM_TIMEOUT/504
+    # instead of STALE_VERSION/409. The mapping below is correct and stays; the
+    # real fix is to raise a NON-retryable SQLSTATE for CAS conflicts, which
+    # means a migration touching 59 occurrences across 18 migrations plus 42
+    # pgTAP assertions - out of scope for a defect pass.
     "40001": "STALE_VERSION",         # stale content_version - the CAS check failed
     "22023": "TRANSITION_NOT_ALLOWED",  # forbidden state transition, self-merge,
                                          # merge-cycle, double-retirement, retired target
@@ -1007,6 +1085,10 @@ _ERROR_STATUS = {
     "TRANSITION_NOT_ALLOWED": 422,
     "INVALID_EFFECTIVE_DATE": 422,
     "INVALID_INPUT": 400,
+    # D2 - a hung upstream call is not an application fault and must not be
+    # reported as one. 504 is a stable, retryable answer the frontend can act
+    # on; the underlying socket/httpx text stays server-side.
+    "UPSTREAM_TIMEOUT": 504,
     "INTERNAL_ERROR": 500,
 }
 
@@ -1016,8 +1098,31 @@ _ERROR_MESSAGE = {
     "STALE_VERSION": "This record changed since you last read it. Reload and try again.",
     "TRANSITION_NOT_ALLOWED": "That action is not allowed for this record's current state.",
     "INVALID_EFFECTIVE_DATE": "The effective date is not valid for this change.",
+    "UPSTREAM_TIMEOUT": "The database did not respond in time. Nothing was changed — please try again.",
     "INTERNAL_ERROR": "Could not complete that action.",
 }
+
+
+# D2 - recognise a genuine upstream timeout without leaking its text. httpx
+# raises TimeoutException subclasses; the underlying socket/ssl layer raises
+# TimeoutError or socket.timeout with "The read operation timed out", which is
+# the exact string observed in the browser walkthrough. Matched structurally
+# first, by message only as a fallback.
+_TIMEOUT_MARKERS = ("timed out", "timeout")
+
+
+def _is_upstream_timeout(exc: BaseException) -> bool:
+    import httpx
+    seen = set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        if isinstance(exc, (httpx.TimeoutException, TimeoutError)):
+            return True
+        text = str(exc).lower()
+        if any(m in text for m in _TIMEOUT_MARKERS):
+            return True
+        exc = exc.__cause__ or exc.__context__
+    return False
 
 
 def _error(code, message=None):
@@ -1054,6 +1159,16 @@ def _rpc_call(client, name, params):
         app.logger.error("unmapped RPC error from %s: %s %s", name, exc.code, exc.message)
         return None, _error("INTERNAL_ERROR")
     except Exception as exc:
+        # D2 - a hung upstream call used to land here and be reported as a bare
+        # 500 INTERNAL_ERROR after the 120-second supabase-py default. The
+        # timeout is now bounded (UPSTREAM_TIMEOUT_SECONDS) and answered with a
+        # stable, retryable 504 that says nothing was changed - which is true,
+        # because every governed mutation is a single atomic RPC that either
+        # committed or did not. The raw socket text is logged, never returned.
+        if _is_upstream_timeout(exc):
+            app.logger.error("RPC %s timed out after %ss: %s",
+                             name, UPSTREAM_TIMEOUT_SECONDS, exc)
+            return None, _error("UPSTREAM_TIMEOUT")
         app.logger.error("RPC call to %s failed: %s", name, exc)
         return None, _error("INTERNAL_ERROR")
 

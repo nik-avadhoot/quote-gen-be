@@ -257,6 +257,55 @@ for desc, code, expected_status, expected_error_code, label, method, path, body,
 check(all(tok != "SERVICE-ROLE" for tok, _, _ in RPC_CALLS),
       "no service-role client is used by any of these routes")
 
+# --- D2 an upstream timeout is a stable 504, never a bare 500 ----------------
+# Observed for real in the browser walkthrough: a governed mutation hung on the
+# supabase-py 120-second default PostgREST timeout and then surfaced as
+# 500 INTERNAL_ERROR carrying nothing the user could act on. The timeout is now
+# bounded, and both the httpx-shaped and the socket-shaped failure map to
+# UPSTREAM_TIMEOUT / 504 with a fixed message. The underlying text - which names
+# the transport, not the application - must never reach the response body.
+import httpx  # noqa: E402
+
+TIMEOUT_SHAPES = [
+    ("httpx.ReadTimeout", httpx.ReadTimeout("The read operation timed out")),
+    ("socket TimeoutError", TimeoutError("The read operation timed out")),
+    ("wrapped in a plain Exception",
+     Exception("HTTPConnectionPool: Read timed out. (read timeout=120)")),
+]
+
+for shape_label, exc in TIMEOUT_SHAPES:
+    reset("update_customer_location", exc)
+    with app.test_client() as c:
+        r = c.open("/masters/customer-locations/11", method="PATCH",
+                   json={"address_text": "X", "expected_content_version": 1}, headers=AUTH)
+    data = r.get_json() or {}
+    body_text = r.get_data(as_text=True)
+
+    check(r.status_code == 504,
+          f"timeout ({shape_label}): answered 504, not 500 (got {r.status_code})")
+    check(data.get("error_code") == "UPSTREAM_TIMEOUT",
+          f"timeout ({shape_label}): carries error_code UPSTREAM_TIMEOUT "
+          f"(got {data.get('error_code')!r})")
+    check(data.get("error") == _server_mod._ERROR_MESSAGE["UPSTREAM_TIMEOUT"],
+          f"timeout ({shape_label}): returns the fixed, actionable message")
+    check("nothing was changed" in (data.get("error") or "").lower(),
+          f"timeout ({shape_label}): the message tells the user nothing was changed")
+    check("timed out" not in body_text.lower() or "did not respond in time" in body_text.lower(),
+          f"timeout ({shape_label}): raw transport text is not echoed to the client")
+    check("read timeout=" not in body_text and "HTTPConnectionPool" not in body_text,
+          f"timeout ({shape_label}): no infrastructure detail leaks into the body")
+
+# A non-timeout failure must still be an INTERNAL_ERROR 500 - the new branch
+# must not swallow unrelated faults into a retryable answer.
+reset("update_customer_location", Exception("column \"secret_col\" does not exist"))
+with app.test_client() as c:
+    r = c.open("/masters/customer-locations/11", method="PATCH",
+               json={"address_text": "X", "expected_content_version": 1}, headers=AUTH)
+check(r.status_code == 500 and (r.get_json() or {}).get("error_code") == "INTERNAL_ERROR",
+      "a NON-timeout failure is still INTERNAL_ERROR 500, not misreported as a timeout")
+check("secret_col" not in r.get_data(as_text=True),
+      "a non-timeout failure still leaks no database text")
+
 print()
 print(f"{PASSES} passed, {len(FAILURES)} failed")
 if FAILURES:

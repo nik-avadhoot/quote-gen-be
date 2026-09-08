@@ -165,6 +165,34 @@ except RuntimeError:
 check(sc.get_supabase() is sc.get_supabase(),
       "C-8 legacy get_supabase() IS a shared singleton - never attach a caller token to it")
 
+# --- C-10 per-REQUEST reuse, and only per request (D1) -----------------------
+# The client is now memoised on flask.g so one request does not pay three TLS
+# handshakes. The security property is unchanged and is asserted here directly:
+# reuse is keyed by token and scoped to a single request context, so no two
+# requests - and no two tokens - can ever share a client.
+from flask import Flask as _Flask
+
+_probe = _Flask("caller-context-probe")
+
+with _probe.test_request_context("/"):
+    r1 = cc.get_supabase_for_caller("token-req-1")
+    r2 = cc.get_supabase_for_caller("token-req-1")
+    check(r1 is r2, "C-10a same token within ONE request reuses one client")
+    check(_auth_header(r1) == "Bearer token-req-1", "C-10b the reused client carries that token")
+
+    r3 = cc.get_supabase_for_caller("token-req-1-other")
+    check(r3 is not r1, "C-10c a DIFFERENT token in the same request never reuses the client")
+    check(_auth_header(r3) == "Bearer token-req-1-other",
+          "C-10d the replacement client carries only the new token")
+
+with _probe.test_request_context("/"):
+    r4 = cc.get_supabase_for_caller("token-req-1")
+    check(r4 is not r1, "C-10e a SECOND request never reuses the first request's client")
+
+check(cc.get_supabase_for_caller("token-no-ctx")
+      is not cc.get_supabase_for_caller("token-no-ctx"),
+      "C-10f outside any request context each call still builds a fresh client")
+
 print()
 print(f"{PASSES} passed, {len(FAILURES)} failed")
 if FAILURES:

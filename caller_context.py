@@ -10,8 +10,11 @@ get_supabase() returns a module-level CACHED SINGLETON. Attaching a caller's
 token to it would publish that token to every concurrent request served by the
 same worker - request A could execute as request B's user. The bug is silent
 and its blast radius is every row RLS protects. So caller-scoped clients are
-built per request and never cached, and that property is asserted by
-tests/test_caller_context.py rather than left to reviewer discipline.
+scoped to ONE REQUEST and never to the module: memoised on `flask.g` and keyed
+by the token they were built with (D1 - three separate clients per request each
+paid their own TLS handshake), so two requests can never share one. That
+property is asserted by tests/test_caller_context.py rather than left to
+reviewer discipline.
 
 The service-role key bypasses RLS entirely (verified: service_role holds
 BYPASSRLS). It is therefore not available as an ambient import here - it is
@@ -21,6 +24,8 @@ PRIVILEGED_OPERATIONS.
 import json
 import os
 import threading
+import time
+from contextlib import contextmanager
 import urllib.error
 import urllib.request
 
@@ -76,23 +81,42 @@ def _env(name: str) -> str:
     return value
 
 
-def get_supabase_for_caller(access_token: str) -> Client:
-    """
-    Build a Supabase client that executes as the CALLER.
+# D2: the supabase-py default PostgREST timeout is 120 SECONDS. A single hung
+# upstream request therefore parked a Flask worker for two minutes and then
+# surfaced as a bare 500 ("The read operation timed out") with no usable
+# feedback in the UI - measured directly, see docs. A bounded timeout turns
+# that into a fast, mappable refusal. Generous enough that ordinary calls
+# (measured median ~320 ms, p-max ~1.2 s) never trip it.
+UPSTREAM_TIMEOUT_SECONDS = int(os.environ.get("QOS_UPSTREAM_TIMEOUT", "15"))
 
-    A new client every call - never cached, never shared, never mutated after
-    construction. The caller's bearer token is fixed in the client's headers at
-    construction time, so two clients built concurrently cannot observe each
-    other's identity.
 
-    PostgREST resolves the token to the `authenticated` role and to
-    auth.uid()/auth.jwt(), which is what every RLS policy and app_private helper
-    reads. The backend therefore adds no authorization of its own here: the
-    database is the boundary.
-    """
-    if not access_token or not isinstance(access_token, str):
-        raise ValueError("access_token is required to build a caller-context client")
+class UpstreamTimeout(Exception):
+    """A Supabase/PostgREST call exceeded UPSTREAM_TIMEOUT_SECONDS."""
 
+
+# D1 - request-path instrumentation. OFF unless QOS_TIMING is set, so it costs
+# nothing in production and adds no log noise; set QOS_TIMING=1 in the
+# gitignored quote-gen-be/.env to measure locally. Emits one line per phase:
+#   TIMING <phase> <ms>
+TIMING_ENABLED = bool(os.environ.get("QOS_TIMING"))
+
+
+@contextmanager
+def timed(phase: str):
+    """Measure one phase of the request path. A no-op unless QOS_TIMING is set."""
+    if not TIMING_ENABLED:
+        yield
+        return
+    import logging
+    start = time.perf_counter()
+    try:
+        yield
+    finally:
+        logging.getLogger("qos.timing").warning(
+            "TIMING %-28s %8.1f ms", phase, (time.perf_counter() - start) * 1000)
+
+
+def _build_caller_client(access_token: str) -> Client:
     return create_client(
         _env("SUPABASE_URL"),
         _env("SUPABASE_PUBLISHABLE_KEY"),
@@ -100,8 +124,53 @@ def get_supabase_for_caller(access_token: str) -> Client:
             headers={"Authorization": f"Bearer {access_token}"},
             auto_refresh_token=False,
             persist_session=False,
+            postgrest_client_timeout=UPSTREAM_TIMEOUT_SECONDS,
+            storage_client_timeout=UPSTREAM_TIMEOUT_SECONDS,
         ),
     )
+
+
+def get_supabase_for_caller(access_token: str) -> Client:
+    """
+    Return a Supabase client that executes as the CALLER.
+
+    ONE client per REQUEST, memoised on `flask.g` and keyed by the token it was
+    built with. Never a module-level cache and never shared between requests, so
+    the original invariant holds: two callers cannot observe each other's
+    identity, because two requests never touch the same `g`. Outside a request
+    context (scripts, tests) this builds a fresh client exactly as before.
+
+    D1: this path used to build a NEW client on every call - three per request
+    for a single screen (require_auth, resolve_caller, the route body), each one
+    paying a fresh TLS handshake (measured 568-1179 ms cold vs ~300 ms on a warm
+    connection). Reusing one client per request removes two handshakes without
+    weakening the boundary.
+
+    The caller's bearer token is fixed in the client's headers at construction
+    time. PostgREST resolves it to the `authenticated` role and to
+    auth.uid()/auth.jwt(), which is what every RLS policy and app_private helper
+    reads. The backend adds no authorization of its own here: the database is
+    the boundary.
+    """
+    if not access_token or not isinstance(access_token, str):
+        raise ValueError("access_token is required to build a caller-context client")
+
+    try:
+        from flask import g, has_request_context
+    except Exception:
+        return _build_caller_client(access_token)
+
+    if not has_request_context():
+        return _build_caller_client(access_token)
+
+    cached = getattr(g, "_qos_caller_client", None)
+    if cached is not None and getattr(g, "_qos_caller_token", None) == access_token:
+        return cached
+
+    client = _build_caller_client(access_token)
+    g._qos_caller_client = client
+    g._qos_caller_token = access_token
+    return client
 
 
 def privileged_client(operation: str) -> Client:
@@ -157,7 +226,7 @@ def _derive_role(group_caps: list[str], plant_caps: dict) -> str:
     return "maker"
 
 
-def resolve_caller(access_token: str) -> dict | None:
+def resolve_caller(access_token: str, known_auth_uid: str | None = None) -> dict | None:
     """
     Resolve the caller's application identity and authority THROUGH RLS.
 
@@ -174,24 +243,50 @@ def resolve_caller(access_token: str) -> dict | None:
     """
     client = get_supabase_for_caller(access_token)
 
-    users = (
-        client.table("app_users")
-        .select("id, auth_user_id, display_name, status")
-        .eq("status", "active")
-        .limit(2)
-        .execute()
-    ).data or []
+    # D1: when require_auth has already verified the token it also knows the
+    # caller's Auth uuid, so ask for that row directly instead of fetching a
+    # window of visible rows and picking from it. An administrator sees
+    # everyone, so the old .limit(2) could genuinely miss their own row once a
+    # third user existed and then resolve to None.
+    #
+    # NOTE - deliberately still THREE reads, not one embedded read. Collapsing
+    # app_users + both grant tables into a single PostgREST resource-embedding
+    # query does work and is measurably faster, but it moves the
+    # status='active' filter for grants out of the database and into Python.
+    # tests/test_capability_shape.py asserts that those queries ASK the database
+    # for active rows precisely so a later edit cannot do that, and that gate is
+    # right: the database, not this file, decides which grants count. The
+    # cheaper shape is left for a separate, reviewed change.
+    query = client.table("app_users").select("id, auth_user_id, display_name, status")
+    query = query.eq("status", "active")
+    if known_auth_uid:
+        query = query.eq("auth_user_id", known_auth_uid)
+    else:
+        query = query.limit(2)
+    users = (query.execute()).data or []
+
     # The app_users select policy shows a caller their own row; an administrator
     # additionally sees everyone, so pick the row that is actually theirs.
     me = None
-    if len(users) == 1:
+    if known_auth_uid:
+        me = next((u for u in users if u.get("auth_user_id") == known_auth_uid), None)
+    elif len(users) == 1:
         me = users[0]
     elif users:
-        auth_uid = _auth_uid(client, access_token)
-        me = next((u for u in users if u.get("auth_user_id") == auth_uid), None)
+        # Standalone callers (scripts, tests) still resolve correctly; the extra
+        # auth.get_user() round-trip only happens when the uuid was not supplied.
+        uid = _auth_uid(client, access_token)
+        me = next((u for u in users if u.get("auth_user_id") == uid), None)
     if not me:
         return None
 
+    # These two reads are independent, and running them concurrently on the
+    # shared per-request client was tried and REVERTED for the same reason as
+    # the six reads in server.list_customer_families(): supabase-py speaks
+    # HTTP/2 over a single multiplexed connection, and httpcore's sync h2 path
+    # fails under concurrent use from threads (WinError 10035) and then leaves
+    # the connection wedged. Sequential, on the one already-warm client.
+    # Both still filter status='active' in the QUERY, not in Python.
     group_rows = (
         client.table("group_capability_grants")
         .select("app_user_id, status, capabilities(capability_key)")
