@@ -362,6 +362,14 @@ U1_SLICE_A_RPCS = {
 # (docs/u1-customer-foundation-authorization-packet.md, quote-gen-fe). No
 # eligibility-change RPC exists - post-proposal eligibility change is
 # Product-Owner-blocked, not built.
+UA3_RPCS = {
+    # UA-3. The single governed capability-replacement operation. anon must not
+    # reach it, and service_role must not either - EXECUTE is explicitly revoked
+    # from both, the U1-CF-C1 discipline.
+    "set_user_capabilities": {"p_app_user": 1, "p_expected_content_version": 1,
+                              "p_group_caps": [], "p_plant_caps": {}},
+}
+
 U1_SLICE_C_RPCS = {
     "propose_customer_location": {"p_party": 1, "p_location_type": None, "p_address_text": None,
                                    "p_contact_name": None, "p_notes": None,
@@ -457,6 +465,20 @@ def main():
     print("\n=== U1 Slice C surface - Customer Location mutations: persona service_role ===")
     for name, body in U1_SLICE_C_RPCS.items():
         expect_service_role_rpc_refused(name, body)
+    anon_matrix([], UA3_RPCS, "UA-3 surface - governed capability replacement")
+    print("\n=== UA-3 surface - governed capability replacement: persona service_role ===")
+    for name, body in UA3_RPCS.items():
+        expect_service_role_rpc_refused(name, body)
+
+    # UA-3 bypass closure, anon half. The grant tables are where capability
+    # state lives; anon never held a privilege on them and must still not.
+    print("\n=== UA-3 bypass closure - anon cannot write the grant tables ===")
+    for table in ("group_capability_grants", "plant_capability_grants"):
+        expect_anon_refused("anon", "POST", "/rest/v1/" + table,
+                            body={"app_user_id": 1, "capability_id": 1})
+        expect_anon_refused("anon", "PATCH", "/rest/v1/%s?id=eq.1" % table,
+                            body={"status": "revoked"})
+
     unroutable_matrix()
 
     if not args.anon_only:
@@ -540,6 +562,23 @@ def authenticated_matrix():
                   "batch_edit_locks"):
             expect_nonempty_read("owner", tokens["owner"],
                                  "/rest/v1/%s?select=id&batch_id=eq.%s" % (t, batch_id))
+
+        # UA-3 bypass closure, the case that actually matters: an AUTHENTICATED
+        # caller can no longer write the grant tables directly. Before the
+        # closure an administer_users holder could, and chose its own
+        # granted_by. Probed over real HTTP, because a policy drop asserted only
+        # in SQL is not the same as one the API enforces.
+        print("\n=== UA-3 bypass closure: authenticated personas cannot write grants ===")
+        for persona, key in (("owner", "owner"), ("checker", "checker"),
+                             ("unprovisioned", "unprov"), ("inactive", "dead")):
+            tok = tokens.get(key)
+            if not tok:
+                continue
+            for table in ("group_capability_grants", "plant_capability_grants"):
+                expect_write_denied(persona, tok, "POST", "/rest/v1/" + table,
+                                    {"app_user_id": 1, "capability_id": 1})
+                expect_write_denied(persona, tok, "PATCH",
+                                    "/rest/v1/%s?id=eq.1" % table, {"status": "revoked"})
 
         # ------------------------------------------- the denied personas
         for persona, key in (("unprovisioned", "unprov"), ("wrong_plant", "wrong"),

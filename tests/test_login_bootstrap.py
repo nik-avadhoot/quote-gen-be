@@ -343,9 +343,58 @@ check(no_invite == wrong_email == deactivated,
       "BL-17 no-invitation, wrong-email and deactivated are indistinguishable")
 
 print()
+# ─────────────────────────────────────────────────────────────────────────────
+# UA-1 regression: identity resolution must never be blind.
+#
+# caller_context.resolve_caller falls back to `.limit(2)` over every row the
+# caller can SEE when no auth uid is supplied - and an administrator sees
+# EVERYONE. With three or more users those two rows need not include the
+# administrator's own, so `me` resolves to None and /auth/refresh answers
+# 403 "Account is not active" for a perfectly valid session.
+#
+# The hazard is named in resolve_caller's own comment and was fixed for the
+# require_auth path; /auth/login and /auth/refresh were left resolving blind.
+# Found live during UA-1/UA-4 acceptance: creating a third user logged the
+# administrator out on their very next token refresh.
+import inspect  # noqa: E402
+
+SEEN = []
+_orig_resolve = server.resolve_caller
+
+
+def _recording_resolve(access_token, known_auth_uid=None):
+    SEEN.append(known_auth_uid)
+    return None
+
+
+server.resolve_caller = _recording_resolve
+try:
+    SEEN.clear()
+    server._identity_or_none("tok", "auth-uuid-123")
+    check(SEEN == ["auth-uuid-123"],
+          "UA-R1 _identity_or_none forwards the auth uid to resolve_caller")
+
+    SEEN.clear()
+    server._identity_or_none("tok")
+    check(SEEN == [None],
+          "UA-R2 and still resolves blind when no uid is available, unchanged")
+finally:
+    server.resolve_caller = _orig_resolve
+
+_login_src = inspect.getsource(server.auth_login)
+_refresh_src = inspect.getsource(server.auth_refresh)
+check("_identity_or_none(session.access_token)" not in _refresh_src,
+      "UA-R3 /auth/refresh never resolves identity blind")
+check(_refresh_src.count("_identity_or_none(session.access_token, str(user.id))") == 1,
+      "UA-R4 /auth/refresh resolves with the authenticated uid")
+check("_identity_or_none(session.access_token)" not in _login_src,
+      "UA-R5 /auth/login never resolves identity blind, on either attempt")
+check(_login_src.count("_identity_or_none(session.access_token, str(user.id))") == 2,
+      "UA-R6 /auth/login resolves with the uid before AND after bootstrap")
+
+
 print(f"{PASSES} passed, {len(FAILURES)} failed")
 if FAILURES:
     for f in FAILURES:
         print(f"  FAILED: {f}")
     sys.exit(1)
-print("first-sign-in gate PASS")

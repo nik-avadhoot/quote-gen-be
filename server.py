@@ -487,7 +487,7 @@ def export_xlsx():
 # an authenticated session.
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _identity_or_none(access_token):
+def _identity_or_none(access_token, auth_uid=None):
     """
     Resolve the caller's application identity using THEIR OWN token, through RLS.
 
@@ -495,9 +495,22 @@ def _identity_or_none(access_token):
     so identity resolution was the one place the database was not the authority.
     Returns None for an unrecognised or deactivated identity - the caller cannot
     tell which, deliberately.
+
+    `auth_uid` MUST be passed wherever it is known. Without it resolve_caller
+    falls back to `.limit(2)` over every row the caller can SEE - and an
+    administrator sees EVERYONE. With three or more users those two rows need
+    not include the administrator's own, so `me` resolves to None and a valid
+    session is refused as "Account is not active".
+
+    That hazard is named in caller_context.resolve_caller and was fixed for the
+    require_auth path by passing the verified uid; the /auth/login and
+    /auth/refresh paths were left resolving blind. Both have the uid in hand
+    from the Auth response, so both now pass it. Found when a third user was
+    created during UA-1/UA-4 acceptance and the administrator's next token
+    refresh logged them out.
     """
     try:
-        return resolve_caller(access_token)
+        return resolve_caller(access_token, known_auth_uid=auth_uid)
     except Exception:
         return None
 
@@ -532,8 +545,10 @@ def auth_login():
     if not session or not user:
         return jsonify({"error": "Invalid email or password"}), 401
 
-    # Identity is resolved with the token just issued, so RLS decides.
-    profile = _identity_or_none(session.access_token)
+    # Identity is resolved with the token just issued, so RLS decides. The uid is
+    # passed so an administrator resolves their OWN row rather than two arbitrary
+    # visible ones.
+    profile = _identity_or_none(session.access_token, str(user.id))
 
     # FIRST SIGN-IN. Authenticating proves who you are; it does not create an
     # application identity. An invited user - including the very first
@@ -554,7 +569,7 @@ def auth_login():
     # identity impossible regardless.
     if not profile:
         bootstrap_caller(session.access_token)
-        profile = _identity_or_none(session.access_token)
+        profile = _identity_or_none(session.access_token, str(user.id))
 
     # One refusal for every cause - no account, no invitation, wrong email,
     # deactivated. The caller must not be able to tell which.
@@ -591,7 +606,7 @@ def auth_refresh():
     # correct answer is to refuse. Attempting a bootstrap on this path would let
     # a long-lived refresh token silently re-enter the system on any invitation
     # that happened to match, which is not a login the user just authenticated.
-    profile = _identity_or_none(session.access_token)
+    profile = _identity_or_none(session.access_token, str(user.id))
     if not profile:
         return jsonify({"error": "Account is not active"}), 403
 
