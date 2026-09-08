@@ -62,7 +62,7 @@ from caller_context import (
     update_caller_email,
     verify_current_password,
 )
-from auth import require_auth, require_group_capability, require_role
+from auth import require_auth, require_group_capability
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -708,7 +708,7 @@ def change_my_email():
 
 @app.route("/admin/users/<uid>/email", methods=["PATCH"])
 @require_auth
-@require_role("admin")
+@require_group_capability("administer_users")
 def admin_change_user_email(uid):
     """
     Administrator-initiated login-email change.
@@ -1792,7 +1792,7 @@ def _plant_requirement_error(role, plant_codes):
 
 @app.route("/admin/users", methods=["GET"])
 @require_auth
-@require_role("admin")
+@require_group_capability("administer_users")
 def list_users():
     """
     Administrator visibility is an RLS POLICY, not a service-role bypass.
@@ -1873,7 +1873,7 @@ def list_users():
 
 @app.route("/admin/users", methods=["POST"])
 @require_auth
-@require_role("admin")
+@require_group_capability("administer_users")
 def create_user():
     data = request.get_json(force=True) or {}
     email        = (data.get("email") or "").strip()
@@ -2120,7 +2120,7 @@ def set_user_capabilities_route(uid):
 
 @app.route("/admin/users/<uid>/reset-password", methods=["POST"])
 @require_auth
-@require_role("admin")
+@require_group_capability("administer_users")
 def reset_password(uid):
     data = request.get_json(force=True) or {}
     generated = not data.get("password")

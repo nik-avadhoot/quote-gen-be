@@ -90,9 +90,18 @@ def require_auth(f):
 
 def require_role(*roles):
     """
-    Compatibility shim. The derived role comes from capability grants, so this
-    still enforces the approved model - it just keeps the existing decorators
-    readable. Prefer require_group_capability for new routes.
+    Compatibility shim, now with NO CALLERS. Do not add one.
+
+    It was never wrong in effect - the derived role is computed from capability
+    grants, so `role == "admin"` and `administer_users` currently coincide - but
+    it made a PRESENTATION LABEL the thing a route consults. A change to
+    derive_role would then silently regate every route wearing this decorator,
+    and the label is deliberately lossy: it cannot express nine of the thirteen
+    capabilities at all. Every administration route now states the capability it
+    actually requires, through require_group_capability.
+
+    Kept only so an out-of-tree caller does not break on import. Anything new
+    must use require_group_capability / require_plant_capability.
     """
     def decorator(f):
         @wraps(f)
