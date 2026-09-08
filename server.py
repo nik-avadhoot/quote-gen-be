@@ -789,7 +789,7 @@ def admin_change_user_email(uid):
 
 @app.route("/admin/auth-orphans", methods=["GET"])
 @require_auth
-@require_role("admin")
+@require_group_capability("administer_users")
 def list_auth_orphans():
     """
     Authentication accounts with no application identity and no open invitation.
@@ -850,7 +850,7 @@ def list_auth_orphans():
 
 @app.route("/admin/users/adopt", methods=["POST"])
 @require_auth
-@require_role("admin")
+@require_group_capability("administer_users")
 def adopt_auth_account():
     """
     Give an EXISTING authentication account an application identity.
@@ -1706,7 +1706,7 @@ def derive_role(group_caps, plant_caps):
 def _read_one_user(client, app_user_id):
     """Re-read one identity as the caller, shaped like the legacy profile row."""
     rows = (client.table("app_users")
-            .select("id, auth_user_id, display_name, status")
+            .select("id, auth_user_id, display_name, status, content_version")
             .eq("id", app_user_id).limit(1).execute()).data or []
     if not rows:
         return {}
@@ -1730,8 +1730,12 @@ def _read_one_user(client, app_user_id):
     return {
         "id": u["id"], "display_name": u["display_name"],
         "active": u["status"] == "active", "status": u["status"],
+        # UA-5 - the caller needs the NEW version to act again without a reload.
+        "content_version": u.get("content_version"),
         "role": derive_role([c for c in gc if c], pc),
         "plant": next(iter(pc), None), "plants": sorted(pc),
+        "group_capabilities": sorted(c for c in gc if c),
+        "plant_capabilities": {k: sorted(v) for k, v in sorted(pc.items())},
     }
 
 
@@ -1964,14 +1968,27 @@ def create_user():
 
 @app.route("/admin/users/<uid>", methods=["PATCH"])
 @require_auth
-@require_role("admin")
+@require_group_capability("administer_users")
 def update_user(uid):
     """
-    `uid` is now the application identity (app_users.id), not an Auth uuid.
+    `uid` is the application identity (app_users.id), not an Auth uuid.
 
-    Every write runs as the caller: display_name through the column grant, status
-    through a capability-checked RPC, and role/plant as ordinary grant rows whose
-    INSERT/UPDATE policies already require administer_users.
+    Both writes run as the caller: display_name through the column grant, and
+    status through the capability-checked, VERSIONED RPC.
+
+    UA-5. The status change now carries `expected_content_version` and goes
+    through _rpc_call, so the SQLSTATE decides the answer instead of every
+    outcome collapsing into one 400:
+
+        PT409 -> 409 STALE_VERSION          someone else changed this user
+        22023 -> 422 TRANSITION_NOT_ALLOWED the last active administrator
+        42501 -> 403 CAPABILITY_REQUIRED    not an administrator any more
+        P0002 -> 404 RECORD_NOT_FOUND       no such user
+
+    require_group_capability, not require_role: a derived label must not gate a
+    route. The two are equivalent today - derive_role reads `admin` from
+    administer_users - which is exactly why the difference has to be written
+    down before a change to the derivation silently regates this.
     """
     data   = request.get_json(force=True) or {}
     client = get_supabase_for_caller(g.access_token)
@@ -1992,15 +2009,22 @@ def update_user(uid):
         touched = True
 
     if "active" in data:
+        # Checked here as well as in the database so the refusal can say what it
+        # actually is. The database refuses it too (42501) and remains the
+        # authority; this only makes the message specific.
         if app_user_id == g.caller["id"] and not data["active"]:
-            return jsonify({"error": "You cannot deactivate your own account"}), 400
-        try:
-            client.rpc("admin_set_app_user_status", {
-                "p_app_user": app_user_id,
-                "p_status": "active" if data["active"] else "deactivated",
-            }).execute()
-        except Exception:
-            return jsonify({"error": "Could not update the account status"}), 400
+            return _error("TRANSITION_NOT_ALLOWED",
+                          "You cannot deactivate your own account.")
+        expected = _int_field(data, "expected_content_version")
+        if expected is None:
+            return _invalid_input("expected_content_version is required")
+        _, err = _rpc_call(client, "admin_set_app_user_status", {
+            "p_app_user": app_user_id,
+            "p_expected_content_version": expected,
+            "p_status": "active" if data["active"] else "deactivated",
+        })
+        if err:
+            return err
         touched = True
 
     # UA-4. The legacy role/plant mutation branch is GONE, not bridged. It could

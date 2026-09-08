@@ -216,15 +216,26 @@ check(not any(t == "SERVICE-ROLE" and tbl == "app_users" for t, tbl, *_ in CALLS
 
 _reset(); PRIVILEGED_CALLS.clear()
 with app.test_client() as c:
-    r = c.patch("/admin/users/7", json={"active": False}, headers=AUTH)
-check(r.status_code == 400,
-      "R-5 /admin/users PATCH refuses self-deactivation")
+    r = c.patch("/admin/users/7", json={"active": False,
+                                       "expected_content_version": 1}, headers=AUTH)
+check(r.status_code == 422 and (r.get_json() or {}).get("error_code") == "TRANSITION_NOT_ALLOWED",
+      "R-5 /admin/users PATCH refuses self-deactivation (UA-5: 422, with a code)")
 
 _reset(); PRIVILEGED_CALLS.clear()
 with app.test_client() as c:
-    r = c.patch("/admin/users/8", json={"active": False}, headers=AUTH)
+    r = c.patch("/admin/users/8", json={"active": False,
+                                       "expected_content_version": 1}, headers=AUTH)
 check(any(tbl == "rpc:admin_set_app_user_status" for _, tbl, *_ in CALLS.items),
       "R-6 status change goes through the capability-checked RPC")
+
+# UA-5 - the version is not optional. Without it the route must refuse before
+# the database, or the CAS the migration added could simply be skipped.
+_reset(); PRIVILEGED_CALLS.clear()
+with app.test_client() as c:
+    r = c.patch("/admin/users/8", json={"active": False}, headers=AUTH)
+check(r.status_code == 400
+      and not any(tbl == "rpc:admin_set_app_user_status" for _, tbl, *_ in CALLS.items),
+      "R-6a an unversioned status change is refused before reaching the database")
 
 _reset(); PRIVILEGED_CALLS.clear()
 with app.test_client() as c:
