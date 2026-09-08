@@ -30,6 +30,7 @@ import os
 import io
 import re
 import secrets
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 
@@ -50,6 +51,7 @@ import openpyxl
 
 from caller_context import (
     TIMING_ENABLED,
+    new_caller_client,
     UPSTREAM_TIMEOUT_SECONDS,
     timed,
     bootstrap_caller,
@@ -953,28 +955,27 @@ def list_customer_families():
 
     client = get_supabase_for_caller(g.access_token)
 
-    # D1 - these six reads are independent of one another, so running them
-    # concurrently is the obvious win. It was TRIED and REVERTED, and the reason
-    # is recorded here so it is not retried blind:
+    # D1 - these six reads are independent of one another and ran strictly in
+    # sequence, which measured ~2.7 s of pure round-trip time against a live
+    # project holding a single family. They now run with BOUNDED parallelism.
     #
-    #   supabase-py talks HTTP/2, which multiplexes every request over ONE TCP
-    #   connection. Sharing the per-request client across a ThreadPoolExecutor
-    #   therefore drives concurrent streams down a single socket through
-    #   httpcore's SYNC h2 implementation, and it fails -
-    #   `httpx.ReadError: [WinError 10035] A non-blocking socket operation could
-    #   not be completed immediately`, raised from httpcore/_sync/http2.py.
-    #   Worse, it leaves the pooled connection wedged, so the NEXT request on it
-    #   hangs until the timeout. Measured, with a stack trace, not theorised.
+    # ONE CLIENT PER WORKER, never the shared per-request client. Sharing it was
+    # tried first and fails: supabase-py speaks HTTP/2 and multiplexes every
+    # request over ONE TCP connection, so concurrent threads collide inside
+    # httpcore's sync h2 path with `httpx.ReadError: [WinError 10035]`, and the
+    # pooled connection is left wedged so the NEXT request hangs until timeout.
+    # Measured, with a stack trace. new_caller_client() therefore hands each
+    # worker its own client and its own connection.
     #
-    # Safe ways to get the concurrency back, both of which are more than a
-    # defect fix and are therefore proposed rather than taken here: give each
-    # concurrent read its own client (measured ~1.0 s wall vs ~2.7 s
-    # sequential), or force HTTP/1.1 so the pool hands each thread its own
-    # connection. Sequential on ONE reused, already-warm client is what runs.
+    # The pool is bounded to exactly these six known reads - not a general
+    # concurrency mechanism, and not sized from anything a caller controls.
     #
-    # Authority is unchanged either way: every read goes through the caller's
-    # own token, RLS decides visibility, and the explicit read_party_master
-    # check above still runs first.
+    # Authority is unchanged: every read carries the caller's own token, RLS
+    # decides visibility exactly as on the sequential path, and the explicit
+    # read_party_master check above still runs first. Failures propagate
+    # deterministically - pool.map re-raises the first worker exception in
+    # submission order, and `results` is only bound if EVERY read returned, so
+    # a partial result set can never be serialised into a response.
     #
     # U1 Slice C addition (locations, location_versions) - additive, same
     # read_party_master gate, no RLS change. Lets the frontend show a Party's
@@ -995,10 +996,19 @@ def list_customer_families():
          "id, location_id, version_no, location_type, address_text, contact_name, notes, status"),
     )
 
+    # Captured HERE, not read inside the worker: `flask.g` is bound to the
+    # request context and is not visible from a pool thread.
+    caller_token = g.access_token
+
+    def _read(spec):
+        key, table, cols = spec
+        worker_client = new_caller_client(caller_token)
+        return key, (worker_client.table(table).select(cols).execute()).data or []
+
     try:
-        with timed("families.six_reads"):
-            results = {key: (client.table(table).select(cols).execute()).data or []
-                       for key, table, cols in _READS}
+        with timed("families.six_reads_parallel"):
+            with ThreadPoolExecutor(max_workers=len(_READS)) as pool:
+                results = dict(pool.map(_read, _READS))
     except Exception as exc:
         if _is_upstream_timeout(exc):
             app.logger.error("customer-families read timed out upstream: %s", exc)
@@ -1055,24 +1065,28 @@ def list_customer_families():
 _RPC_ERROR_MAP = {
     "42501": "CAPABILITY_REQUIRED",   # capability check failed inside app_private.*
     "P0002": "RECORD_NOT_FOUND",      # Family / Party / alias not found
-    # KNOWN DEFECT, measured 2026-09-08, fix NOT taken here (needs approval).
-    # 40001 is serialization_failure, and PostgREST AUTOMATICALLY RETRIES it -
-    # that SQLSTATE conventionally means "transient, safe to retry". A stale
-    # content_version is deterministic, so every retry re-raises it and the
-    # request never returns: the caller hangs until its own timeout. Proven by
-    # calling one governed RPC three ways against the same persona, where the
-    # ONLY difference was the SQLSTATE raised:
-    #     P0002 (not found)  -> HTTP 500 in 468 ms
-    #     40001 (stale CAS)  -> no response; 25-40 s, client timeout
-    # ...identical through raw urllib/HTTP1.1 and supabase-py/HTTP2, so it is
-    # PostgREST, not the client. Direct SQL raises the same 40001 in 49 ms.
+    # D2, corrected by migration 20260908052900. A DELIBERATE stale-version
+    # conflict now raises PT409, never 40001.
     #
-    # This is why a stale save currently surfaces as UPSTREAM_TIMEOUT/504
-    # instead of STALE_VERSION/409. The mapping below is correct and stays; the
-    # real fix is to raise a NON-retryable SQLSTATE for CAS conflicts, which
-    # means a migration touching 59 occurrences across 18 migrations plus 42
-    # pgTAP assertions - out of scope for a defect pass.
-    "40001": "STALE_VERSION",         # stale content_version - the CAS check failed
+    # Why it moved: 40001 is serialization_failure, which the Data API treats as
+    # a TRANSIENT fault and retries. Our CAS conflict is deterministic, so every
+    # retry re-raised it and the request never returned. Measured on one
+    # governed RPC, one persona, one path, where only the SQLSTATE differed:
+    #     P0002 (not found) -> HTTP 500 in 468 ms
+    #     40001 (stale CAS) -> no response at all; 25-40 s, client timeout
+    # ...identical through raw urllib/HTTP1.1 and supabase-py/HTTP2, so it was
+    # the server, not the client; direct SQL raised that same 40001 in 49 ms.
+    # postgres_logs for the `authenticator` role showed 1,025,464 x 40001 about
+    # 10 ms apart, against 8 x P0002 in the same window - a retry storm, not a
+    # slow response.
+    "PT409": "STALE_VERSION",         # stale content_version - the CAS check failed
+    # A GENUINE serialization failure is still possible and is deliberately kept
+    # DISTINCT: it is raised by Postgres itself under concurrent access, it is
+    # transient, and retrying it is the correct response - the opposite of a
+    # stale-version conflict, where retrying unchanged can only fail again.
+    # Nothing in this codebase raises 40001 on purpose any more, so reaching
+    # this entry means the database really did fail to serialize.
+    "40001": "SERIALIZATION_FAILURE",
     "22023": "TRANSITION_NOT_ALLOWED",  # forbidden state transition, self-merge,
                                          # merge-cycle, double-retirement, retired target
     "22007": "INVALID_EFFECTIVE_DATE",  # effective date precedes the current membership
@@ -1085,9 +1099,13 @@ _ERROR_STATUS = {
     "TRANSITION_NOT_ALLOWED": 422,
     "INVALID_EFFECTIVE_DATE": 422,
     "INVALID_INPUT": 400,
+    # A genuine serialization failure is transient: the caller may safely retry
+    # the SAME request unchanged. Distinct from STALE_VERSION, where retrying
+    # unchanged is guaranteed to fail again.
+    "SERIALIZATION_FAILURE": 409,
     # D2 - a hung upstream call is not an application fault and must not be
-    # reported as one. 504 is a stable, retryable answer the frontend can act
-    # on; the underlying socket/httpx text stays server-side.
+    # reported as one. 504 is a stable answer the frontend can act on; the
+    # underlying socket/httpx text stays server-side.
     "UPSTREAM_TIMEOUT": 504,
     "INTERNAL_ERROR": 500,
 }
@@ -1098,7 +1116,17 @@ _ERROR_MESSAGE = {
     "STALE_VERSION": "This record changed since you last read it. Reload and try again.",
     "TRANSITION_NOT_ALLOWED": "That action is not allowed for this record's current state.",
     "INVALID_EFFECTIVE_DATE": "The effective date is not valid for this change.",
-    "UPSTREAM_TIMEOUT": "The database did not respond in time. Nothing was changed — please try again.",
+    "SERIALIZATION_FAILURE": "The database could not complete that under concurrent load. "
+                             "Nothing was changed — please try again.",
+    # D2 CORRECTION. This must NOT claim the write did not happen. A client-side
+    # timeout means the RESPONSE was lost, not that the server did nothing: the
+    # transaction may well have committed before the connection gave up. Telling
+    # the user "nothing was changed, try again" invites a duplicate submission on
+    # an operation that already succeeded. The honest answer is that the outcome
+    # is unknown and must be observed before acting.
+    "UPSTREAM_TIMEOUT": "The database did not respond in time, so the outcome of this action is "
+                        "UNKNOWN — it may or may not have been saved. Refresh to see the current "
+                        "state before trying again.",
     "INTERNAL_ERROR": "Could not complete that action.",
 }
 

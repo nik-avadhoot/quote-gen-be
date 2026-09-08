@@ -258,7 +258,14 @@ ERROR_MAPPING_CASES = [
     ("not found", "P0002", 404, "RECORD_NOT_FOUND", "update-name", "PATCH",
      "/masters/customer-families/999",
      {"name": "X", "expected_content_version": 1}, "update_customer_family"),
-    ("stale version", "40001", 409, "STALE_VERSION", "update-name", "PATCH",
+    ("stale version", "PT409", 409, "STALE_VERSION", "update-name", "PATCH",
+     "/masters/customer-families/7",
+     {"name": "X", "expected_content_version": 1}, "update_customer_family"),
+    # D2 - a GENUINE serialization failure keeps its own identity. It is raised
+    # by Postgres under concurrent access, is transient, and retrying the same
+    # request unchanged is the correct response; a stale version is the exact
+    # opposite, and conflating the two is what produced the retry storm.
+    ("genuine serialization failure", "40001", 409, "SERIALIZATION_FAILURE", "update-name", "PATCH",
      "/masters/customer-families/7",
      {"name": "X", "expected_content_version": 1}, "update_customer_family"),
     ("forbidden transition", "22023", 422, "TRANSITION_NOT_ALLOWED", "approve", "POST",

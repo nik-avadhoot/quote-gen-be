@@ -220,7 +220,7 @@ ERROR_MAPPING_CASES = [
     ("not found", "P0002", 404, "RECORD_NOT_FOUND", "update", "PATCH",
      "/masters/customer-locations/999", {"address_text": "X", "expected_content_version": 1},
      "update_customer_location"),
-    ("stale version", "40001", 409, "STALE_VERSION", "update", "PATCH",
+    ("stale version", "PT409", 409, "STALE_VERSION", "update", "PATCH",
      "/masters/customer-locations/11", {"address_text": "X", "expected_content_version": 1},
      "update_customer_location"),
     ("forbidden transition", "22023", 422, "TRANSITION_NOT_ALLOWED", "approve", "POST",
@@ -288,8 +288,18 @@ for shape_label, exc in TIMEOUT_SHAPES:
           f"(got {data.get('error_code')!r})")
     check(data.get("error") == _server_mod._ERROR_MESSAGE["UPSTREAM_TIMEOUT"],
           f"timeout ({shape_label}): returns the fixed, actionable message")
-    check("nothing was changed" in (data.get("error") or "").lower(),
-          f"timeout ({shape_label}): the message tells the user nothing was changed")
+    # D2 CORRECTION. A client-side timeout means the RESPONSE was lost, NOT that
+    # the server did nothing - the transaction may have committed before the
+    # connection gave up. Claiming "nothing was changed" invites a duplicate
+    # submission of an operation that already succeeded, so the message must say
+    # the outcome is unknown and send the user to refresh first.
+    msg = (data.get("error") or "").lower()
+    check("unknown" in msg,
+          f"timeout ({shape_label}): the message says the OUTCOME IS UNKNOWN")
+    check("refresh" in msg,
+          f"timeout ({shape_label}): the message tells the user to refresh before retrying")
+    check("nothing was changed" not in msg,
+          f"timeout ({shape_label}): must NOT claim the write did not happen")
     check("timed out" not in body_text.lower() or "did not respond in time" in body_text.lower(),
           f"timeout ({shape_label}): raw transport text is not echoed to the client")
     check("read timeout=" not in body_text and "HTTPConnectionPool" not in body_text,

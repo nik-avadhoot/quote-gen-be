@@ -115,9 +115,46 @@ def fake_caller(token):
 
 cc.get_supabase_for_caller = fake_caller
 
+# D1: the six master reads run with bounded parallelism, one INDEPENDENT
+# caller-scoped client per worker (see server.list_customer_families and
+# caller_context.new_caller_client). Every construction is recorded so the
+# tests below can prove the workers did not share one client - sharing is what
+# broke under HTTP/2 multiplexing.
+WORKER_CLIENTS = []
+FAIL_ON_TABLE = None          # set to a table name to make that one read raise
+
+
+class WorkerReadFailure(RuntimeError):
+    pass
+
+
+class FailingQuery(FakeQuery):
+    def execute(self):
+        CALLS.append((self.token, self.table))
+        if FAIL_ON_TABLE is not None and self.table == FAIL_ON_TABLE:
+            raise WorkerReadFailure(f"synthetic failure reading {self.table}")
+        return type("R", (), {"data": self.rows})()
+
+
+class WorkerClient(FakeClient):
+    def table(self, name):
+        return FailingQuery(self.token, name, self._rows.get(name, []))
+
+
+def fake_worker_client(token):
+    if not token or not isinstance(token, str):
+        raise ValueError("access_token is required")
+    c = WorkerClient(token, ROWS)
+    WORKER_CLIENTS.append(c)
+    return c
+
+
+cc.new_caller_client = fake_worker_client
+
 import server  # noqa: E402
 import auth as auth_mod  # noqa: E402
 server.get_supabase_for_caller = fake_caller
+server.new_caller_client = fake_worker_client
 auth_mod.get_supabase_for_caller = fake_caller
 
 app = server.app
@@ -166,6 +203,65 @@ check(body["mutations"] == "governed",
 
 # ------------------------------------------------- CF-5 no service-role client
 check(all(t != "SERVICE-ROLE" for t, _ in CALLS), "CF-5 no service-role client is used at any point")
+
+# ── D1 bounded parallel reads ────────────────────────────────────────────────
+# The six Customer Master reads are independent and now run concurrently. What
+# has to stay true: all six actually happen, each worker uses its OWN client,
+# a failing worker fails the whole request deterministically, and no partial
+# result set can ever be serialised into a 200.
+
+EXPECTED_TABLES = {
+    "customer_families", "customer_family_aliases", "party_family_memberships",
+    "parties", "customer_locations", "customer_location_versions",
+}
+
+ROWS = WITH_CAP_FIXTURE_ROWS
+FAIL_ON_TABLE = None
+CALLS.clear()
+WORKER_CLIENTS.clear()
+with app.test_client() as c:
+    r = c.get("/masters/customer-families", headers=AUTH)
+
+check(r.status_code == 200, "D1-1 parallel reads still answer 200 for an authorised caller")
+read_tables = {t for _, t in CALLS if t in EXPECTED_TABLES}
+check(read_tables == EXPECTED_TABLES,
+      f"D1-2 all six master reads occur (missing: {sorted(EXPECTED_TABLES - read_tables)})")
+
+body = r.get_json()
+check(set(body) >= {"families", "aliases", "memberships", "parties",
+                    "locations", "location_versions"},
+      "D1-3 the response shape is unchanged - every key still present")
+check(body["families"] and body["families"][0]["group_customer_code"] == "F-005",
+      "D1-4 the parallel path returns the same rows as the sequential one did")
+
+check(len(WORKER_CLIENTS) == 6,
+      f"D1-5 exactly one client is built per read, six in total (got {len(WORKER_CLIENTS)})")
+check(len({id(c) for c in WORKER_CLIENTS}) == 6,
+      "D1-6 no two workers share a client instance - the HTTP/2 multiplexing hazard")
+check(all(c.token == "tok-x" for c in WORKER_CLIENTS),
+      "D1-7 every worker client carries the CALLER's own token, so RLS is unchanged")
+
+# A worker failure must propagate, not be swallowed into a partial response.
+# TESTING=True re-raises out of the test client, which would prove the exception
+# escapes but not what a real client receives; PROPAGATE_EXCEPTIONS off lets
+# Flask turn it into the 500 an actual caller would see.
+app.config["PROPAGATE_EXCEPTIONS"] = False
+for failing in ("parties", "customer_location_versions"):
+    FAIL_ON_TABLE = failing
+    CALLS.clear()
+    WORKER_CLIENTS.clear()
+    with app.test_client() as c:
+        r = c.get("/masters/customer-families", headers=AUTH)
+    check(r.status_code >= 500,
+          f"D1-8 a failing '{failing}' read fails the whole request ({r.status_code}), never a partial 200")
+    payload = r.get_json(silent=True) or {}
+    check("families" not in payload,
+          f"D1-9 no partial result set is returned when '{failing}' fails")
+    check("synthetic failure" not in r.get_data(as_text=True),
+          f"D1-10 the worker's raw failure text does not leak to the client ('{failing}')")
+
+FAIL_ON_TABLE = None
+app.config["PROPAGATE_EXCEPTIONS"] = None   # back to Flask's default
 
 print()
 print(f"{PASSES} passed, {len(FAILURES)} failed")

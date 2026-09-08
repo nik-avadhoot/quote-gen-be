@@ -176,7 +176,10 @@ LEAKY_MESSAGE = (
 ERROR_MAPPING_CASES = [
     ("no capability", "42501", 403, "CAPABILITY_REQUIRED"),
     ("not found", "P0002", 404, "RECORD_NOT_FOUND"),
-    ("stale version", "40001", 409, "STALE_VERSION"),
+    ("stale version", "PT409", 409, "STALE_VERSION"),
+    # D2: a GENUINE serialization failure is transient and keeps its own
+    # identity - retrying it unchanged is correct, unlike a stale version.
+    ("genuine serialization failure", "40001", 409, "SERIALIZATION_FAILURE"),
     ("forbidden transition", "22023", 422, "TRANSITION_NOT_ALLOWED"),
     ("unmapped code", "XXNEW", 500, "INTERNAL_ERROR"),
 ]

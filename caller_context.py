@@ -130,6 +130,31 @@ def _build_caller_client(access_token: str) -> Client:
     )
 
 
+def new_caller_client(access_token: str) -> Client:
+    """
+    Build a FRESH caller-scoped client, never memoised, for ONE worker thread.
+
+    D1: the six Customer Master reads are independent and were strictly
+    sequential (~2.7 s of pure round-trip time). Running them concurrently on
+    the SHARED per-request client does not work: supabase-py speaks HTTP/2 and
+    multiplexes every request over ONE connection, and httpcore's sync h2 path
+    fails under concurrent use from threads with
+    `httpx.ReadError: [WinError 10035]`, then leaves the pooled connection
+    wedged so the NEXT request hangs. That was measured, with a stack trace.
+
+    So each worker gets its own client and therefore its own connection. The
+    caller's token, and nothing else, is what they share - RLS still decides
+    every row, exactly as on the sequential path.
+
+    Use ONLY for bounded fan-out with a known, small worker count. Ordinary
+    sequential work must use get_supabase_for_caller() so it keeps the warm
+    per-request connection.
+    """
+    if not access_token or not isinstance(access_token, str):
+        raise ValueError("access_token is required to build a caller-context client")
+    return _build_caller_client(access_token)
+
+
 def get_supabase_for_caller(access_token: str) -> Client:
     """
     Return a Supabase client that executes as the CALLER.
