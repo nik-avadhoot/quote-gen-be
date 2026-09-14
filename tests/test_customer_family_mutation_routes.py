@@ -11,7 +11,7 @@ Postgres error code to an HTTP status - not authorization or CAS outcomes at
 the database layer (proved separately by tests.customer_family_mutations()
 via tests.run_all()).
 
-Every one of the ten routes below is a thin forwarder to one `public.*` RPC
+Every one of the eleven routes below is a thin forwarder to one `public.*` RPC
 (docs/u1-customer-family-mutations-packet.md in quote-gen-fe, §§1-2/8). None
 of them duplicates a capability or state-transition check - app_private.*
 already enforces every one - so "no capability" here is proven by injecting
@@ -150,11 +150,15 @@ def reset(rpc_name=None, response=None):
 ROUTES = [
     # (label, method, path, body, rpc_name, expected_params, success_response)
     ("propose", "POST", "/masters/customer-families",
-     {"name": "Acme"}, "propose_customer_family", {"p_name": "Acme"}, 7),
+     {"name": "Acme", "sector_id": 31}, "propose_customer_family",
+     {"p_name": "Acme", "p_sector": 31}, 7),
     ("prospect", "POST", "/masters/customer-families/prospects",
-     {"display_name": "Beta Co"}, "create_minimal_prospect",
-     {"p_display_name": "Beta Co", "p_family_id": None},
+     {"display_name": "Beta Co", "sector_id": 31}, "create_minimal_prospect",
+     {"p_display_name": "Beta Co", "p_family_id": None, "p_sector": 31},
      [{"party_id": 9, "family_id": 7}]),
+    ("add-sector", "POST", "/masters/customer-families/7/sectors",
+     {"sector_id": 32, "expected_content_version": 1}, "add_customer_family_sector",
+     {"p_family": 7, "p_sector": 32, "p_expected_content_version": 1}, None),
     ("update-name", "PATCH", "/masters/customer-families/7",
      {"name": "Acme Renamed", "expected_content_version": 1}, "update_customer_family",
      {"p_family": 7, "p_expected_content_version": 1, "p_name": "Acme Renamed"}, None),
@@ -214,8 +218,13 @@ check(RPC_CALLS[0][2].get("p_effective") == "2026-09-10",
 
 # ------------------------------------------------- missing required field -> 400, no RPC
 MISSING_FIELD_CASES = [
-    ("propose: blank name", "POST", "/masters/customer-families", {"name": "  "}),
-    ("prospect: missing display_name", "POST", "/masters/customer-families/prospects", {}),
+    ("propose: blank name", "POST", "/masters/customer-families", {"name": "  ", "sector_id": 31}),
+    ("propose: missing first Sector", "POST", "/masters/customer-families", {"name": "Acme"}),
+    ("prospect: missing display_name", "POST", "/masters/customer-families/prospects", {"sector_id": 31}),
+    ("prospect: implicit Family missing first Sector", "POST", "/masters/customer-families/prospects",
+     {"display_name": "Beta Co"}),
+    ("add-sector: missing CAS token", "POST", "/masters/customer-families/7/sectors",
+     {"sector_id": 32}),
     ("update-name: missing expected_content_version", "PATCH", "/masters/customer-families/7",
      {"name": "X"}),
     ("approve: missing expected_content_version", "POST", "/masters/customer-families/7/approve", {}),
@@ -258,9 +267,15 @@ ERROR_MAPPING_CASES = [
     ("not found", "P0002", 404, "RECORD_NOT_FOUND", "update-name", "PATCH",
      "/masters/customer-families/999",
      {"name": "X", "expected_content_version": 1}, "update_customer_family"),
+    ("foreign identity", "23503", 404, "RECORD_NOT_FOUND", "add-sector", "POST",
+     "/masters/customer-families/7/sectors",
+     {"sector_id": 999, "expected_content_version": 1}, "add_customer_family_sector"),
     ("stale version", "PT409", 409, "STALE_VERSION", "update-name", "PATCH",
      "/masters/customer-families/7",
      {"name": "X", "expected_content_version": 1}, "update_customer_family"),
+    ("calculation not ready", "PT422", 422, "CALCULATION_NOT_READY", "approve", "POST",
+     "/masters/customer-families/7/approve",
+     {"expected_content_version": 1}, "approve_customer_family"),
     # D2 - a GENUINE serialization failure keeps its own identity. It is raised
     # by Postgres under concurrent access, is transient, and retrying the same
     # request unchanged is the correct response; a stale version is the exact
@@ -274,6 +289,9 @@ ERROR_MAPPING_CASES = [
     ("effective date precedes membership", "22007", 422, "INVALID_EFFECTIVE_DATE", "reassign", "POST",
      "/masters/customer-families/reassign",
      {"party_id": 9, "new_family_id": 8, "expected_content_version": 1}, "reassign_customer_family"),
+    ("lock unavailable", "55P03", 409, "LOCK_UNAVAILABLE", "add-sector", "POST",
+     "/masters/customer-families/7/sectors",
+     {"sector_id": 32, "expected_content_version": 1}, "add_customer_family_sector"),
     ("unmapped code", "XXNEW", 500, "INTERNAL_ERROR", "approve", "POST",
      "/masters/customer-families/7/approve",
      {"expected_content_version": 1}, "approve_customer_family"),
@@ -314,7 +332,7 @@ check(set(_server_mod._RPC_ERROR_MAP) == {c for _, c, *_ in ERROR_MAPPING_CASES 
 
 # --------------------------------------------------------- no service-role client
 check(all(tok != "SERVICE-ROLE" for tok, _, _ in RPC_CALLS),
-      "no service-role client is used by any of the ten mutation routes")
+      "no service-role client is used by any of the eleven mutation routes")
 
 print()
 print(f"{PASSES} passed, {len(FAILURES)} failed")

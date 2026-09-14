@@ -44,16 +44,41 @@ def check(cond, label):
 CALLS = []
 
 
+# PostgREST applies the select() column list server-side, so a fake that
+# ignored it could not prove the route does not over-select. It is honoured
+# here - otherwise CF-4k/CF-4l below would pass against a route that leaked
+# every column.
+#
+# Only a PLAIN column list is projected. caller_context reads embedded
+# resources (`capabilities(capability_key)`), and those rows are returned
+# untouched rather than mangled by a parser this fake has no business owning.
+_PLAIN_COLS = __import__("re").compile(r"^[a-z_][a-z0-9_]*$")
+
+
+def _project(cols, rows):
+    if not cols:
+        return rows
+    wanted = [c.strip() for c in str(cols).split(",")]
+    if not all(_PLAIN_COLS.match(c) for c in wanted):
+        return rows                      # embedded resource - leave it alone
+    return [{k: r[k] for k in wanted if k in r} for r in rows]
+
+
 class FakeQuery:
     def __init__(self, token, table, rows):
         self.token, self.table, self.rows = token, table, rows
+        self.cols = None
 
-    def select(self, *a, **k): return self
+    def select(self, *a, **k):
+        if a:
+            self.cols = a[0]
+        return self
+
     def eq(self, *a, **k): return self
     def limit(self, *a, **k): return self
     def execute(self):
         CALLS.append((self.token, self.table))
-        return type("R", (), {"data": self.rows})()
+        return type("R", (), {"data": _project(self.cols, self.rows)})()
 
 
 class FakeAuth:
@@ -77,6 +102,7 @@ NO_CAP_ROWS = {
     "customer_families": [{"id": 1, "group_customer_code": "F-001", "name": "Should Not Be Seen",
                             "status": "active", "surviving_family_id": None}],
     "customer_family_aliases": [], "party_family_memberships": [], "parties": [],
+    "customer_family_sectors": [], "sectors": [],
 }
 
 WITH_CAP_EMPTY_ROWS = {
@@ -86,6 +112,7 @@ WITH_CAP_EMPTY_ROWS = {
     ],
     "plant_capability_grants": [],
     "customer_families": [], "customer_family_aliases": [], "party_family_memberships": [], "parties": [],
+    "customer_family_sectors": [], "sectors": [],
 }
 
 WITH_CAP_FIXTURE_ROWS = {
@@ -102,6 +129,22 @@ WITH_CAP_FIXTURE_ROWS = {
                                    "effective_until": None, "is_current": True}],
     "parties": [{"id": 9, "customer_code": "C-009", "display_name": "Acme Ltd",
                  "lifecycle_state": "customer", "status": "active", "content_version": 2}],
+    "customer_family_sectors": [
+        {"family_id": 5, "sector_id": 31, "created_at": "2026-02-01T00:00:00Z"},
+        {"family_id": 5, "sector_id": 32, "created_at": "2026-03-01T00:00:00Z"},
+    ],
+    "sectors": [
+        {"id": 31, "sector_code": "PIZZA", "name": "Pizza", "status": "active"},
+        {"id": 32, "sector_code": "FMCG", "name": "FMCG", "status": "active"},
+    ],
+    # created_by is present in the fake rows ON PURPOSE: the route must not
+    # select it, so a test that never supplied it could not prove anything.
+    "party_external_references": [
+        {"id": 71, "party_id": 9, "ref_kind": "legacy_customer_code",
+         "ref_value": "OLD-ACME-1", "created_at": "2026-02-01T00:00:00Z", "created_by": 3},
+        {"id": 72, "party_id": 9, "ref_kind": "customer_item_ref",
+         "ref_value": "ITEM-77", "created_at": "2026-02-02T00:00:00Z", "created_by": 3},
+    ],
 }
 
 ROWS = NO_CAP_ROWS  # swapped per-scenario below
@@ -115,7 +158,7 @@ def fake_caller(token):
 
 cc.get_supabase_for_caller = fake_caller
 
-# D1: the six master reads run with bounded parallelism, one INDEPENDENT
+# D1: the master reads run with bounded parallelism, one INDEPENDENT
 # caller-scoped client per worker (see server.list_customer_families and
 # caller_context.new_caller_client). Every construction is recorded so the
 # tests below can prove the workers did not share one client - sharing is what
@@ -133,7 +176,10 @@ class FailingQuery(FakeQuery):
         CALLS.append((self.token, self.table))
         if FAIL_ON_TABLE is not None and self.table == FAIL_ON_TABLE:
             raise WorkerReadFailure(f"synthetic failure reading {self.table}")
-        return type("R", (), {"data": self.rows})()
+        # Projects exactly as FakeQuery does. The seven master reads run through
+        # THIS class, so leaving it unprojected would have made CF-4k/CF-4l
+        # unprovable on the path that actually serves them.
+        return type("R", (), {"data": _project(self.cols, self.rows)})()
 
 
 class WorkerClient(FakeClient):
@@ -183,6 +229,10 @@ check(r.status_code == 200, "CF-3 an authorized caller is not refused")
 body = r.get_json()
 check(body["families"] == [] and body["aliases"] == [] and body["memberships"] == [] and body["parties"] == [],
       "CF-3a and a genuinely empty master reads as empty arrays, not a 403")
+check(body["external_references"] == [],
+      "CF-3b a Party Master with no external references reads as an empty array, not a missing key")
+check(body["family_sectors"] == [] and body["sectors"] == [],
+      "CF-3c an empty Family Sector catalogue remains explicit")
 
 # --------------------------------------------- CF-4 authorized, with fixtures
 ROWS = WITH_CAP_FIXTURE_ROWS
@@ -200,19 +250,42 @@ check(body["families"][0]["content_version"] == 3 and body["parties"][0]["conten
       "CF-4f every mutable record's content_version is exposed - the frontend needs it for CAS")
 check(body["mutations"] == "governed",
       "CF-4e the response states mutations are governed, now that the U1 mutation routes exist")
+check([row["sector_id"] for row in body["family_sectors"]] == [31, 32]
+      and [row["sector_code"] for row in body["sectors"]] == ["PIZZA", "FMCG"],
+      "CF-4m Family Sector memberships and their exact governed identities are returned")
+
+# ── U1 external references (read-only) ───────────────────────────────────────
+# The canonical requirement (data-model-frontend-design-plan.md S6 U1,
+# "Customers and Prospects - external references") was recorded as a gap by
+# u1-customer-foundation-authorization-packet.md. This closes the READ half
+# only: no create/edit/retire/delete exists anywhere.
+xrefs = body["external_references"]
+check(len(xrefs) == 2, "CF-4g both external references are returned")
+check(all(x["party_id"] == 9 for x in xrefs),
+      "CF-4h each carries its party_id, so the frontend can associate it with the right Party")
+check(sorted(x["ref_value"] for x in xrefs) == ["ITEM-77", "OLD-ACME-1"],
+      "CF-4i with their values intact")
+check(sorted(x["ref_kind"] for x in xrefs) == ["customer_item_ref", "legacy_customer_code"],
+      "CF-4j and their kinds, which the frontend maps to readable labels")
+check(all("created_by" not in x for x in xrefs),
+      "CF-4k created_by is NEVER exposed - the operator who recorded a reference is not "
+      "disclosed on the Customer Master")
+check(all(set(x) == {"id", "party_id", "ref_kind", "ref_value", "created_at"} for x in xrefs),
+      "CF-4l and no field beyond the five authorised ones is returned")
 
 # ------------------------------------------------- CF-5 no service-role client
 check(all(t != "SERVICE-ROLE" for t, _ in CALLS), "CF-5 no service-role client is used at any point")
 
 # ── D1 bounded parallel reads ────────────────────────────────────────────────
-# The six Customer Master reads are independent and now run concurrently. What
-# has to stay true: all six actually happen, each worker uses its OWN client,
+# The Customer Master reads are independent and now run concurrently. What
+# has to stay true: all of them actually happen, each worker uses its OWN client,
 # a failing worker fails the whole request deterministically, and no partial
 # result set can ever be serialised into a 200.
 
 EXPECTED_TABLES = {
     "customer_families", "customer_family_aliases", "party_family_memberships",
     "parties", "customer_locations", "customer_location_versions",
+    "party_external_references", "customer_family_sectors", "sectors",
 }
 
 ROWS = WITH_CAP_FIXTURE_ROWS
@@ -225,18 +298,19 @@ with app.test_client() as c:
 check(r.status_code == 200, "D1-1 parallel reads still answer 200 for an authorised caller")
 read_tables = {t for _, t in CALLS if t in EXPECTED_TABLES}
 check(read_tables == EXPECTED_TABLES,
-      f"D1-2 all six master reads occur (missing: {sorted(EXPECTED_TABLES - read_tables)})")
+      f"D1-2 all nine master reads occur (missing: {sorted(EXPECTED_TABLES - read_tables)})")
 
 body = r.get_json()
 check(set(body) >= {"families", "aliases", "memberships", "parties",
-                    "locations", "location_versions"},
+                    "locations", "location_versions", "external_references",
+                    "family_sectors", "sectors"},
       "D1-3 the response shape is unchanged - every key still present")
 check(body["families"] and body["families"][0]["group_customer_code"] == "F-005",
       "D1-4 the parallel path returns the same rows as the sequential one did")
 
-check(len(WORKER_CLIENTS) == 6,
-      f"D1-5 exactly one client is built per read, six in total (got {len(WORKER_CLIENTS)})")
-check(len({id(c) for c in WORKER_CLIENTS}) == 6,
+check(len(WORKER_CLIENTS) == 9,
+      f"D1-5 exactly one client is built per read, nine in total (got {len(WORKER_CLIENTS)})")
+check(len({id(c) for c in WORKER_CLIENTS}) == 9,
       "D1-6 no two workers share a client instance - the HTTP/2 multiplexing hazard")
 check(all(c.token == "tok-x" for c in WORKER_CLIENTS),
       "D1-7 every worker client carries the CALLER's own token, so RLS is unchanged")
@@ -246,7 +320,7 @@ check(all(c.token == "tok-x" for c in WORKER_CLIENTS),
 # escapes but not what a real client receives; PROPAGATE_EXCEPTIONS off lets
 # Flask turn it into the 500 an actual caller would see.
 app.config["PROPAGATE_EXCEPTIONS"] = False
-for failing in ("parties", "customer_location_versions"):
+for failing in ("parties", "customer_location_versions", "party_external_references"):
     FAIL_ON_TABLE = failing
     CALLS.clear()
     WORKER_CLIENTS.clear()

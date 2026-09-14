@@ -32,6 +32,7 @@ import re
 import secrets
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -57,6 +58,7 @@ from caller_context import (
     bootstrap_caller,
     get_supabase_anon,
     get_supabase_for_caller,
+    invoke_calculation_executor,
     privileged_client,
     resolve_caller,
     update_caller_email,
@@ -937,6 +939,562 @@ def list_plants():
     })
 
 
+@app.route("/masters/pricing-basis-releases", methods=["GET"])
+@require_auth
+def list_pricing_basis_releases():
+    """Read the governed Pricing Basis catalogue as the authenticated caller.
+
+    U3's first vertical slice is deliberately read-only.  The release and every
+    supporting component are read with the caller's bearer token, so existing
+    RLS remains the authority.  This route exposes no propose/approve/withdraw
+    function and never uses the service-role client.
+
+    A caller with no plant_access is refused explicitly.  RLS would otherwise
+    turn that denial into an empty release list, which would falsely mean that
+    no releases exist.  Supporting reads may legitimately be narrower than the
+    release read (the group-wide Sector and Calculation Default masters have
+    their own read capabilities), so unavailable component detail is reported
+    as partial data rather than fabricated or silently omitted.
+    """
+    plant_caps = g.caller.get("plant_capabilities") or {}
+    has_plant_access = any(
+        isinstance(caps, list) and "plant_access" in caps
+        for caps in plant_caps.values()
+    )
+    if not has_plant_access:
+        return jsonify({"error": "plant_access capability is required"}), 403
+
+    caller_token = g.access_token
+    try:
+        releases = (get_supabase_for_caller(caller_token)
+                    .table("pricing_basis_releases")
+                    .select(
+                        "id, plant_id, release_name, effective_from, effective_until, "
+                        "is_automatic_default, rate_set_version_id, freight_set_version_id, "
+                        "sector_version_id, calculation_default_version_id, status, "
+                        "self_approved, created_at, approved_at, withdrawn_at"
+                    ).execute()).data or []
+    except Exception as exc:
+        if _is_upstream_timeout(exc):
+            app.logger.error("pricing-basis release read timed out upstream: %s", exc)
+            return _error("UPSTREAM_TIMEOUT")
+        raise
+
+    # No supporting read can add meaning when no release is visible.  Returning
+    # here also keeps the genuine empty state fast in a newly activated project.
+    if not releases:
+        return jsonify({
+            "releases": [],
+            "components_partial": False,
+            "unavailable_components": [],
+            "mutations": "none",
+        })
+
+    # Independent supporting reads run with one caller-scoped client each.  A
+    # failed or RLS-hidden source never causes a guessed label: the response
+    # carries a null component and components_partial=true instead.
+    _SUPPORTING_READS = (
+        ("plants", "plants", "id, plant_code, name, status"),
+        ("rate_sets", "rate_sets", "id, plant_id, name, status"),
+        ("rate_versions", "rate_set_versions",
+         "id, rate_set_id, plant_id, version_no, status, approved_at, credit_cost_pct"),
+        ("rate_entries", "rate_entries",
+         "id, rate_set_version_id, plant_id, grade_code, description, price, discount, "
+         "freight, interest_pct, effective_material_rate"),
+        ("freight_sets", "freight_sets", "id, plant_id, name, status"),
+        ("freight_versions", "freight_set_versions",
+         "id, freight_set_id, plant_id, version_no, effective_from, status, approved_at"),
+        ("freight_entries", "freight_entries",
+         "id, freight_set_version_id, plant_id, origin_plant_id, "
+         "destination_location_id, rate"),
+        ("customer_locations", "customer_locations",
+         "id, party_id, location_code, ship_to_eligible, status"),
+        ("parties", "parties",
+         "id, customer_code, display_name, lifecycle_state, status"),
+        ("sectors", "sectors", "id, sector_code, name, status"),
+        ("sector_versions", "sector_versions",
+         "id, sector_id, version_no, waste_cbb_pct, waste_pp_pct, conv_box_rate, "
+         "conv_pp_rate, margin_pct, status, approved_at"),
+        ("calculation_defaults", "calculation_default_versions",
+         "id, version_no, annual_interest_pct, day_count_basis, interest_fallback_pct, "
+         "waste_cbb_fallback_pct, waste_pp_fallback_pct, conv_box_fallback_rate, "
+         "conv_pp_fallback_rate, margin_fallback_pct, rounding_step, engine_version, "
+         "rounding_rule_version, status, approved_at"),
+    )
+
+    def _read_supporting(spec):
+        key, table, cols = spec
+        try:
+            rows = (new_caller_client(caller_token)
+                    .table(table).select(cols).execute()).data or []
+            return key, rows, False
+        except Exception as exc:  # noqa: BLE001 - an honest partial read is usable
+            app.logger.warning("pricing-basis supporting read failed (%s): %s", table, exc)
+            return key, [], True
+
+    with timed("pricing_basis.supporting_reads_parallel"):
+        with ThreadPoolExecutor(max_workers=len(_SUPPORTING_READS)) as pool:
+            support_results = list(pool.map(_read_supporting, _SUPPORTING_READS))
+
+    supporting = {key: rows for key, rows, _failed in support_results}
+    failed_sources = {key for key, _rows, failed in support_results if failed}
+
+    def _by_id(key):
+        return {row["id"]: row for row in supporting.get(key, [])}
+
+    plants = _by_id("plants")
+    rate_sets = _by_id("rate_sets")
+    rate_versions = _by_id("rate_versions")
+    rate_entries = supporting.get("rate_entries", [])
+    freight_sets = _by_id("freight_sets")
+    freight_versions = _by_id("freight_versions")
+    freight_entries = supporting.get("freight_entries", [])
+    customer_locations = _by_id("customer_locations")
+    parties = _by_id("parties")
+    sectors = _by_id("sectors")
+    sector_versions = _by_id("sector_versions")
+    calculation_defaults = _by_id("calculation_defaults")
+
+    def _plant_identity(plant_id):
+        plant = plants.get(plant_id)
+        return ({
+            "id": plant["id"], "plant_code": plant.get("plant_code"),
+            "name": plant.get("name"), "status": plant.get("status"),
+        } if plant else None)
+
+    def _rate_entry(entry, version):
+        exception = entry.get("interest_pct")
+        inherited = version.get("credit_cost_pct")
+        return {
+            "id": entry["id"],
+            "grade_code": entry.get("grade_code"),
+            "description": entry.get("description"),
+            "price": entry.get("price"),
+            "discount": entry.get("discount"),
+            "freight": entry.get("freight"),
+            # Despite the legacy column name, interest_pct is the governed
+            # supplier-credit exception.  It remains explicitly upstream of
+            # Batch Calculate; only effective_material_rate crosses that boundary.
+            "supplier_credit_pct": exception,
+            "supplier_credit_source": ("entry_exception"
+                                       if exception is not None else "version_default"),
+            "effective_supplier_credit_pct": (exception
+                                                if exception is not None else inherited),
+            "effective_material_rate": entry.get("effective_material_rate"),
+        }
+
+    def _rate_version(version):
+        entries = [
+            _rate_entry(entry, version)
+            for entry in rate_entries
+            if entry.get("rate_set_version_id") == version.get("id")
+        ]
+        entries.sort(key=lambda entry: entry.get("grade_code") or "")
+        return {
+            "id": version["id"],
+            "owning_plant": _plant_identity(version.get("plant_id")),
+            "version_no": version.get("version_no"),
+            "status": version.get("status"),
+            "approved_at": version.get("approved_at"),
+            "credit_cost_pct": version.get("credit_cost_pct"),
+            "entries": entries,
+            "entries_available": "rate_entries" not in failed_sources,
+        }
+
+    def _freight_entry(entry):
+        origin = plants.get(entry.get("origin_plant_id"))
+        destination = customer_locations.get(entry.get("destination_location_id"))
+        party = parties.get(destination.get("party_id")) if destination else None
+        try:
+            explicit_zero = entry.get("rate") is not None and float(entry.get("rate")) == 0
+        except (TypeError, ValueError):
+            explicit_zero = False
+        return {
+            "id": entry["id"],
+            "origin_plant": ({
+                "id": origin["id"], "plant_code": origin.get("plant_code"),
+                "name": origin.get("name"), "status": origin.get("status"),
+            } if origin else None),
+            "destination": ({
+                "id": destination["id"],
+                "location_code": destination.get("location_code"),
+                "ship_to_eligible": destination.get("ship_to_eligible") is True,
+                "status": destination.get("status"),
+                "customer": ({
+                    "id": party["id"], "customer_code": party.get("customer_code"),
+                    "display_name": party.get("display_name"),
+                    "lifecycle_state": party.get("lifecycle_state"),
+                    "status": party.get("status"),
+                } if party else None),
+            } if destination else None),
+            "rate": entry.get("rate"),
+            "explicit_zero": explicit_zero,
+            "destination_visible": destination is not None,
+        }
+
+    def _freight_version(version):
+        entries = [
+            _freight_entry(entry)
+            for entry in freight_entries
+            if entry.get("freight_set_version_id") == version.get("id")
+        ]
+        entries.sort(key=lambda entry: (
+            ((entry.get("origin_plant") or {}).get("plant_code") or ""),
+            ((entry.get("destination") or {}).get("location_code") or ""),
+        ))
+        return {
+            "id": version["id"],
+            "owning_plant": _plant_identity(version.get("plant_id")),
+            "version_no": version.get("version_no"),
+            "effective_from": version.get("effective_from"),
+            "status": version.get("status"),
+            "approved_at": version.get("approved_at"),
+            "entries": entries,
+            "entries_available": "freight_entries" not in failed_sources,
+            "destination_details_partial": any(
+                not entry.get("destination_visible") for entry in entries
+            ),
+            "missing_destinations": ([{
+                "id": location["id"],
+                "location_code": location.get("location_code"),
+                "status": location.get("status"),
+                "customer": ({
+                    "id": parties[location.get("party_id")]["id"],
+                    "customer_code": parties[location.get("party_id")].get("customer_code"),
+                    "display_name": parties[location.get("party_id")].get("display_name"),
+                    "status": parties[location.get("party_id")].get("status"),
+                } if location.get("party_id") in parties else None),
+            } for location in customer_locations.values()
+              if location.get("status") == "active"
+              and location.get("ship_to_eligible") is True
+              and location.get("id") not in {
+                  entry.get("destination_location_id")
+                  for entry in freight_entries
+                  if entry.get("freight_set_version_id") == version.get("id")
+              }] if "customer_locations" not in failed_sources else []),
+            "missing_destinations_available": "customer_locations" not in failed_sources,
+        }
+
+    unavailable = set(failed_sources)
+    out = []
+    for release in releases:
+        plant = plants.get(release["plant_id"])
+        rate_version = rate_versions.get(release["rate_set_version_id"])
+        rate_set = rate_sets.get(rate_version.get("rate_set_id")) if rate_version else None
+        freight_version = freight_versions.get(release["freight_set_version_id"])
+        freight_set = (freight_sets.get(freight_version.get("freight_set_id"))
+                       if freight_version else None)
+        sector_version = sector_versions.get(release["sector_version_id"])
+        sector = sectors.get(sector_version.get("sector_id")) if sector_version else None
+        defaults = calculation_defaults.get(release["calculation_default_version_id"])
+
+        expected = {
+            "plants": plant,
+            "rate_versions": rate_version,
+            "rate_sets": rate_set,
+            "freight_versions": freight_version,
+            "freight_sets": freight_set,
+            "sector_versions": sector_version,
+            "sectors": sector,
+            "calculation_defaults": defaults,
+        }
+        unavailable.update(key for key, value in expected.items() if value is None)
+
+        rate_history = []
+        if rate_version:
+            rate_history = [
+                _rate_version(version)
+                for version in rate_versions.values()
+                if version.get("rate_set_id") == rate_version.get("rate_set_id")
+            ]
+            rate_history.sort(key=lambda version: version.get("version_no") or 0, reverse=True)
+        freight_history = []
+        if freight_version:
+            freight_history = [
+                _freight_version(version)
+                for version in freight_versions.values()
+                if version.get("freight_set_id") == freight_version.get("freight_set_id")
+            ]
+            freight_history.sort(key=lambda version: version.get("version_no") or 0, reverse=True)
+
+        rate_detail = _rate_version(rate_version) if rate_version else None
+        freight_detail = _freight_version(freight_version) if freight_version else None
+        if rate_detail and not rate_detail["entries_available"]:
+            unavailable.add("rate_entries")
+        if freight_detail and not freight_detail["entries_available"]:
+            unavailable.add("freight_entries")
+        if freight_detail and freight_detail["destination_details_partial"]:
+            unavailable.add("freight_destinations")
+
+        sector_history = []
+        if sector_version:
+            sector_history = [{
+                "id": version["id"],
+                "version_no": version.get("version_no"),
+                "status": version.get("status"),
+                "approved_at": version.get("approved_at"),
+            } for version in sector_versions.values()
+              if version.get("sector_id") == sector_version.get("sector_id")]
+            sector_history.sort(key=lambda version: version.get("version_no") or 0, reverse=True)
+
+        defaults_history = [{
+            "id": version["id"],
+            "version_no": version.get("version_no"),
+            "status": version.get("status"),
+            "approved_at": version.get("approved_at"),
+        } for version in calculation_defaults.values()]
+        defaults_history.sort(key=lambda version: version.get("version_no") or 0, reverse=True)
+
+        out.append({
+            "id": release["id"],
+            "release_name": release.get("release_name"),
+            "status": release.get("status"),
+            "effective_from": release.get("effective_from"),
+            "effective_until": release.get("effective_until"),
+            "is_automatic_default": release.get("is_automatic_default") is True,
+            "self_approved": release.get("self_approved") is True,
+            "created_at": release.get("created_at"),
+            "approved_at": release.get("approved_at"),
+            "withdrawn_at": release.get("withdrawn_at"),
+            "plant": ({
+                "id": plant["id"], "plant_code": plant.get("plant_code"),
+                "name": plant.get("name"), "status": plant.get("status"),
+            } if plant else None),
+            "components": {
+                "rate": ({
+                    "id": rate_version["id"], "set_name": rate_set.get("name"),
+                    "set_id": rate_set.get("id"),
+                    "set_status": rate_set.get("status"),
+                    "owning_plant": _plant_identity(rate_version.get("plant_id")),
+                    "version_no": rate_version.get("version_no"),
+                    "status": rate_version.get("status"),
+                    "approved": rate_version.get("approved_at") is not None,
+                    "approved_at": rate_version.get("approved_at"),
+                    "credit_cost_pct": rate_version.get("credit_cost_pct"),
+                    "entries": rate_detail["entries"],
+                    "entries_available": rate_detail["entries_available"],
+                    "history": rate_history,
+                } if rate_version and rate_set else None),
+                "freight": ({
+                    "id": freight_version["id"], "set_name": freight_set.get("name"),
+                    "set_id": freight_set.get("id"),
+                    "set_status": freight_set.get("status"),
+                    "owning_plant": _plant_identity(freight_version.get("plant_id")),
+                    "version_no": freight_version.get("version_no"),
+                    "effective_from": freight_version.get("effective_from"),
+                    "status": freight_version.get("status"),
+                    "approved": freight_version.get("approved_at") is not None,
+                    "approved_at": freight_version.get("approved_at"),
+                    "entries": freight_detail["entries"],
+                    "entries_available": freight_detail["entries_available"],
+                    "destination_details_partial": freight_detail["destination_details_partial"],
+                    "missing_destinations": freight_detail["missing_destinations"],
+                    "missing_destinations_available": freight_detail["missing_destinations_available"],
+                    "history": freight_history,
+                } if freight_version and freight_set else None),
+                "sector": ({
+                    "id": sector_version["id"], "sector_code": sector.get("sector_code"),
+                    "sector_id": sector.get("id"),
+                    "name": sector.get("name"), "version_no": sector_version.get("version_no"),
+                    "waste_cbb_pct": sector_version.get("waste_cbb_pct"),
+                    "waste_pp_pct": sector_version.get("waste_pp_pct"),
+                    "conv_box_rate": sector_version.get("conv_box_rate"),
+                    "conv_pp_rate": sector_version.get("conv_pp_rate"),
+                    "margin_pct": sector_version.get("margin_pct"),
+                    "status": sector_version.get("status"),
+                    "approved": sector_version.get("approved_at") is not None,
+                    "approved_at": sector_version.get("approved_at"),
+                    "history": sector_history,
+                } if sector_version and sector else None),
+                "calculation_defaults": ({
+                    "id": defaults["id"], "version_no": defaults.get("version_no"),
+                    "annual_interest_pct": defaults.get("annual_interest_pct"),
+                    "day_count_basis": defaults.get("day_count_basis"),
+                    "interest_fallback_pct": defaults.get("interest_fallback_pct"),
+                    "waste_cbb_fallback_pct": defaults.get("waste_cbb_fallback_pct"),
+                    "waste_pp_fallback_pct": defaults.get("waste_pp_fallback_pct"),
+                    "conv_box_fallback_rate": defaults.get("conv_box_fallback_rate"),
+                    "conv_pp_fallback_rate": defaults.get("conv_pp_fallback_rate"),
+                    "margin_fallback_pct": defaults.get("margin_fallback_pct"),
+                    "rounding_step": defaults.get("rounding_step"),
+                    "engine_version": defaults.get("engine_version"),
+                    "rounding_rule_version": defaults.get("rounding_rule_version"),
+                    "status": defaults.get("status"),
+                    "approved": defaults.get("approved_at") is not None,
+                    "approved_at": defaults.get("approved_at"),
+                    "history": defaults_history,
+                } if defaults else None),
+            },
+        })
+
+    out.sort(key=lambda r: (
+        (r.get("plant") or {}).get("plant_code") or "",
+        r.get("effective_from") or "",
+        r.get("release_name") or "",
+    ), reverse=True)
+    return jsonify({
+        "releases": out,
+        "components_partial": bool(unavailable),
+        "unavailable_components": sorted(unavailable),
+        "mutations": "none",
+    })
+
+
+@app.route("/masters/constructions", methods=["GET"])
+@require_auth
+def list_constructions():
+    """
+    The Construction Library, read as the caller (U2, first read-only slice).
+
+    NOT the Producing Plants pattern. Producing Plants is broadly readable;
+    this master is gated on the GROUP capability `read_construction_library`,
+    which S4-5 proved a Maker does not hold - FA-6: a Maker cannot "read back
+    the version they just wrote". So the access-denied state is the PRIMARY
+    case here, not an edge case, and it is answered explicitly:
+
+        RLS alone would return an EMPTY LIST to a caller without the
+        capability. An empty list says "no constructions exist", which is a
+        different and false statement. `require_auth` has already resolved the
+        caller's group capabilities into `g.caller`, at no extra query cost, so
+        the check below runs first and returns 403. Genuine access denial is
+        never presented as absence of data - the same rule the Customer
+        Families route states.
+
+    THREE READS, THREE DIFFERENT GATES, and that asymmetry is the design:
+
+        constructions          has_group_cap('read_construction_library')
+        construction_versions  has_group_cap('read_construction_library')
+        plant_construction_adoptions
+                               has_plant_cap(plant_id, 'plant_access')
+
+    Adoption is therefore visible for the caller's OWN plants only. The 403
+    above means an adoption row can never appear beside a construction the
+    caller cannot see; additionally the adoptions are joined in memory to the
+    versions actually returned, and any orphan is dropped rather than rendered
+    as a bare construction_version_id.
+
+    PLANT IDENTITY IS NOT INVENTED HERE. These reads obtain plant_id and
+    nothing else about a plant. The frontend joins names from the separately
+    loaded, already-governed `/masters/plants` response rather than this route
+    claiming a relationship its own reads do not establish. An adoption whose
+    plant is not in that response is shown as another plant, never as a
+    fabricated name.
+
+    ACTOR ATTRIBUTION IS WITHHELD. `created_by`, `adopted_by` and `approved_by`
+    are FKs to app_users and are not selected, following the U1 external-
+    references precedent: a read-only master screen discloses no operator
+    identity. `approved_at` is read only to derive a boolean.
+
+    READ-ONLY. No propose, approve, publish, adopt, withdraw or merge operation
+    is exposed by this route. Those `app_private.*` operations exist and stay
+    unreachable from here. No service-role client, no privileged read: every
+    query below carries the caller's own token and RLS remains the authority.
+    """
+    if "read_construction_library" not in (g.caller.get("group_capabilities") or []):
+        return jsonify({"error": "read_construction_library capability is required"}), 403
+
+    # The two REQUIRED reads and the one OPTIONAL read are separated on purpose:
+    # a failure of the optional one degrades the screen, a failure of a required
+    # one is an error. They must never be conflated (see adoptions_partial).
+    _REQUIRED = (
+        ("constructions", "constructions",
+         "id, construction_code, name, status, surviving_construction_id"),
+        # The compact technical stack that DISTINGUISHES immutable versions: ply,
+        # flutes, board GSM and the five layer code/GSM pairs. This is not the
+        # deferred full Specification Reference - that is a separate, much wider
+        # field-classification exercise and is not started here.
+        ("versions", "construction_versions",
+         "id, construction_id, version_no, ply, flute_f1, flute_f2, board_gsm, effective_from, "
+         "layer_top_code, layer_top_gsm, layer_f1_code, layer_f1_gsm, layer_l1_code, layer_l1_gsm, "
+         "layer_f2_code, layer_f2_gsm, layer_l2_code, layer_l2_gsm, approved_at"),
+    )
+
+    caller_token = g.access_token
+
+    def _read(spec):
+        key, table, cols = spec
+        worker_client = new_caller_client(caller_token)
+        return key, (worker_client.table(table).select(cols).execute()).data or []
+
+    try:
+        with timed("constructions.master_reads_parallel"):
+            with ThreadPoolExecutor(max_workers=len(_REQUIRED)) as pool:
+                results = dict(pool.map(_read, _REQUIRED))
+    except Exception as exc:
+        if _is_upstream_timeout(exc):
+            app.logger.error("constructions read timed out upstream: %s", exc)
+            return _error("UPSTREAM_TIMEOUT")
+        raise
+
+    # OPTIONAL. adoptions_partial is true ONLY when this read FAILED. It is
+    # false when the read succeeded, including when RLS legitimately returned
+    # zero caller-visible rows - "you have no adopting plants" is an answer, not
+    # a partial result. A failure of either REQUIRED read above never reaches
+    # here, so it can never be reported as partial success.
+    adoptions, adoptions_partial = [], False
+    try:
+        adoptions = (new_caller_client(caller_token)
+                     .table("plant_construction_adoptions")
+                     .select("id, plant_id, construction_version_id, status")
+                     .execute()).data or []
+    except Exception as exc:  # noqa: BLE001 - degrade, never fail the screen
+        app.logger.warning("construction adoptions read failed (degrading): %s", exc)
+        adoptions_partial = True
+
+    constructions = results["constructions"]
+    versions = results["versions"]
+
+    version_ids = {v["id"] for v in versions}
+    by_version = {}
+    for a in adoptions:
+        # Orphan drop: an adoption pointing at a version this caller cannot read
+        # is not rendered as a bare identifier.
+        if a["construction_version_id"] in version_ids:
+            by_version.setdefault(a["construction_version_id"], []).append(
+                {"plant_id": a["plant_id"], "status": a["status"]})
+
+    by_construction = {}
+    for v in versions:
+        by_construction.setdefault(v["construction_id"], []).append(v)
+
+    out = []
+    for c in constructions:
+        vs = sorted(by_construction.get(c["id"], []), key=lambda v: v.get("version_no") or 0)
+        out.append({
+            "id": c["id"],
+            "construction_code": c.get("construction_code"),
+            "name": c.get("name"),
+            "status": c.get("status"),
+            "surviving_construction_id": c.get("surviving_construction_id"),
+            "versions": [{
+                "id": v["id"],
+                "version_no": v.get("version_no"),
+                "ply": v.get("ply"),
+                "flute_f1": v.get("flute_f1"),
+                "flute_f2": v.get("flute_f2"),
+                "board_gsm": v.get("board_gsm"),
+                "effective_from": v.get("effective_from"),
+                "layers": [
+                    {"layer": "TOP", "code": v.get("layer_top_code"), "gsm": v.get("layer_top_gsm")},
+                    {"layer": "F1", "code": v.get("layer_f1_code"), "gsm": v.get("layer_f1_gsm")},
+                    {"layer": "L1", "code": v.get("layer_l1_code"), "gsm": v.get("layer_l1_gsm")},
+                    {"layer": "F2", "code": v.get("layer_f2_code"), "gsm": v.get("layer_f2_gsm")},
+                    {"layer": "L2", "code": v.get("layer_l2_code"), "gsm": v.get("layer_l2_gsm")},
+                ],
+                # Derived boolean. The timestamp and the approver are not exposed.
+                "approved": v.get("approved_at") is not None,
+                "adoptions": by_version.get(v["id"], []),
+            } for v in vs],
+        })
+
+    out.sort(key=lambda c: c.get("construction_code") or c.get("name") or "")
+    return jsonify({
+        "constructions": out,
+        "adoptions_partial": adoptions_partial,
+        "mutations": "none",
+    })
+
+
 @app.route("/masters/customer-families", methods=["GET"])
 @require_auth
 def list_customer_families():
@@ -970,7 +1528,7 @@ def list_customer_families():
 
     client = get_supabase_for_caller(g.access_token)
 
-    # D1 - these six reads are independent of one another and ran strictly in
+    # D1 - these reads are independent of one another and ran strictly in
     # sequence, which measured ~2.7 s of pure round-trip time against a live
     # project holding a single family. They now run with BOUNDED parallelism.
     #
@@ -982,8 +1540,9 @@ def list_customer_families():
     # Measured, with a stack trace. new_caller_client() therefore hands each
     # worker its own client and its own connection.
     #
-    # The pool is bounded to exactly these six known reads - not a general
-    # concurrency mechanism, and not sized from anything a caller controls.
+    # The pool is bounded to exactly the known reads in _READS (nine after
+    # Family Sector classification) - not a general concurrency mechanism,
+    # and not sized from anything a caller controls.
     #
     # Authority is unchanged: every read carries the caller's own token, RLS
     # decides visibility exactly as on the sequential path, and the explicit
@@ -1009,6 +1568,19 @@ def list_customer_families():
          "id, party_id, location_code, bill_to_eligible, ship_to_eligible, status, content_version"),
         ("location_versions", "customer_location_versions",
          "id, location_id, version_no, location_type, address_text, contact_name, notes, status"),
+        # U1 external references (read-only). Same read_party_master gate as the
+        # six above - `party_external_references_select` is the identical policy
+        # - so this exposes nothing a caller could not already reach.
+        #
+        # `created_by` is deliberately NOT selected. It is an FK to app_users,
+        # and the Customer Master screen has no business disclosing WHICH
+        # operator recorded a reference. Read-only view only: no create, edit,
+        # retire or delete operation exists for this table anywhere.
+        ("external_references", "party_external_references",
+         "id, party_id, ref_kind, ref_value, created_at"),
+        ("family_sectors", "customer_family_sectors",
+         "family_id, sector_id, created_at"),
+        ("sectors", "sectors", "id, sector_code, name, status"),
     )
 
     # Captured HERE, not read inside the worker: `flask.g` is bound to the
@@ -1021,7 +1593,7 @@ def list_customer_families():
         return key, (worker_client.table(table).select(cols).execute()).data or []
 
     try:
-        with timed("families.six_reads_parallel"):
+        with timed("families.master_reads_parallel"):
             with ThreadPoolExecutor(max_workers=len(_READS)) as pool:
                 results = dict(pool.map(_read, _READS))
     except Exception as exc:
@@ -1036,6 +1608,9 @@ def list_customer_families():
     parties = results["parties"]
     locations = results["locations"]
     location_versions = results["location_versions"]
+    external_references = results["external_references"]
+    family_sectors = results["family_sectors"]
+    sectors = results["sectors"]
 
     families.sort(key=lambda r: r.get("group_customer_code") or r.get("name") or "")
     return jsonify({
@@ -1045,6 +1620,9 @@ def list_customer_families():
         "parties": parties,
         "locations": locations,
         "location_versions": location_versions,
+        "external_references": external_references,
+        "family_sectors": family_sectors,
+        "sectors": sectors,
         "mutations": "governed",
     })
 
@@ -1080,6 +1658,7 @@ def list_customer_families():
 _RPC_ERROR_MAP = {
     "42501": "CAPABILITY_REQUIRED",   # capability check failed inside app_private.*
     "P0002": "RECORD_NOT_FOUND",      # Family / Party / alias not found
+    "23503": "RECORD_NOT_FOUND",      # governed identity/FK does not exist
     # D2, corrected by migration 20260908052900. A DELIBERATE stale-version
     # conflict now raises PT409, never 40001.
     #
@@ -1095,6 +1674,7 @@ _RPC_ERROR_MAP = {
     # 10 ms apart, against 8 x P0002 in the same window - a retry storm, not a
     # slow response.
     "PT409": "STALE_VERSION",         # stale content_version - the CAS check failed
+    "PT422": "CALCULATION_NOT_READY", # governed input gatherer refused incomplete/ineligible state
     # A GENUINE serialization failure is still possible and is deliberately kept
     # DISTINCT: it is raised by Postgres itself under concurrent access, it is
     # transient, and retrying it is the correct response - the opposite of a
@@ -1105,15 +1685,22 @@ _RPC_ERROR_MAP = {
     "22023": "TRANSITION_NOT_ALLOWED",  # forbidden state transition, self-merge,
                                          # merge-cycle, double-retirement, retired target
     "22007": "INVALID_EFFECTIVE_DATE",  # effective date precedes the current membership
+    "55P03": "LOCK_UNAVAILABLE",        # another editor holds the Batch lock
 }
 
 _ERROR_STATUS = {
+    "AUTH_REQUIRED": 401,
     "CAPABILITY_REQUIRED": 403,
     "RECORD_NOT_FOUND": 404,
     "STALE_VERSION": 409,
     "TRANSITION_NOT_ALLOWED": 422,
     "INVALID_EFFECTIVE_DATE": 422,
     "INVALID_INPUT": 400,
+    "LOCK_UNAVAILABLE": 409,
+    "CALCULATION_NOT_READY": 422,
+    "SEND_NOT_READY": 422,
+    "CALCULATION_EXECUTOR_UNAVAILABLE": 503,
+    "CALCULATION_EXECUTION_FAILED": 500,
     # A genuine serialization failure is transient: the caller may safely retry
     # the SAME request unchanged. Distinct from STALE_VERSION, where retrying
     # unchanged is guaranteed to fail again.
@@ -1126,11 +1713,17 @@ _ERROR_STATUS = {
 }
 
 _ERROR_MESSAGE = {
+    "AUTH_REQUIRED": "Your session is no longer valid. Sign in again and retry.",
     "CAPABILITY_REQUIRED": "You do not have permission to perform this action.",
     "RECORD_NOT_FOUND": "The requested record could not be found.",
     "STALE_VERSION": "This record changed since you last read it. Reload and try again.",
     "TRANSITION_NOT_ALLOWED": "That action is not allowed for this record's current state.",
     "INVALID_EFFECTIVE_DATE": "The effective date is not valid for this change.",
+    "LOCK_UNAVAILABLE": "This Batch is locked by another editor. Refresh before editing.",
+    "CALCULATION_NOT_READY": "This row is not ready for governed calculation input resolution.",
+    "SEND_NOT_READY": "This Batch is not ready to create an immutable draft Quote candidate.",
+    "CALCULATION_EXECUTOR_UNAVAILABLE": "Governed Calculate is not available in this environment.",
+    "CALCULATION_EXECUTION_FAILED": "The governed calculation executor could not produce a valid result.",
     "SERIALIZATION_FAILURE": "The database could not complete that under concurrent load. "
                              "Nothing was changed — please try again.",
     # D2 CORRECTION. This must NOT claim the write did not happen. A client-side
@@ -1182,7 +1775,7 @@ def _invalid_input(message):
     return _error("INVALID_INPUT", message)
 
 
-def _rpc_call(client, name, params):
+def _rpc_call(client, name, params, error_map=None):
     """
     Call a governed `public.*` RPC and translate the outcome into a stable
     HTTP error tuple, or (result, None) on success.
@@ -1195,7 +1788,7 @@ def _rpc_call(client, name, params):
     try:
         return client.rpc(name, params).execute(), None
     except APIError as exc:
-        code = _RPC_ERROR_MAP.get(exc.code)
+        code = {**_RPC_ERROR_MAP, **(error_map or {})}.get(exc.code)
         if code is not None:
             app.logger.info("RPC %s refused: %s %s -> %s", name, exc.code, exc.message, code)
             return None, _error(code)
@@ -1228,6 +1821,2107 @@ def _int_field(data, key):
     return None
 
 
+def _optional_nonnegative_numeric(data, key, max_value=None):
+    """Preserve blank-versus-zero while refusing booleans, NaN and negatives."""
+    value = data.get(key)
+    if value is None or value == "":
+        return None, None
+    if isinstance(value, bool):
+        return None, _invalid_input(f"{key} must be blank or a non-negative number")
+    try:
+        parsed = Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        return None, _invalid_input(f"{key} must be blank or a non-negative number")
+    if not parsed.is_finite() or parsed < 0:
+        return None, _invalid_input(f"{key} must be blank or a non-negative number")
+    if max_value is not None and parsed > Decimal(max_value):
+        return None, _invalid_input(f"{key} exceeds the supported maximum of {max_value}")
+    return float(parsed), None
+
+
+def _pricing_group_input(client, batch_id, data, existing):
+    """Validate one complete Pricing Group commercial-terms replacement."""
+    expected = _int_field(data, "expected_content_version")
+    if expected is None or expected < 1:
+        return None, _invalid_input("expected_content_version is required")
+
+    label_value = data.get("label")
+    if label_value is not None and not isinstance(label_value, str):
+        return None, _invalid_input("label must be text or blank")
+    label = (label_value or "").strip()
+    if len(label) > 120:
+        return None, _invalid_input("label must be 120 characters or fewer")
+
+    freight_mode = data.get("freight_mode")
+    if freight_mode not in ("master", "manual", "ex_factory"):
+        return None, _invalid_input("freight_mode must be master, manual or ex_factory")
+    freight_manual_value, err = _optional_nonnegative_numeric(
+        data, "freight_manual_value", "99999999.9999")
+    if err:
+        return None, err
+    if freight_mode == "manual" and freight_manual_value is None:
+        return None, _invalid_input("freight_manual_value is required in manual mode")
+    if freight_mode != "manual":
+        freight_manual_value = None
+
+    raw_days = data.get("payment_terms_days")
+    payment_terms_days = _int_field(data, "payment_terms_days")
+    if raw_days not in (None, "") and payment_terms_days not in (30, 45, 60, 90):
+        return None, _invalid_input("payment_terms_days must be blank, 30, 45, 60 or 90")
+
+    payment_text_value = data.get("payment_terms_text")
+    if payment_text_value is not None and not isinstance(payment_text_value, str):
+        return None, _invalid_input("payment_terms_text must be text or blank")
+    payment_terms_text = (payment_text_value or "").strip()
+    if len(payment_terms_text) > 500:
+        return None, _invalid_input("payment_terms_text must be 500 characters or fewer")
+
+    interest_override_pct, err = _optional_nonnegative_numeric(
+        data, "interest_override_pct", "9999.999")
+    if err:
+        return None, err
+    reason_value = data.get("interest_override_reason")
+    if reason_value is not None and not isinstance(reason_value, str):
+        return None, _invalid_input("interest_override_reason must be text or blank")
+    reason = (reason_value or "").strip()
+    if len(reason) > 500:
+        return None, _invalid_input("interest_override_reason must be 500 characters or fewer")
+
+    derived_pct = None
+    if interest_override_pct is not None and payment_terms_days is not None:
+        batch_rows = (client.table("batches")
+                      .select("id, pricing_basis_release_id")
+                      .eq("id", batch_id).limit(1).execute()).data or []
+        release_id = batch_rows[0].get("pricing_basis_release_id") if batch_rows else None
+        if release_id is None:
+            return None, _invalid_input(
+                "Select a Pricing Basis Release before recording an Interest override.")
+        release_rows = (client.table("pricing_basis_releases")
+                        .select("id, calculation_default_version_id")
+                        .eq("id", release_id).limit(1).execute()).data or []
+        defaults_id = release_rows[0].get("calculation_default_version_id") if release_rows else None
+        defaults_rows = [] if defaults_id is None else (
+            client.table("calculation_default_versions")
+            .select("id, annual_interest_pct, day_count_basis")
+            .eq("id", defaults_id).limit(1).execute()).data or []
+        if not defaults_rows:
+            return None, _invalid_input(
+                "The selected Pricing Basis cannot supply the governed annual Interest basis.")
+        annual = Decimal(str(defaults_rows[0].get("annual_interest_pct")))
+        day_count = Decimal(str(defaults_rows[0].get("day_count_basis")))
+        if not annual.is_finite() or not day_count.is_finite() or day_count <= 0:
+            return None, _invalid_input(
+                "The selected Pricing Basis has an invalid annual Interest basis.")
+        derived_pct = (annual * Decimal(payment_terms_days) / day_count).quantize(
+            Decimal("0.001"), rounding=ROUND_HALF_UP)
+
+    override_decimal = None if interest_override_pct is None else Decimal(str(interest_override_pct))
+    if interest_override_pct is not None and (derived_pct is None or override_decimal != derived_pct) and not reason:
+        return None, _invalid_input(
+            "interest_override_reason is required when the override differs from derived Interest")
+
+    updates = {
+        "label": label or None,
+        "freight_mode": freight_mode,
+        "freight_manual_value": freight_manual_value,
+        "payment_terms_days": payment_terms_days,
+        "payment_terms_text": payment_terms_text or None,
+        "interest_override_pct": interest_override_pct,
+        "interest_override_derived_pct": float(derived_pct) if derived_pct is not None else None,
+        "interest_override_reason": (reason or None) if interest_override_pct is not None else None,
+    }
+    if freight_mode == "ex_factory":
+        updates["freight_basis_delivery_group_id"] = None
+    if (existing.get("legacy_freight_source") == "legacy_batch"
+            and freight_mode in ("manual", "ex_factory")):
+        # This explicit governed statement replaces, rather than competes with,
+        # the temporary higher-priority Batch freight tier.
+        updates["legacy_freight_value"] = None
+        updates["legacy_freight_source"] = None
+    return {"expected": expected, "updates": updates}, None
+
+
+def _valid_date_only(value):
+    """Validate a commercial date without converting it to a timezone instant."""
+    if not isinstance(value, str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+        return False
+    try:
+        parsed = datetime.strptime(value, "%Y-%m-%d")
+    except ValueError:
+        return False
+    return parsed.strftime("%Y-%m-%d") == value
+
+
+def _read_batch_pricing_basis(client, *, batch_id=None, batch_reference=None):
+    """Read one RLS-visible Batch and its caller-visible Pricing Basis identity."""
+    query = client.table("batches").select(
+        "id, batch_reference, plant_id, status, content_version, pricing_date, "
+        "pricing_basis_release_id, pricing_basis_is_deliberate"
+    )
+    if batch_id is not None:
+        query = query.eq("id", batch_id)
+    else:
+        query = query.eq("batch_reference", batch_reference)
+    rows = query.limit(1).execute().data or []
+    if not rows:
+        return None
+
+    batch = rows[0]
+    plant_rows = (client.table("plants")
+                  .select("id, plant_code, name, status")
+                  .eq("id", batch["plant_id"]).limit(1).execute()).data or []
+    release_rows = []
+    if batch.get("pricing_basis_release_id") is not None:
+        release_rows = (client.table("pricing_basis_releases")
+                        .select(
+                            "id, plant_id, release_name, status, effective_from, effective_until, "
+                            "is_automatic_default, created_at, approved_at, withdrawn_at"
+                        )
+                        .eq("id", batch["pricing_basis_release_id"])
+                        .limit(1).execute()).data or []
+
+    batch["plant"] = plant_rows[0] if plant_rows else None
+    batch["pricing_basis_release"] = release_rows[0] if release_rows else None
+    batch["details_partial"] = not plant_rows or (
+        batch.get("pricing_basis_release_id") is not None and not release_rows
+    )
+    return batch
+
+
+def _optional_caller_rows(query):
+    """Read one optional workspace section without widening caller authority.
+
+    RLS-hidden rows naturally return an empty list.  A table-level 42501 is
+    retained as a caller-visible denied section instead of turning an otherwise
+    readable Batch into a fabricated complete response.
+    """
+    try:
+        return query.execute().data or [], False
+    except APIError as exc:
+        if exc.code == "42501":
+            return [], True
+        raise
+
+
+def _read_quote_workspace(client, quote_reference=None, revision_id=None, batch_id=None):
+    """Assemble one caller-visible Quote without weakening Family G RLS.
+
+    A permanent Quote reference, exact revision identity, or exact Batch
+    identity is the entry point. Revision identity is required for a submitted,
+    pre-approval candidate reached from an inbox. Batch identity supports a
+    durable Batch-to-Quote handoff even before a permanent Quote reference has
+    been allocated. Every supporting read
+    uses the same caller-scoped client; optional RLS/table denials are reported
+    as partial evidence and are never filled from a privileged connection.
+    Frozen calculation inputs/results are returned exactly as stored so the
+    Quote screen cannot silently re-resolve current Batch or master data.
+    """
+    family_query = client.table("quote_families").select(
+        "id, batch_id, quote_reference, status, created_at, created_by"
+    )
+    if revision_id is not None:
+        revision_rows = (client.table("quote_revisions")
+                         .select("id, family_id")
+                         .eq("id", revision_id).limit(1).execute()).data or []
+        if not revision_rows:
+            return None
+        family_query = family_query.eq("id", revision_rows[0]["family_id"])
+    elif batch_id is not None:
+        family_query = family_query.eq("batch_id", batch_id)
+    else:
+        family_query = family_query.eq("quote_reference", quote_reference)
+    family_rows = family_query.limit(1).execute().data or []
+    if not family_rows:
+        return None
+
+    family = family_rows[0]
+    partial, denied = [], []
+
+    def optional(section, query):
+        rows, was_denied = _optional_caller_rows(query)
+        if was_denied:
+            denied.append(section)
+        return rows
+
+    def one(section, table, columns, row_id):
+        if row_id is None:
+            return None
+        rows = optional(section, client.table(table).select(columns).eq("id", row_id).limit(1))
+        if not rows and section not in denied:
+            partial.append(section)
+        return rows[0] if rows else None
+
+    family["batch"] = one(
+        "batch", "batches",
+        "id, batch_reference, family_id, plant_id, owner_user_id, sector_id, status, "
+        "pricing_date, pricing_basis_release_id, pricing_basis_is_deliberate, created_at, created_by",
+        family.get("batch_id"))
+    if family.get("batch"):
+        family["batch"]["plant"] = one(
+            "plant", "plants", "id, plant_code, name, status",
+            family["batch"].get("plant_id"))
+        family["batch"]["customer_family"] = one(
+            "customer_family", "customer_families",
+            "id, group_customer_code, name, status",
+            family["batch"].get("family_id"))
+
+    revisions = optional(
+        "revisions", client.table("quote_revisions").select(
+            "id, family_id, revision_no, source_revision_id, workflow_status, standing, "
+            "addressee_name, addressee_details, quote_date, offer_validity_to, approved_by, "
+            "approved_at, issued_by, issued_at, voided_by, voided_at, void_reason, "
+            "withdraw_reason, return_note, created_at, created_by"
+        ).eq("family_id", family["id"]))
+    revisions.sort(key=lambda row: (row.get("revision_no") is None,
+                                    row.get("revision_no") or 0,
+                                    row.get("created_at") or ""))
+    revision_ids = [row["id"] for row in revisions]
+
+    def many_for(section, table, columns, foreign_key, ids):
+        if not ids:
+            return []
+        return optional(section, client.table(table).select(columns).in_(foreign_key, ids))
+
+    items = many_for(
+        "quote_items", "quote_items",
+        "id, revision_id, batch_row_lineage_id, pricing_group_id, calculation_snapshot_id",
+        "revision_id", revision_ids)
+    snapshot_ids = [row["calculation_snapshot_id"] for row in items]
+    snapshots = many_for(
+        "calculation_snapshots", "calculation_snapshots",
+        "id, schema_version, engine_version, rounding_rule_version, pricing_basis_release_id, "
+        "calculation_default_version_id, pricing_date, effective_waste_pct, waste_source, "
+        "effective_conv_rate, conv_source, effective_margin_pct, margin_source, "
+        "effective_interest_pct, interest_source, effective_freight, freight_source, "
+        "freight_authority, freight_set_version_id, freight_entry_id, total_cost, final_rate, "
+        "rate_per_kg, calc_moq, calculation_fingerprint, presentation_fingerprint, "
+        "effective_inputs, results, calculated_by, calculated_at",
+        "id", snapshot_ids)
+    item_ids = [row["id"] for row in items]
+    delivery_links = many_for(
+        "item_delivery_groups", "quote_item_delivery_groups",
+        "id, quote_item_id, delivery_group_id", "quote_item_id", item_ids)
+    workflow_events = many_for(
+        "workflow_events", "quote_workflow_events",
+        "id, revision_id, event_type, actor_user_id, occurred_at, note",
+        "revision_id", revision_ids)
+    outcome_events = many_for(
+        "customer_outcomes", "customer_outcome_events",
+        "id, revision_id, outcome, acceptance_date, acceptance_reference, note, recorded_by, occurred_at",
+        "revision_id", revision_ids)
+
+    snapshots_by_id = {str(row["id"]): row for row in snapshots}
+    links_by_item = {}
+    for link in delivery_links:
+        links_by_item.setdefault(str(link["quote_item_id"]), []).append(link)
+    items_by_revision = {}
+    for item in items:
+        item["calculation_snapshot"] = snapshots_by_id.get(str(item["calculation_snapshot_id"]))
+        item["delivery_groups"] = links_by_item.get(str(item["id"]), [])
+        if not item["calculation_snapshot"] and "calculation_snapshots" not in denied:
+            partial.append("calculation_snapshot")
+        items_by_revision.setdefault(str(item["revision_id"]), []).append(item)
+
+    actor_ids = {
+        actor_id for actor_id in (
+            [family.get("created_by")]
+            + [value for revision in revisions for value in (
+                revision.get("created_by"), revision.get("approved_by"),
+                revision.get("issued_by"), revision.get("voided_by"))]
+            + [snapshot.get("calculated_by") for snapshot in snapshots]
+            + [event.get("actor_user_id") for event in workflow_events]
+            + [event.get("recorded_by") for event in outcome_events]
+        ) if actor_id is not None
+    }
+    actors = {}
+    for actor_id in actor_ids:
+        actor = one("actor_identity", "app_users", "id, display_name, status", actor_id)
+        if actor:
+            actors[str(actor_id)] = actor
+
+    events_by_revision = {}
+    for event in workflow_events:
+        event["actor"] = actors.get(str(event.get("actor_user_id")))
+        events_by_revision.setdefault(str(event["revision_id"]), []).append(event)
+    outcomes_by_revision = {}
+    for event in outcome_events:
+        event["recorded_by_actor"] = actors.get(str(event.get("recorded_by")))
+        outcomes_by_revision.setdefault(str(event["revision_id"]), []).append(event)
+
+    for revision in revisions:
+        revision["created_by_actor"] = actors.get(str(revision.get("created_by")))
+        revision["approved_by_actor"] = actors.get(str(revision.get("approved_by")))
+        revision["issued_by_actor"] = actors.get(str(revision.get("issued_by")))
+        revision["voided_by_actor"] = actors.get(str(revision.get("voided_by")))
+        revision["items"] = items_by_revision.get(str(revision["id"]), [])
+        for item in revision["items"]:
+            snapshot = item.get("calculation_snapshot")
+            if snapshot:
+                snapshot["calculated_by_actor"] = actors.get(str(snapshot.get("calculated_by")))
+        revision["workflow_events"] = sorted(
+            events_by_revision.get(str(revision["id"]), []),
+            key=lambda event: (event.get("occurred_at") or "", event.get("id")))
+        revision["customer_outcomes"] = sorted(
+            outcomes_by_revision.get(str(revision["id"]), []),
+            key=lambda event: (event.get("occurred_at") or "", event.get("id")))
+
+    family["created_by_actor"] = actors.get(str(family.get("created_by")))
+    family["revisions"] = revisions
+    family["details_partial"] = bool(partial or denied)
+    family["partial_sections"] = sorted(set(partial))
+    family["denied_sections"] = sorted(set(denied))
+    family["actions"] = {
+        name: {"enabled": False, "reason": "backend_activation_pending"}
+        for name in ("calculate", "send", "approve", "return", "withdraw",
+                     "issue", "create_revision", "amend", "reprice")
+    }
+    return family
+
+
+def _read_quote_catalogue(client, view):
+    """Build a bounded, caller-visible U5 Quote catalogue.
+
+    The catalogue never widens authority: its primary and supporting reads all
+    use the same caller-scoped client and existing Family G RLS. Supporting
+    denials remain explicit partial data. The 51-row read lets the UI state
+    truthfully when the current view was limited to its first 50 records.
+    """
+    revision_query = client.table("quote_revisions").select(
+        "id, family_id, revision_no, workflow_status, standing, quote_date, "
+        "created_at, created_by, approved_at, approved_by, issued_at, issued_by"
+    )
+    if view == "inbox":
+        revision_query = revision_query.eq("workflow_status", "submitted")
+    revisions = (revision_query.order("created_at", desc=True).limit(51).execute()).data or []
+    results_limited = len(revisions) > 50
+    revisions = revisions[:50]
+
+    partial, denied = [], []
+
+    def optional(section, query):
+        rows, was_denied = _optional_caller_rows(query)
+        if was_denied:
+            denied.append(section)
+        return rows
+
+    def indexed(section, table, columns, ids):
+        if not ids:
+            return {}
+        rows = optional(section, client.table(table).select(columns).in_("id", ids))
+        return {str(row["id"]): row for row in rows}
+
+    family_ids = list({row["family_id"] for row in revisions})
+    families = indexed(
+        "quote_families", "quote_families",
+        "id, batch_id, quote_reference, status", family_ids)
+    batch_ids = list({row["batch_id"] for row in families.values()})
+    batches = indexed(
+        "batches", "batches",
+        "id, batch_reference, family_id, plant_id, status", batch_ids)
+    plant_ids = list({row["plant_id"] for row in batches.values()})
+    plants = indexed("plants", "plants", "id, plant_code, name, status", plant_ids)
+    customer_family_ids = list({row["family_id"] for row in batches.values()})
+    customer_families = indexed(
+        "customer_families", "customer_families",
+        "id, group_customer_code, name, status", customer_family_ids)
+
+    revision_ids = [row["id"] for row in revisions]
+    items = optional(
+        "quote_items",
+        client.table("quote_items").select("id, revision_id").in_("revision_id", revision_ids)
+    ) if revision_ids else []
+    item_counts = {}
+    for item in items:
+        key = str(item["revision_id"])
+        item_counts[key] = item_counts.get(key, 0) + 1
+
+    actor_ids = list({actor_id for revision in revisions for actor_id in (
+        revision.get("created_by"), revision.get("approved_by"), revision.get("issued_by")
+    ) if actor_id is not None})
+    actors = indexed("actor_identities", "app_users", "id, display_name, status", actor_ids)
+
+    rows = []
+    for revision in revisions:
+        family = families.get(str(revision["family_id"]))
+        batch = batches.get(str(family.get("batch_id"))) if family else None
+        plant = plants.get(str(batch.get("plant_id"))) if batch else None
+        customer_family = customer_families.get(str(batch.get("family_id"))) if batch else None
+        if not family:
+            partial.append("quote_family")
+        elif not batch:
+            partial.append("batch")
+        row = dict(revision)
+        row.update({
+            "quote_family_id": family.get("id") if family else revision.get("family_id"),
+            "quote_reference": family.get("quote_reference") if family else None,
+            "family_status": family.get("status") if family else None,
+            "batch_id": batch.get("id") if batch else None,
+            "batch_reference": batch.get("batch_reference") if batch else None,
+            "batch_status": batch.get("status") if batch else None,
+            "plant": plant,
+            "customer_family": customer_family,
+            "created_by_actor": actors.get(str(revision.get("created_by"))),
+            "approved_by_actor": actors.get(str(revision.get("approved_by"))),
+            "issued_by_actor": actors.get(str(revision.get("issued_by"))),
+            "item_count": item_counts.get(str(revision["id"]), 0),
+        })
+        rows.append(row)
+
+    return {
+        "view": view,
+        "rows": rows,
+        "display_limit": 50,
+        "results_limited": results_limited,
+        "details_partial": bool(partial or denied),
+        "partial_sections": sorted(set(partial)),
+        "denied_sections": sorted(set(denied)),
+        "actions": {
+            name: {"enabled": False, "reason": "backend_activation_pending"}
+            for name in ("approve", "return", "withdraw", "issue", "create_revision")
+        },
+    }
+
+
+def _read_batch_catalogue(client):
+    """Build the bounded caller-visible U4 Batch operational catalogue.
+
+    `batches_select` remains the authority for which rows exist in this result.
+    Every supporting identity is read with the same caller-scoped client. A
+    denied or RLS-hidden supporting record is therefore partial catalogue
+    evidence, never a reason to substitute a privileged or inferred identity.
+
+    The 51-row read makes the 50-row display boundary observable. Search and
+    filters are deliberately described as applying to that displayed window;
+    cursor pagination becomes mandatory once the boundary is reached in normal
+    use (recorded in the U4 catalogue increment note).
+    """
+    batches = (client.table("batches").select(
+        "id, batch_reference, family_id, plant_id, owner_user_id, sector_id, status, "
+        "content_version, pricing_date, pricing_basis_release_id, "
+        "pricing_basis_is_deliberate, created_at, created_by"
+    ).order("created_at", desc=True).limit(51).execute()).data or []
+    results_limited = len(batches) > 50
+    batches = batches[:50]
+
+    partial, denied = [], []
+
+    def optional(section, query):
+        rows, was_denied = _optional_caller_rows(query)
+        if was_denied:
+            denied.append(section)
+        return rows
+
+    def indexed(section, table, columns, ids):
+        if not ids:
+            return {}
+        rows = optional(section, client.table(table).select(columns).in_("id", ids))
+        return {str(row["id"]): row for row in rows}
+
+    family_ids = list({row["family_id"] for row in batches})
+    plant_ids = list({row["plant_id"] for row in batches})
+    sector_ids = list({row["sector_id"] for row in batches if row.get("sector_id") is not None})
+    release_ids = list({row["pricing_basis_release_id"] for row in batches
+                        if row.get("pricing_basis_release_id") is not None})
+    owner_ids = list({row["owner_user_id"] for row in batches})
+
+    families = indexed(
+        "customer_families", "customer_families",
+        "id, group_customer_code, name, status", family_ids)
+    plants = indexed("plants", "plants", "id, plant_code, name, status", plant_ids)
+    sectors = indexed("sectors", "sectors", "id, sector_code, name, status", sector_ids)
+    releases = indexed(
+        "pricing_basis_releases", "pricing_basis_releases",
+        "id, plant_id, release_name, status, effective_from, effective_until, "
+        "is_automatic_default, approved_at, withdrawn_at", release_ids)
+    owners = indexed("owner_identities", "app_users", "id, display_name, status", owner_ids)
+
+    rows = []
+    for batch in batches:
+        row = dict(batch)
+        row["customer_family"] = families.get(str(batch.get("family_id")))
+        row["plant"] = plants.get(str(batch.get("plant_id")))
+        row["sector"] = sectors.get(str(batch.get("sector_id")))
+        row["pricing_basis_release"] = releases.get(
+            str(batch.get("pricing_basis_release_id")))
+        row["owner"] = owners.get(str(batch.get("owner_user_id")))
+
+        if row["customer_family"] is None:
+            partial.append("customer_family")
+        if row["plant"] is None:
+            partial.append("plant")
+        if batch.get("sector_id") is not None and row["sector"] is None:
+            partial.append("sector")
+        if (batch.get("pricing_basis_release_id") is not None
+                and row["pricing_basis_release"] is None):
+            partial.append("pricing_basis_release")
+        if row["owner"] is None:
+            partial.append("owner_identity")
+        row["details_partial"] = any((
+            row["customer_family"] is None,
+            row["plant"] is None,
+            batch.get("sector_id") is not None and row["sector"] is None,
+            batch.get("pricing_basis_release_id") is not None
+            and row["pricing_basis_release"] is None,
+            row["owner"] is None,
+        ))
+        rows.append(row)
+
+    return {
+        "rows": rows,
+        "display_limit": 50,
+        "results_limited": results_limited,
+        "filter_scope": "displayed_newest_first_window",
+        "details_partial": bool(partial or denied),
+        "partial_sections": sorted(set(partial)),
+        "denied_sections": sorted(set(denied)),
+        "actions": {
+            name: {"enabled": False, "reason": "backend_activation_pending"}
+            for name in ("calculate", "send", "submit", "approve", "return", "issue")
+        },
+    }
+
+
+def _read_batch_workspace(client, batch_id):
+    """Assemble the caller-visible, read-only durable Batch workspace."""
+    batch_rows = (client.table("batches").select(
+        "id, batch_reference, family_id, plant_id, owner_user_id, sector_id, status, "
+        "price_validity_from, price_validity_to, content_version, created_at, created_by, "
+        "pricing_date, pricing_basis_release_id, pricing_basis_is_deliberate"
+    ).eq("id", batch_id).limit(1).execute()).data or []
+    if not batch_rows:
+        return None
+
+    batch = batch_rows[0]
+    partial, denied = [], []
+
+    def one(section, table, columns, row_id):
+        if row_id is None:
+            return None
+        rows, was_denied = _optional_caller_rows(
+            client.table(table).select(columns).eq("id", row_id).limit(1))
+        if was_denied:
+            denied.append(section)
+        elif not rows:
+            partial.append(section)
+        return rows[0] if rows else None
+
+    batch["plant"] = one("plant", "plants", "id, plant_code, name, status", batch["plant_id"])
+    batch["family"] = one(
+        "customer_family", "customer_families",
+        "id, group_customer_code, name, status, content_version", batch["family_id"])
+    batch["owner"] = one(
+        "owner", "app_users", "id, display_name, status", batch["owner_user_id"])
+    batch["sector"] = one(
+        "sector", "sectors", "id, sector_code, name, status", batch.get("sector_id"))
+
+    family_sectors, family_sectors_denied = _optional_caller_rows(
+        client.table("customer_family_sectors").select(
+            "family_id, sector_id, created_at"
+        ).eq("family_id", batch["family_id"]))
+    if family_sectors_denied:
+        denied.append("family_sectors")
+    for membership in family_sectors:
+        if batch.get("sector") and membership.get("sector_id") == batch.get("sector_id"):
+            membership["sector"] = batch["sector"]
+        else:
+            membership["sector"] = one(
+                "family_sector_identity", "sectors", "id, sector_code, name, status",
+                membership.get("sector_id"))
+    family_sectors.sort(key=lambda membership: (
+        membership.get("created_at") or "",
+        membership.get("sector_id"),
+    ))
+    if not family_sectors and not family_sectors_denied:
+        partial.append("family_sectors")
+    batch["family_sectors"] = family_sectors
+
+    profiles, profiles_denied = _optional_caller_rows(
+        client.table("batch_profile_versions").select(
+            "id, batch_id, version_no, waste_cbb_pct, waste_pp_pct, conv_box_rate, "
+            "conv_pp_rate, margin_box_pct, margin_pp_pct, is_current, created_at, created_by"
+        ).eq("batch_id", batch_id).eq("is_current", True).limit(1))
+    if profiles_denied:
+        denied.append("current_profile")
+    elif not profiles:
+        partial.append("current_profile")
+    batch["current_profile"] = profiles[0] if profiles else None
+
+    collaborators, collaborators_denied = _optional_caller_rows(
+        client.table("batch_collaborators").select(
+            "id, batch_id, app_user_id, status, created_at"
+        ).eq("batch_id", batch_id).eq("status", "active"))
+    if collaborators_denied:
+        denied.append("collaborators")
+    for collaborator in collaborators:
+        collaborator["user"] = one(
+            "collaborator_identity", "app_users", "id, display_name, status",
+            collaborator.get("app_user_id"))
+    batch["collaborators"] = collaborators
+
+    locks, locks_denied = _optional_caller_rows(
+        client.table("batch_edit_locks").select(
+            "id, batch_id, holder_user_id, acquired_at, heartbeat_at, released_at"
+        ).eq("batch_id", batch_id).limit(1))
+    if locks_denied:
+        denied.append("edit_lock")
+    active_lock = next((lock for lock in locks if lock.get("released_at") is None), None)
+    if active_lock:
+        active_lock["holder"] = one(
+            "lock_holder_identity", "app_users", "id, display_name, status",
+            active_lock.get("holder_user_id"))
+    batch["edit_lock"] = active_lock
+
+    groups, groups_denied = _optional_caller_rows(
+        client.table("pricing_groups").select(
+            "id, batch_id, label, freight_mode, freight_basis_delivery_group_id, "
+            "freight_manual_value, payment_terms_days, payment_terms_text, "
+            "interest_override_pct, interest_override_derived_pct, interest_override_reason, "
+            "interest_override_by, interest_override_at, status, content_version, "
+            "legacy_freight_value, legacy_freight_source"
+        ).eq("batch_id", batch_id))
+    if groups_denied:
+        denied.append("pricing_groups")
+
+    deliveries, deliveries_denied = _optional_caller_rows(
+        client.table("delivery_groups").select(
+            "id, pricing_group_id, batch_id, label, bill_to_location_id, "
+            "ship_to_location_id, route_notes, status"
+        ).eq("batch_id", batch_id))
+    if deliveries_denied:
+        denied.append("delivery_groups")
+
+    visible_locations = {}
+    location_ids = {
+        location_id for delivery in deliveries
+        for location_id in (delivery.get("bill_to_location_id"), delivery.get("ship_to_location_id"))
+        if location_id is not None
+    }
+    for location_id in location_ids:
+        location = one(
+            "customer_location", "customer_locations",
+            "id, party_id, location_code, bill_to_eligible, ship_to_eligible, status, content_version",
+            location_id)
+        if location:
+            visible_locations[str(location_id)] = location
+
+    deliveries_by_group = {}
+    for delivery in deliveries:
+        delivery["bill_to_location"] = visible_locations.get(str(delivery.get("bill_to_location_id")))
+        delivery["ship_to_location"] = visible_locations.get(str(delivery.get("ship_to_location_id")))
+        deliveries_by_group.setdefault(str(delivery["pricing_group_id"]), []).append(delivery)
+    for group in groups:
+        group["delivery_groups"] = deliveries_by_group.get(str(group["id"]), [])
+    batch["pricing_groups"] = groups
+
+    rows, rows_denied = _optional_caller_rows(
+        client.table("batch_rows").select(
+            "id, lineage_id, batch_id, plant_id, pricing_group_id, sku_id, sku_version_id, "
+            "proposed_construction_version_id, material_code, row_type, waste_override_pct, "
+            "margin_override_pct, conv_override_rate, freight_override, sales_moq, volume, "
+            "status, content_version, addon_printing, addon_stitching, addon_coating, "
+            "addon_handling, addon_moq_charge, addon_packing, addon_other, addon_unloading, "
+            "fluting_bcf"
+        ).eq("batch_id", batch_id))
+    if rows_denied:
+        denied.append("batch_rows")
+
+    for row in rows:
+        row["sku"] = one(
+            "row_sku", "skus",
+            "id, plant_id, party_id, plant_item_code, status, replacement_sku_id, content_version",
+            row.get("sku_id"))
+        if row.get("sku"):
+            row["customer"] = one(
+                "row_customer", "parties",
+                "id, customer_code, display_name, lifecycle_state, status",
+                row["sku"].get("party_id"))
+        else:
+            row["customer"] = None
+
+        row["sku_version"] = one(
+            "row_sku_version", "sku_versions",
+            "id, sku_id, plant_id, version_no, construction_version_id, is_price_driving, "
+            "length_mm, width_mm, height_mm, box_type, ups, spec_bs, spec_bct, spec_ect, approved_at",
+            row.get("sku_version_id"))
+
+        effective_construction_version_id = row.get("proposed_construction_version_id")
+        construction_origin = "row_proposed"
+        if effective_construction_version_id is None:
+            construction_origin = "sku_version"
+            effective_construction_version_id = (row.get("sku_version") or {}).get(
+                "construction_version_id")
+        construction_version = one(
+            "row_construction_version", "construction_versions",
+            "id, construction_id, version_no, ply, flute_f1, flute_f2, board_gsm, "
+            "effective_from, approved_at",
+            effective_construction_version_id)
+        construction = one(
+            "row_construction", "constructions",
+            "id, construction_code, name, status, surviving_construction_id",
+            (construction_version or {}).get("construction_id"))
+        row["effective_construction"] = {
+            "version_id": effective_construction_version_id,
+            "origin": construction_origin,
+            "version": construction_version,
+            "construction": construction,
+            "details_partial": construction_version is None or construction is None,
+        }
+
+    rows.sort(key=lambda row: row.get("id") or 0)
+    batch["batch_rows"] = rows
+
+    sets, sets_denied = _optional_caller_rows(
+        client.table("batch_sets").select(
+            "id, batch_id, box_row_id, set_code, status, active_component_count, created_at"
+        ).eq("batch_id", batch_id))
+    if sets_denied:
+        denied.append("batch_sets")
+    memberships, memberships_denied = _optional_caller_rows(
+        client.table("batch_set_memberships").select(
+            "id, set_id, row_id, batch_id, role, status, created_at"
+        ).eq("batch_id", batch_id))
+    if memberships_denied:
+        denied.append("batch_set_memberships")
+    memberships_by_set = {}
+    for membership in memberships:
+        memberships_by_set.setdefault(str(membership["set_id"]), []).append(membership)
+    for item in sets:
+        item["memberships"] = sorted(
+            memberships_by_set.get(str(item["id"]), []),
+            key=lambda membership: membership.get("id") or 0)
+    batch["batch_sets"] = sorted(sets, key=lambda item: item.get("id") or 0)
+
+    batch["details_partial"] = bool(partial or denied)
+    batch["partial_sections"] = sorted(set(partial))
+    batch["denied_sections"] = sorted(set(denied))
+    return batch
+
+
+def _read_batch_row_options(client, batch_id):
+    """Return exact caller-visible SKU/version choices for one governed Batch.
+
+    The database remains authoritative for every write.  This read narrows the
+    editor to the already-ratified U4 contract: the SKU belongs to the Batch
+    Family and plant; its immutable Version is approved; and its Construction
+    authority is currently adopted at that plant.  No rendered label is later
+    parsed back into an identity.
+    """
+    batches = (client.table("batches")
+               .select("id, family_id, plant_id, status")
+               .eq("id", batch_id).limit(1).execute()).data or []
+    if not batches:
+        return None
+    batch = batches[0]
+
+    memberships = (client.table("party_family_memberships")
+                   .select("party_id, family_id, is_current")
+                   .eq("family_id", batch["family_id"])
+                   .eq("is_current", True).execute()).data or []
+    family_party_ids = {membership.get("party_id") for membership in memberships}
+
+    parties = []
+    if family_party_ids:
+        parties = (client.table("parties")
+                   .select("id, customer_code, display_name, lifecycle_state, status")
+                   .in_("id", sorted(family_party_ids))
+                   .eq("status", "active").execute()).data or []
+    party_by_id = {party["id"]: party for party in parties
+                   if party.get("id") in family_party_ids}
+
+    skus = (client.table("skus")
+            .select("id, plant_id, party_id, plant_item_code, status, replacement_sku_id, content_version")
+            .eq("plant_id", batch["plant_id"]).execute()).data or []
+    skus = [sku for sku in skus if sku.get("party_id") in party_by_id]
+    sku_ids = {sku["id"] for sku in skus}
+
+    versions = (client.table("sku_versions").select(
+        "id, sku_id, plant_id, version_no, construction_version_id, is_price_driving, "
+        "length_mm, width_mm, height_mm, box_type, ups, spec_bs, spec_bct, spec_ect, approved_at"
+    ).eq("plant_id", batch["plant_id"]).execute()).data or []
+    versions = [version for version in versions
+                if version.get("sku_id") in sku_ids and version.get("approved_at") is not None]
+
+    adoptions = (client.table("plant_construction_adoptions")
+                 .select("plant_id, construction_version_id, status")
+                 .eq("plant_id", batch["plant_id"])
+                 .eq("status", "adopted").execute()).data or []
+    adopted_version_ids = {adoption.get("construction_version_id") for adoption in adoptions}
+    versions = [version for version in versions
+                if version.get("construction_version_id") in adopted_version_ids]
+
+    construction_versions = []
+    if adopted_version_ids:
+        construction_versions = (client.table("construction_versions").select(
+            "id, construction_id, version_no, ply, flute_f1, flute_f2, board_gsm, "
+            "effective_from, approved_at"
+        ).in_("id", sorted(adopted_version_ids)).execute()).data or []
+    construction_version_by_id = {
+        version["id"]: version for version in construction_versions
+        if version.get("id") in adopted_version_ids
+    }
+    construction_ids = {
+        version.get("construction_id") for version in construction_version_by_id.values()
+    }
+    constructions = []
+    if construction_ids:
+        constructions = (client.table("constructions")
+                         .select("id, construction_code, name, status, surviving_construction_id")
+                         .in_("id", sorted(construction_ids)).execute()).data or []
+    construction_by_id = {construction["id"]: construction for construction in constructions
+                          if construction.get("id") in construction_ids}
+
+    references = (client.table("sku_external_references")
+                  .select("id, sku_id, plant_id, reference_kind, reference_value, status")
+                  .eq("plant_id", batch["plant_id"])
+                  .eq("status", "active").execute()).data or []
+    references_by_sku = {}
+    for reference in references:
+        if reference.get("sku_id") in sku_ids:
+            references_by_sku.setdefault(reference["sku_id"], []).append(reference)
+
+    versions_by_sku = {}
+    for version in versions:
+        construction_version = construction_version_by_id.get(version["construction_version_id"])
+        construction = construction_by_id.get(
+            (construction_version or {}).get("construction_id"))
+        decorated = dict(version)
+        decorated["construction_version"] = construction_version
+        decorated["construction"] = construction
+        decorated["construction_details_partial"] = (
+            construction_version is None or construction is None)
+        versions_by_sku.setdefault(version["sku_id"], []).append(decorated)
+
+    out = []
+    for sku in skus:
+        sku_versions = sorted(
+            versions_by_sku.get(sku["id"], []),
+            key=lambda version: version.get("version_no") or 0,
+            reverse=True)
+        if not sku_versions:
+            continue
+        out.append({
+            **sku,
+            "customer": party_by_id.get(sku.get("party_id")),
+            "external_references": sorted(
+                references_by_sku.get(sku["id"], []),
+                key=lambda reference: (reference.get("reference_kind") or "",
+                                       reference.get("reference_value") or "")),
+            "versions": sku_versions,
+        })
+    out.sort(key=lambda sku: (
+        (sku.get("customer") or {}).get("customer_code") or "",
+        sku.get("plant_item_code") or "",
+        sku.get("id") or 0,
+    ))
+    return {"batch": batch, "skus": out}
+
+
+def _decorate_workspace_for_caller(batch):
+    """Expose edit readiness without pretending the UI is an authority check."""
+    caller_id = g.caller["id"]
+    batch["caller_id"] = caller_id
+    batch["caller_holds_lock"] = bool(
+        batch.get("edit_lock")
+        and batch["edit_lock"].get("holder_user_id") == caller_id
+    )
+    return batch
+
+
+def _caller_table_write(label, operation):
+    """Run one caller-token Data API write and return only stable errors."""
+    try:
+        return operation().execute(), None
+    except APIError as exc:
+        code = {
+            "42501": "CAPABILITY_REQUIRED",
+            "23503": "RECORD_NOT_FOUND",
+            "23505": "TRANSITION_NOT_ALLOWED",
+            "23514": "TRANSITION_NOT_ALLOWED",
+            "55P03": "LOCK_UNAVAILABLE",
+        }.get(exc.code)
+        if code:
+            app.logger.info("%s refused: %s %s -> %s", label, exc.code, exc.message, code)
+            return None, _error(code)
+        app.logger.error("unmapped Data API error from %s: %s %s", label, exc.code, exc.message)
+        return None, _error("INTERNAL_ERROR")
+    except Exception as exc:
+        if _is_upstream_timeout(exc):
+            app.logger.error("%s timed out upstream: %s", label, exc)
+            return None, _error("UPSTREAM_TIMEOUT")
+        app.logger.error("%s failed: %s", label, exc)
+        return None, _error("INTERNAL_ERROR")
+
+
+def _delivery_location(client, location_id, role):
+    """Validate one caller-visible active Location for its selected route role."""
+    rows = (client.table("customer_locations")
+            .select("id, party_id, location_code, bill_to_eligible, ship_to_eligible, status")
+            .eq("id", location_id).limit(1).execute()).data or []
+    if not rows:
+        return None, _invalid_input(f"The selected {role} Location is unavailable to this caller.")
+    location = rows[0]
+    eligible_key = "bill_to_eligible" if role == "Bill-to" else "ship_to_eligible"
+    if location.get("status") != "active" or location.get(eligible_key) is not True:
+        return None, _invalid_input(f"The selected {role} Location is not active and eligible.")
+    return location, None
+
+
+def _delivery_group_input(client, data):
+    """Validate the common create/edit route fields without timezone or identity inference."""
+    pricing_group_id = _int_field(data, "pricing_group_id")
+    bill_to_id = _int_field(data, "bill_to_location_id")
+    ship_to_id = _int_field(data, "ship_to_location_id")
+    if pricing_group_id is None or pricing_group_id < 1:
+        return None, _invalid_input("pricing_group_id is required")
+    if bill_to_id is None or bill_to_id < 1:
+        return None, _invalid_input("bill_to_location_id is required")
+    if ship_to_id is None or ship_to_id < 1:
+        return None, _invalid_input("ship_to_location_id is required")
+    label = (data.get("label") or "").strip()
+    if len(label) > 120:
+        return None, _invalid_input("label must be 120 characters or fewer")
+    _bill_to, err = _delivery_location(client, bill_to_id, "Bill-to")
+    if err:
+        return None, err
+    _ship_to, err = _delivery_location(client, ship_to_id, "Ship-to")
+    if err:
+        return None, err
+    return {
+        "pricing_group_id": pricing_group_id,
+        "bill_to_location_id": bill_to_id,
+        "ship_to_location_id": ship_to_id,
+        "label": label or None,
+    }, None
+
+
+_BATCH_ROW_TYPES = {"box", "plate", "part_l", "part_w", "other"}
+_BATCH_ROW_OVERRIDE_FIELDS = (
+    "waste_override_pct", "margin_override_pct", "conv_override_rate", "freight_override",
+)
+_BATCH_ROW_ADDON_FIELDS = (
+    "addon_printing", "addon_stitching", "addon_coating", "addon_handling",
+    "addon_moq_charge", "addon_packing", "addon_other", "addon_unloading",
+)
+_BATCH_ROW_NUMERIC_FIELDS = (*_BATCH_ROW_OVERRIDE_FIELDS, *_BATCH_ROW_ADDON_FIELDS, "fluting_bcf")
+
+
+def _batch_row_input(client, batch_id, data, existing_sku_id=None, existing_overrides=None):
+    """Validate exact durable row identities without accepting display text."""
+    pricing_group_id = _int_field(data, "pricing_group_id")
+    sku_id = existing_sku_id if existing_sku_id is not None else _int_field(data, "sku_id")
+    sku_version_id = _int_field(data, "sku_version_id")
+    if pricing_group_id is None or pricing_group_id < 1:
+        return None, _invalid_input("pricing_group_id is required")
+    if sku_id is None or sku_id < 1:
+        return None, _invalid_input("sku_id is required")
+    if sku_version_id is None or sku_version_id < 1:
+        return None, _invalid_input("sku_version_id is required")
+    row_type = (data.get("row_type") or "").strip().lower()
+    if row_type not in _BATCH_ROW_TYPES:
+        return None, _invalid_input("row_type must be box, plate, part_l, part_w or other")
+    material_code = data.get("material_code")
+    if material_code is not None:
+        material_code = str(material_code).strip() or None
+        if material_code is not None and len(material_code) > 160:
+            return None, _invalid_input("material_code must be 160 characters or fewer")
+
+    options = _read_batch_row_options(client, batch_id)
+    if options is None:
+        return None, _error("RECORD_NOT_FOUND")
+    sku = next((item for item in options["skus"] if item["id"] == sku_id), None)
+    version = next((item for item in (sku or {}).get("versions", [])
+                    if item["id"] == sku_version_id), None)
+    if sku is None or version is None:
+        return None, _invalid_input(
+            "The selected SKU Version is not an approved, plant-adopted option for this Batch Family.")
+
+    groups = (client.table("pricing_groups").select("id, batch_id, status")
+              .eq("id", pricing_group_id).eq("batch_id", batch_id).limit(1).execute()).data or []
+    if not groups:
+        return None, _error("RECORD_NOT_FOUND")
+    if groups[0].get("status") != "active":
+        return None, _error("TRANSITION_NOT_ALLOWED")
+    numeric_values = {}
+    for key in _BATCH_ROW_NUMERIC_FIELDS:
+        if key not in data and existing_overrides is not None:
+            numeric_values[key] = existing_overrides.get(key)
+            continue
+        numeric_values[key], err = _optional_nonnegative_numeric(data, key)
+        if err:
+            return None, err
+    if numeric_values["fluting_bcf"] is not None and numeric_values["fluting_bcf"] > 0.30:
+        return None, _invalid_input("fluting_bcf must be blank or between 0 and 0.30")
+    return {
+        "pricing_group_id": pricing_group_id,
+        "sku_id": sku_id,
+        "sku_version_id": sku_version_id,
+        "row_type": row_type,
+        "material_code": material_code,
+        **numeric_values,
+    }, None
+
+
+def _workspace_write_response(client, batch_id, mutation, status=200):
+    """Read back the state after a write; timeout means the write outcome is unknown."""
+    try:
+        batch = _read_batch_workspace(client, batch_id)
+    except Exception as exc:
+        if _is_upstream_timeout(exc):
+            app.logger.error("%s read-back timed out upstream: %s", mutation, exc)
+            return _error("UPSTREAM_TIMEOUT")
+        raise
+    if batch is None:
+        return _error("RECORD_NOT_FOUND")
+    return jsonify({"batch": _decorate_workspace_for_caller(batch), "mutation": mutation}), status
+
+
+def _rpc_scalar_id(result):
+    """Accept the scalar shapes returned by PostgREST for a bigint RPC."""
+    value = getattr(result, "data", None)
+    if isinstance(value, list) and len(value) == 1:
+        value = value[0]
+    if isinstance(value, dict) and len(value) == 1:
+        value = next(iter(value.values()))
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value.isdigit():
+        return int(value)
+    return None
+
+
+@app.route("/batches/create-options", methods=["GET"])
+@require_auth
+def get_batch_create_options():
+    """Return only caller-visible identities needed to create a governed Batch."""
+    if "read_party_master" not in (g.caller.get("group_capabilities") or []):
+        return _error("CAPABILITY_REQUIRED")
+
+    client = get_supabase_for_caller(g.access_token)
+    families = (client.table("customer_families")
+                .select("id, group_customer_code, name, status")
+                .eq("status", "active").execute()).data or []
+    memberships = (client.table("party_family_memberships")
+                   .select("party_id, family_id, is_current")
+                   .eq("is_current", True).execute()).data or []
+    parties = (client.table("parties")
+               .select("id, customer_code, display_name, lifecycle_state, status")
+               .eq("status", "active").execute()).data or []
+    plants = (client.table("plants")
+              .select("id, plant_code, name, status")
+              .eq("status", "active").execute()).data or []
+
+    sectors, sectors_denied = _optional_caller_rows(
+        client.table("sectors").select("id, sector_code, name, status").eq("status", "active"))
+    family_sectors, family_sectors_denied = _optional_caller_rows(
+        client.table("customer_family_sectors").select("family_id, sector_id, created_at"))
+
+    maker_codes = {
+        code for code, capabilities in (g.caller.get("plant_capabilities") or {}).items()
+        if isinstance(capabilities, list) and "make_quote" in capabilities
+    }
+    plants = [plant for plant in plants if plant.get("plant_code") in maker_codes]
+
+    party_by_id = {str(party["id"]): party for party in parties}
+    members_by_family = {}
+    for membership in memberships:
+        party = party_by_id.get(str(membership.get("party_id")))
+        if party:
+            members_by_family.setdefault(str(membership.get("family_id")), []).append(party)
+    for family in families:
+        family["members"] = sorted(
+            members_by_family.get(str(family["id"]), []),
+            key=lambda party: party.get("customer_code") or party.get("display_name") or "")
+        ordered_sector_memberships = sorted(
+            (membership for membership in family_sectors
+             if membership.get("family_id") == family.get("id")
+                and membership.get("sector_id") is not None),
+            key=lambda membership: (
+                membership.get("created_at") or "",
+                membership.get("sector_id"),
+            ))
+        family["sector_ids"] = [membership["sector_id"] for membership in ordered_sector_memberships]
+
+    families.sort(key=lambda family: family.get("group_customer_code") or family.get("name") or "")
+    plants.sort(key=lambda plant: plant.get("plant_code") or "")
+    sectors.sort(key=lambda sector: sector.get("sector_code") or "")
+    return jsonify({
+        "families": families,
+        "plants": plants,
+        "sectors": sectors,
+        "sectors_denied": sectors_denied,
+        "family_sectors_denied": family_sectors_denied,
+        "mutation": "create_batch_rpc_only",
+    })
+
+
+@app.route("/batches", methods=["POST"])
+@require_auth
+def create_batch_route():
+    """Create and read back one governed Batch through public.create_batch."""
+    data = request.get_json(force=True) or {}
+    family_id = _int_field(data, "family_id")
+    plant_id = _int_field(data, "plant_id")
+    if family_id is None or family_id < 1:
+        return _invalid_input("family_id is required")
+    if plant_id is None or plant_id < 1:
+        return _invalid_input("plant_id is required")
+    sector_id = _int_field(data, "sector_id")
+    if sector_id is None or sector_id < 1:
+        return _invalid_input("sector_id is required")
+
+    client = get_supabase_for_caller(g.access_token)
+    result, err = _rpc_call(client, "create_batch", {
+        "p_family": family_id,
+        "p_plant": plant_id,
+        "p_sector": sector_id,
+    })
+    if err:
+        return err
+    batch_id = _rpc_scalar_id(result)
+    if batch_id is None:
+        app.logger.error("create_batch returned an invalid scalar identity")
+        return _error("INTERNAL_ERROR")
+    return _workspace_write_response(client, batch_id, "create_batch", status=201)
+
+
+@app.route("/batches/<int:batch_id>/lock/acquire", methods=["POST"])
+@require_auth
+def acquire_batch_lock_route(batch_id):
+    """Acquire an available governed Batch lock and read back its exact holder."""
+    client = get_supabase_for_caller(g.access_token)
+    _result, err = _rpc_call(client, "acquire_batch_lock", {"p_batch": batch_id})
+    if err:
+        return err
+    return _workspace_write_response(client, batch_id, "acquire_batch_lock")
+
+
+@app.route("/batches/<int:batch_id>/lock/reclaim", methods=["POST"])
+@require_auth
+def reclaim_batch_lock_route(batch_id):
+    """Reclaim a stale Batch lock only if its observed holder still matches."""
+    data = request.get_json(silent=True) or {}
+    expected_holder_id = _int_field(data, "expected_holder_id")
+    if expected_holder_id is None or expected_holder_id < 1:
+        return _invalid_input("expected_holder_id must be a positive integer")
+
+    client = get_supabase_for_caller(g.access_token)
+    _result, err = _rpc_call(client, "reclaim_batch_lock", {
+        "p_batch": batch_id,
+        "p_expected_holder": expected_holder_id,
+    })
+    if err:
+        return err
+    return _workspace_write_response(client, batch_id, "reclaim_batch_lock")
+
+
+@app.route("/batches/<int:batch_id>/lock/heartbeat", methods=["POST"])
+@require_auth
+def heartbeat_batch_lock_route(batch_id):
+    """Maintain the caller's existing Batch lock without changing Batch content."""
+    client = get_supabase_for_caller(g.access_token)
+    _result, err = _rpc_call(client, "heartbeat_batch_lock", {"p_batch": batch_id})
+    if err:
+        return err
+    return jsonify({"mutation": "heartbeat_batch_lock"})
+
+
+@app.route("/batches/<int:batch_id>/lock/release", methods=["POST"])
+@require_auth
+def release_batch_lock_route(batch_id):
+    """Release the caller's Batch lock; the database operation is idempotent."""
+    client = get_supabase_for_caller(g.access_token)
+    _result, err = _rpc_call(client, "release_batch_lock", {"p_batch": batch_id})
+    if err:
+        return err
+    return jsonify({"mutation": "release_batch_lock"})
+
+
+@app.route("/batches/pricing-basis", methods=["GET"])
+@require_auth
+def get_batch_pricing_basis_by_reference():
+    """Open a durable Batch by its permanent reference, entirely as the caller."""
+    reference = (request.args.get("reference") or "").strip()
+    if not reference:
+        return _invalid_input("reference is required")
+    try:
+        batch = _read_batch_pricing_basis(
+            get_supabase_for_caller(g.access_token), batch_reference=reference)
+    except Exception as exc:
+        if _is_upstream_timeout(exc):
+            app.logger.error("Batch Pricing Basis read timed out upstream: %s", exc)
+            return _error("UPSTREAM_TIMEOUT")
+        raise
+    if batch is None:
+        return _error("RECORD_NOT_FOUND")
+    return jsonify({"batch": batch, "mutations": "governed_rpc_only"})
+
+
+@app.route("/batches/<int:batch_id>/pricing-basis", methods=["GET"])
+@require_auth
+def get_batch_pricing_basis(batch_id):
+    """Reopen the persisted Pricing Basis selection for one caller-visible Batch."""
+    try:
+        batch = _read_batch_pricing_basis(
+            get_supabase_for_caller(g.access_token), batch_id=batch_id)
+    except Exception as exc:
+        if _is_upstream_timeout(exc):
+            app.logger.error("Batch Pricing Basis reopen timed out upstream: %s", exc)
+            return _error("UPSTREAM_TIMEOUT")
+        raise
+    if batch is None:
+        return _error("RECORD_NOT_FOUND")
+    return jsonify({"batch": batch, "mutations": "governed_rpc_only"})
+
+
+@app.route("/batches/<int:batch_id>/workspace", methods=["GET"])
+@require_auth
+def get_batch_workspace(batch_id):
+    """Load caller-visible Batch structure; separate routes govern Delivery Group writes."""
+    try:
+        batch = _read_batch_workspace(get_supabase_for_caller(g.access_token), batch_id)
+    except Exception as exc:
+        if _is_upstream_timeout(exc):
+            app.logger.error("Batch workspace read timed out upstream: %s", exc)
+            return _error("UPSTREAM_TIMEOUT")
+        raise
+    if batch is None:
+        return _error("RECORD_NOT_FOUND")
+    return jsonify({"batch": _decorate_workspace_for_caller(batch), "mode": "governed"})
+
+
+@app.route("/batches/catalogue", methods=["GET"])
+@require_auth
+def get_batch_catalogue():
+    """List the bounded caller-visible durable Batch operational window."""
+    try:
+        catalogue = _read_batch_catalogue(get_supabase_for_caller(g.access_token))
+    except APIError as exc:
+        if exc.code == "42501":
+            return _error("CAPABILITY_REQUIRED")
+        raise
+    except Exception as exc:
+        if _is_upstream_timeout(exc):
+            app.logger.error("Batch catalogue read timed out upstream: %s", exc)
+            return _error("UPSTREAM_TIMEOUT")
+        raise
+    return jsonify({
+        "catalogue": catalogue,
+        "mode": "governed_read_only",
+        "authority": "caller_token_rls_only",
+    })
+
+
+@app.route("/quotes/workspace", methods=["GET"])
+@require_auth
+def get_quote_workspace():
+    """Open one immutable caller-visible Quote by reference, revision or Batch id."""
+    reference = (request.args.get("reference") or "").strip()
+    revision_id_raw = (request.args.get("revision_id") or "").strip()
+    batch_id_raw = (request.args.get("batch_id") or "").strip()
+    if sum(bool(value) for value in (reference, revision_id_raw, batch_id_raw)) != 1:
+        return _invalid_input("provide exactly one of reference, revision_id or batch_id")
+    revision_id = None
+    if revision_id_raw:
+        try:
+            revision_id = int(revision_id_raw)
+        except ValueError:
+            return _invalid_input("revision_id must be a positive integer")
+        if revision_id <= 0:
+            return _invalid_input("revision_id must be a positive integer")
+    batch_id = None
+    if batch_id_raw:
+        try:
+            batch_id = int(batch_id_raw)
+        except ValueError:
+            return _invalid_input("batch_id must be a positive integer")
+        if batch_id <= 0:
+            return _invalid_input("batch_id must be a positive integer")
+    try:
+        quote = _read_quote_workspace(
+            get_supabase_for_caller(g.access_token), reference or None, revision_id, batch_id)
+    except Exception as exc:
+        if _is_upstream_timeout(exc):
+            app.logger.error("Quote workspace read timed out upstream: %s", exc)
+            return _error("UPSTREAM_TIMEOUT")
+        raise
+    if quote is None:
+        return _error("RECORD_NOT_FOUND")
+    return jsonify({
+        "quote": quote,
+        "mode": "governed_read_only",
+        "authority": "caller_token_rls_only",
+    })
+
+
+@app.route("/quotes/catalogue", methods=["GET"])
+@require_auth
+def get_quote_catalogue():
+    """List a bounded caller-visible approval inbox or Quote history."""
+    view = (request.args.get("view") or "").strip().lower()
+    if view not in ("inbox", "history"):
+        return _invalid_input("view must be inbox or history")
+    if view == "inbox" and not any(
+            "check_quote" in capabilities
+            for capabilities in (g.caller.get("plant_capabilities") or {}).values()):
+        return _error("CAPABILITY_REQUIRED")
+    try:
+        catalogue = _read_quote_catalogue(get_supabase_for_caller(g.access_token), view)
+    except APIError as exc:
+        if exc.code == "42501":
+            return _error("CAPABILITY_REQUIRED")
+        raise
+    except Exception as exc:
+        if _is_upstream_timeout(exc):
+            app.logger.error("Quote catalogue read timed out upstream: %s", exc)
+            return _error("UPSTREAM_TIMEOUT")
+        raise
+    return jsonify({
+        "catalogue": catalogue,
+        "mode": "governed_read_only",
+        "authority": "caller_token_rls_only",
+    })
+
+
+@app.route("/batches/<int:batch_id>/row-options", methods=["GET"])
+@require_auth
+def get_batch_row_options(batch_id):
+    """Load exact SKU/Version/Construction identities eligible for row addition."""
+    try:
+        options = _read_batch_row_options(get_supabase_for_caller(g.access_token), batch_id)
+    except APIError as exc:
+        if exc.code == "42501":
+            return _error("CAPABILITY_REQUIRED")
+        raise
+    except Exception as exc:
+        if _is_upstream_timeout(exc):
+            app.logger.error("Batch row options timed out upstream: %s", exc)
+            return _error("UPSTREAM_TIMEOUT")
+        raise
+    if options is None:
+        return _error("RECORD_NOT_FOUND")
+    return jsonify({
+        **options,
+        "selection_contract": "approved_sku_version_with_plant_adopted_construction",
+        "mutations": "caller_token_rls_only",
+    })
+
+
+@app.route("/batches/<int:batch_id>/profile", methods=["POST"])
+@require_auth
+def revise_batch_profile_route(batch_id):
+    """Create the next immutable Batch Profile version through its governed CAS RPC."""
+    data = request.get_json(force=True) or {}
+    expected = _int_field(data, "expected_content_version")
+    if expected is None or expected < 1:
+        return _invalid_input("expected_content_version is required")
+    fields = (
+        "waste_cbb_pct", "waste_pp_pct", "conv_box_rate",
+        "conv_pp_rate", "margin_box_pct", "margin_pp_pct",
+    )
+    values = {}
+    for field in fields:
+        values[field], err = _optional_nonnegative_numeric(data, field)
+        if err:
+            return err
+    client = get_supabase_for_caller(g.access_token)
+    _result, err = _rpc_call(client, "revise_batch_profile", {
+        "p_batch": batch_id,
+        "p_expected_content_version": expected,
+        **{f"p_{field}": value for field, value in values.items()},
+    })
+    if err:
+        return err
+    return _workspace_write_response(client, batch_id, "revise_batch_profile")
+
+
+@app.route("/batches/<int:batch_id>/sets", methods=["POST"])
+@require_auth
+def create_batch_set(batch_id):
+    """Start a durable SET around one Box; its status remains database-derived."""
+    data = request.get_json(force=True) or {}
+    box_row_id = _int_field(data, "box_row_id")
+    set_code = (data.get("set_code") or "").strip()
+    if box_row_id is None or box_row_id < 1:
+        return _invalid_input("box_row_id is required")
+    if not set_code or len(set_code) > 80:
+        return _invalid_input("set_code is required and must be at most 80 characters")
+    client = get_supabase_for_caller(g.access_token)
+    try:
+        box_rows = (client.table("batch_rows").select("id, batch_id, row_type, status")
+                    .eq("id", box_row_id).eq("batch_id", batch_id).limit(1).execute()).data or []
+    except APIError as exc:
+        if exc.code == "42501":
+            return _error("CAPABILITY_REQUIRED")
+        raise
+    if not box_rows:
+        return _error("RECORD_NOT_FOUND")
+    if box_rows[0].get("row_type") != "box" or box_rows[0].get("status") != "active":
+        return _invalid_input("A SET parent must be an active Box row")
+    result, err = _caller_table_write("create Batch SET", lambda: client.table("batch_sets").insert({
+        "batch_id": batch_id, "box_row_id": box_row_id,
+        "set_code": set_code, "created_by": g.caller["id"],
+    }))
+    if err:
+        return err
+    if not (result.data or []):
+        return _error("CAPABILITY_REQUIRED")
+    return _workspace_write_response(client, batch_id, "create_batch_set", status=201)
+
+
+@app.route("/batches/<int:batch_id>/sets/<int:set_id>/memberships", methods=["POST"])
+@require_auth
+def create_batch_set_membership(batch_id, set_id):
+    """Attach one non-Box component; database triggers activate/recount the SET."""
+    data = request.get_json(force=True) or {}
+    row_id = _int_field(data, "row_id")
+    role = (data.get("role") or "").strip()
+    if row_id is None or row_id < 1:
+        return _invalid_input("row_id is required")
+    if role not in ("plate", "partition", "other"):
+        return _invalid_input("role must be plate, partition or other")
+    client = get_supabase_for_caller(g.access_token)
+    try:
+        sets = (client.table("batch_sets").select("id, batch_id, box_row_id")
+                .eq("id", set_id).eq("batch_id", batch_id).limit(1).execute()).data or []
+        rows = (client.table("batch_rows").select("id, batch_id, row_type, status")
+                .eq("id", row_id).eq("batch_id", batch_id).limit(1).execute()).data or []
+    except APIError as exc:
+        if exc.code == "42501":
+            return _error("CAPABILITY_REQUIRED")
+        raise
+    if not sets or not rows:
+        return _error("RECORD_NOT_FOUND")
+    if rows[0].get("row_type") == "box" or rows[0].get("status") != "active":
+        return _invalid_input("A SET component must be an active non-Box row")
+    result, err = _caller_table_write(
+        "attach Batch SET component", lambda: client.table("batch_set_memberships").insert({
+            "set_id": set_id, "row_id": row_id, "batch_id": batch_id,
+            "role": role, "status": "active", "created_by": g.caller["id"],
+        }))
+    if err:
+        return err
+    if not (result.data or []):
+        return _error("CAPABILITY_REQUIRED")
+    return _workspace_write_response(client, batch_id, "create_batch_set_membership", status=201)
+
+
+@app.route("/batches/<int:batch_id>/set-memberships/<int:membership_id>", methods=["PATCH"])
+@require_auth
+def update_batch_set_membership(batch_id, membership_id):
+    """Remove/reactivate a component or revise its role; SET state stays derived."""
+    data = request.get_json(force=True) or {}
+    status = (data.get("status") or "").strip()
+    role = (data.get("role") or "").strip()
+    if status not in ("active", "removed"):
+        return _invalid_input("status must be active or removed")
+    if role not in ("plate", "partition", "other"):
+        return _invalid_input("role must be plate, partition or other")
+    client = get_supabase_for_caller(g.access_token)
+    try:
+        existing = (client.table("batch_set_memberships").select("id, batch_id")
+                    .eq("id", membership_id).eq("batch_id", batch_id).limit(1).execute()).data or []
+    except APIError as exc:
+        if exc.code == "42501":
+            return _error("CAPABILITY_REQUIRED")
+        raise
+    if not existing:
+        return _error("RECORD_NOT_FOUND")
+    result, err = _caller_table_write(
+        "revise Batch SET component", lambda: client.table("batch_set_memberships")
+        .update({"status": status, "role": role})
+        .eq("id", membership_id).eq("batch_id", batch_id))
+    if err:
+        return err
+    if not (result.data or []):
+        return _error("CAPABILITY_REQUIRED")
+    return _workspace_write_response(client, batch_id, "update_batch_set_membership")
+
+
+@app.route("/batches/<int:batch_id>/rows", methods=["POST"])
+@require_auth
+def create_batch_row(batch_id):
+    """Add one durable Batch row through caller-token RLS and the active lock."""
+    data = request.get_json(force=True) or {}
+    client = get_supabase_for_caller(g.access_token)
+    values, err = _batch_row_input(client, batch_id, data)
+    if err:
+        return err
+
+    batch = (client.table("batches").select("id, plant_id, status")
+             .eq("id", batch_id).limit(1).execute()).data or []
+    if not batch:
+        return _error("RECORD_NOT_FOUND")
+    if batch[0].get("status") not in ("working", "sent"):
+        return _error("TRANSITION_NOT_ALLOWED")
+
+    payload = {
+        **values,
+        "batch_id": batch_id,
+        "plant_id": batch[0]["plant_id"],
+        "status": "active",
+        "created_by": g.caller["id"],
+    }
+    result, err = _caller_table_write(
+        "create Batch row", lambda: client.table("batch_rows").insert(payload))
+    if err:
+        return err
+    if not (result.data or []):
+        return _error("CAPABILITY_REQUIRED")
+    return _workspace_write_response(client, batch_id, "create_batch_row", status=201)
+
+
+@app.route("/batches/<int:batch_id>/rows/<int:row_id>", methods=["PATCH"])
+@require_auth
+def update_batch_row(batch_id, row_id):
+    """Revise mutable row identity fields using the row content-version CAS token."""
+    data = request.get_json(force=True) or {}
+    expected = _int_field(data, "expected_content_version")
+    if expected is None or expected < 1:
+        return _invalid_input("expected_content_version is required")
+
+    client = get_supabase_for_caller(g.access_token)
+    existing = (client.table("batch_rows")
+                .select("id, batch_id, sku_id, status, content_version, waste_override_pct, "
+                        "margin_override_pct, conv_override_rate, freight_override, "
+                        "addon_printing, addon_stitching, addon_coating, addon_handling, "
+                        "addon_moq_charge, addon_packing, addon_other, addon_unloading, fluting_bcf")
+                .eq("id", row_id).eq("batch_id", batch_id).limit(1).execute()).data or []
+    if not existing:
+        return _error("RECORD_NOT_FOUND")
+    row = existing[0]
+    if row.get("status") != "active":
+        return _error("TRANSITION_NOT_ALLOWED")
+    if row.get("content_version") != expected:
+        return _error("STALE_VERSION")
+
+    values, err = _batch_row_input(
+        client, batch_id, data, existing_sku_id=row["sku_id"], existing_overrides=row)
+    if err:
+        return err
+    updates = {key: values[key] for key in (
+        "pricing_group_id", "sku_version_id", "row_type", "material_code",
+        *_BATCH_ROW_NUMERIC_FIELDS)}
+    result, err = _caller_table_write(
+        "update Batch row",
+        lambda: client.table("batch_rows").update(updates)
+        .eq("id", row_id).eq("batch_id", batch_id)
+        .eq("content_version", expected))
+    if err:
+        return err
+    if not (result.data or []):
+        latest = (client.table("batch_rows").select("content_version")
+                  .eq("id", row_id).eq("batch_id", batch_id).limit(1).execute()).data or []
+        if latest and latest[0].get("content_version") != expected:
+            return _error("STALE_VERSION")
+        return _error("CAPABILITY_REQUIRED")
+    return _workspace_write_response(client, batch_id, "update_batch_row")
+
+
+@app.route("/batches/<int:batch_id>/rows/<int:row_id>/status", methods=["PATCH"])
+@require_auth
+def update_batch_row_status(batch_id, row_id):
+    """Reversibly remove or restore one durable row with its CAS token."""
+    data = request.get_json(silent=True) or {}
+    expected = _int_field(data, "expected_content_version")
+    status = (data.get("status") or "").strip().lower()
+    if expected is None or expected < 1:
+        return _invalid_input("expected_content_version is required")
+    if status not in ("active", "removed"):
+        return _invalid_input("status must be active or removed")
+
+    client = get_supabase_for_caller(g.access_token)
+    rows, denied = _optional_caller_rows(
+        client.table("batch_rows").select("id, batch_id, status, content_version")
+        .eq("id", row_id).eq("batch_id", batch_id).limit(1))
+    if denied:
+        return _error("CAPABILITY_REQUIRED")
+    if not rows:
+        return _error("RECORD_NOT_FOUND")
+    row = rows[0]
+    if row.get("content_version") != expected:
+        return _error("STALE_VERSION")
+    if row.get("status") == status:
+        return _invalid_input(f"Batch row is already {status}")
+
+    result, err = _caller_table_write(
+        f"mark Batch row {status}",
+        lambda: client.table("batch_rows").update({"status": status})
+        .eq("id", row_id).eq("batch_id", batch_id).eq("content_version", expected))
+    if err:
+        return err
+    if not (result.data or []):
+        latest = (client.table("batch_rows").select("content_version")
+                  .eq("id", row_id).eq("batch_id", batch_id).limit(1).execute()).data or []
+        if latest and latest[0].get("content_version") != expected:
+            return _error("STALE_VERSION")
+        return _error("CAPABILITY_REQUIRED")
+    return _workspace_write_response(client, batch_id, "update_batch_row_status")
+
+
+@app.route("/batches/<int:batch_id>/rows/<int:row_id>/effective-inputs", methods=["GET"])
+@require_auth
+def get_batch_row_effective_inputs(batch_id, row_id):
+    """Read governed effective inputs and compare them with any persisted calculation.
+
+    This invokes the existing secret-independent gatherer; it never calls the
+    calculation writer and therefore cannot persist a calculation.
+    """
+    client = get_supabase_for_caller(g.access_token)
+    try:
+        rows = (client.table("batch_rows").select("id, batch_id, status, content_version")
+                .eq("id", row_id).eq("batch_id", batch_id).limit(1).execute()).data or []
+    except APIError as exc:
+        if exc.code == "42501":
+            return _error("CAPABILITY_REQUIRED")
+        raise
+    if not rows:
+        return _error("RECORD_NOT_FOUND")
+
+    result, err = _rpc_call(client, "calculate_inputs", {"p_batch_row_id": row_id})
+    if err:
+        return err
+    resolution = result.data or {}
+    binding = resolution.get("binding") or {}
+    calculations, denied = _optional_caller_rows(
+        client.table("batch_calculations").select(
+            "id, batch_row_id, batch_id, calculation_fingerprint, presentation_fingerprint, "
+            "engine_version, schema_version, computed_by, computed_at"
+        ).eq("batch_row_id", row_id).eq("batch_id", batch_id).limit(1))
+    calculation = calculations[0] if calculations else None
+    if denied:
+        freshness = "unknown"
+    elif calculation is None:
+        freshness = "not_calculated"
+    elif calculation.get("calculation_fingerprint") != binding.get("calculation_fingerprint"):
+        freshness = "calculation_stale"
+    elif calculation.get("presentation_fingerprint") != binding.get("presentation_fingerprint"):
+        freshness = "needs_send_only"
+    else:
+        freshness = "fresh"
+    return jsonify({
+        "resolution": resolution,
+        "calculation": calculation,
+        "calculation_details_denied": denied,
+        "freshness": freshness,
+        "mutation": "none",
+        "governed_calculate": "available",
+    })
+
+
+_CALCULATE_EXECUTOR_ERROR_MAP = {
+    "AUTH_REQUIRED": "AUTH_REQUIRED",
+    "42501": "CAPABILITY_REQUIRED",
+    "P0002": "RECORD_NOT_FOUND",
+    "23503": "RECORD_NOT_FOUND",
+    "PT409": "STALE_VERSION",
+    "PT422": "CALCULATION_NOT_READY",
+    "55P03": "LOCK_UNAVAILABLE",
+    "EXECUTOR_NOT_PROVISIONED": "CALCULATION_EXECUTOR_UNAVAILABLE",
+}
+
+
+@app.route("/batches/<int:batch_id>/rows/<int:row_id>/calculate", methods=["POST"])
+@require_auth
+def calculate_batch_row_route(batch_id, row_id):
+    """Run the trusted executor and database writer as the authenticated caller."""
+    client = get_supabase_for_caller(g.access_token)
+    try:
+        rows = (client.table("batch_rows").select("id, batch_id, status, content_version")
+                .eq("id", row_id).eq("batch_id", batch_id).limit(1).execute()).data or []
+    except APIError as exc:
+        if exc.code == "42501":
+            return _error("CAPABILITY_REQUIRED")
+        raise
+    except Exception as exc:
+        if _is_upstream_timeout(exc):
+            return _error("UPSTREAM_TIMEOUT")
+        raise
+    if not rows:
+        return _error("RECORD_NOT_FOUND")
+
+    try:
+        outcome = invoke_calculation_executor(g.access_token, row_id)
+    except Exception as exc:
+        if _is_upstream_timeout(exc):
+            app.logger.error("Calculate executor timed out for Batch row %s", row_id)
+            return _error("UPSTREAM_TIMEOUT")
+        app.logger.error("Calculate executor transport failed for Batch row %s: %s",
+                         row_id, type(exc).__name__)
+        return _error("CALCULATION_EXECUTOR_UNAVAILABLE")
+
+    if outcome.get("status") != 200:
+        upstream_code = outcome.get("error_code")
+        code = _CALCULATE_EXECUTOR_ERROR_MAP.get(upstream_code)
+        if code is None:
+            code = "CALCULATION_EXECUTION_FAILED"
+            app.logger.error("Calculate executor refused Batch row %s with stable code %s",
+                             row_id, upstream_code or "missing")
+        else:
+            app.logger.info("Calculate executor refused Batch row %s: %s -> %s",
+                            row_id, upstream_code, code)
+        return _error(code)
+
+    calculation_id = outcome.get("batch_calculation_id")
+    if isinstance(calculation_id, str) and calculation_id.isdigit():
+        calculation_id = int(calculation_id)
+    if isinstance(calculation_id, bool) or not isinstance(calculation_id, int) or calculation_id <= 0:
+        app.logger.error("Calculate executor returned no valid calculation id for Batch row %s", row_id)
+        return _error("CALCULATION_EXECUTION_FAILED")
+    return jsonify({
+        "batch_calculation_id": calculation_id,
+        "batch_row_id": row_id,
+        "mutation": "calculate_batch_row",
+        "authority": "caller_token_trusted_executor_database_writer",
+    })
+
+
+@app.route("/batches/<int:batch_id>/send", methods=["POST"])
+@require_auth
+def send_batch_route(batch_id):
+    """Atomically create the first immutable, unnumbered draft Quote candidate."""
+    data = request.get_json(silent=True) or {}
+    expected = _int_field(data, "expected_content_version")
+    if expected is None or expected < 1:
+        return _invalid_input("expected_content_version must be a positive integer")
+
+    result, err = _rpc_call(
+        get_supabase_for_caller(g.access_token),
+        "send_batch",
+        {"p_batch": batch_id, "p_expected_content_version": expected},
+        error_map={"PT422": "SEND_NOT_READY"},
+    )
+    if err:
+        return err
+    revision_id = _rpc_scalar_id(result)
+    if revision_id is None:
+        app.logger.error("send_batch returned no valid Quote revision id for Batch %s", batch_id)
+        return _error("INTERNAL_ERROR")
+    return jsonify({
+        "revision_id": revision_id,
+        "batch_id": batch_id,
+        "quote_candidate_status": "draft",
+        "mutation": "atomic_send",
+        "authority": "caller_token_database_rpc",
+    }), 201
+
+
+@app.route("/batches/<int:batch_id>/pricing-groups", methods=["POST"])
+@require_auth
+def create_pricing_group(batch_id):
+    """Add an empty Pricing Group for a genuinely different price schedule."""
+    data = request.get_json(silent=True) or {}
+    label_value = data.get("label")
+    if label_value is not None and not isinstance(label_value, str):
+        return _invalid_input("label must be text or blank")
+    label = (label_value or "").strip()
+    if len(label) > 120:
+        return _invalid_input("label must be 120 characters or fewer")
+
+    client = get_supabase_for_caller(g.access_token)
+    batches = (client.table("batches").select("id, status")
+               .eq("id", batch_id).limit(1).execute()).data or []
+    if not batches:
+        return _error("RECORD_NOT_FOUND")
+    if batches[0].get("status") not in ("working", "sent"):
+        return _error("TRANSITION_NOT_ALLOWED")
+
+    result, err = _caller_table_write(
+        "create Pricing Group", lambda: client.table("pricing_groups").insert({
+            "batch_id": batch_id,
+            "label": label or None,
+            "status": "active",
+            "created_by": g.caller["id"],
+        }))
+    if err:
+        return err
+    if not (result.data or []):
+        return _error("CAPABILITY_REQUIRED")
+    return _workspace_write_response(client, batch_id, "create_pricing_group", status=201)
+
+
+@app.route("/batches/<int:batch_id>/pricing-groups/<int:pricing_group_id>/status", methods=["PATCH"])
+@require_auth
+def update_pricing_group_status(batch_id, pricing_group_id):
+    """Reversibly remove or restore one Pricing Group with its CAS token."""
+    data = request.get_json(silent=True) or {}
+    expected = _int_field(data, "expected_content_version")
+    status = (data.get("status") or "").strip().lower()
+    if expected is None or expected < 1:
+        return _invalid_input("expected_content_version is required")
+    if status not in ("active", "removed"):
+        return _invalid_input("status must be active or removed")
+
+    client = get_supabase_for_caller(g.access_token)
+    groups, denied = _optional_caller_rows(
+        client.table("pricing_groups").select("id, batch_id, status, content_version")
+        .eq("id", pricing_group_id).eq("batch_id", batch_id).limit(1))
+    if denied:
+        return _error("CAPABILITY_REQUIRED")
+    if not groups:
+        return _error("RECORD_NOT_FOUND")
+    group = groups[0]
+    if group.get("content_version") != expected:
+        return _error("STALE_VERSION")
+    if group.get("status") == status:
+        return _invalid_input(f"Pricing Group is already {status}")
+
+    result, err = _caller_table_write(
+        f"mark Pricing Group {status}",
+        lambda: client.table("pricing_groups").update({"status": status})
+        .eq("id", pricing_group_id).eq("batch_id", batch_id)
+        .eq("content_version", expected))
+    if err:
+        return err
+    if not (result.data or []):
+        latest = (client.table("pricing_groups").select("content_version")
+                  .eq("id", pricing_group_id).eq("batch_id", batch_id)
+                  .limit(1).execute()).data or []
+        if latest and latest[0].get("content_version") != expected:
+            return _error("STALE_VERSION")
+        return _error("CAPABILITY_REQUIRED")
+    return _workspace_write_response(client, batch_id, "update_pricing_group_status")
+
+
+@app.route("/batches/<int:batch_id>/delivery-groups", methods=["POST"])
+@require_auth
+def create_delivery_group(batch_id):
+    """Add one route under an existing Pricing Group through caller-token RLS."""
+    data = request.get_json(force=True) or {}
+    client = get_supabase_for_caller(g.access_token)
+    values, err = _delivery_group_input(client, data)
+    if err:
+        return err
+    group_rows = (client.table("pricing_groups").select("id, batch_id, status")
+                  .eq("id", values["pricing_group_id"])
+                  .eq("batch_id", batch_id).limit(1).execute()).data or []
+    if not group_rows:
+        return _error("RECORD_NOT_FOUND")
+    if group_rows[0].get("status") != "active":
+        return _error("TRANSITION_NOT_ALLOWED")
+
+    payload = {**values, "batch_id": batch_id, "status": "active", "created_by": g.caller["id"]}
+    result, err = _caller_table_write(
+        "create Delivery Group", lambda: client.table("delivery_groups").insert(payload))
+    if err:
+        return err
+    if not (result.data or []):
+        return _error("CAPABILITY_REQUIRED")
+    return _workspace_write_response(client, batch_id, "create_delivery_group", status=201)
+
+
+@app.route("/batches/<int:batch_id>/delivery-groups/<int:delivery_group_id>", methods=["PATCH"])
+@require_auth
+def update_delivery_group(batch_id, delivery_group_id):
+    """Complete or revise one caller-visible route while the Batch lock is held."""
+    data = request.get_json(force=True) or {}
+    client = get_supabase_for_caller(g.access_token)
+    values, err = _delivery_group_input(client, data)
+    if err:
+        return err
+    existing = (client.table("delivery_groups").select("id, batch_id, pricing_group_id, status")
+                .eq("id", delivery_group_id).eq("batch_id", batch_id)
+                .eq("pricing_group_id", values["pricing_group_id"]).limit(1).execute()).data or []
+    if not existing:
+        return _error("RECORD_NOT_FOUND")
+    if existing[0].get("status") != "active":
+        return _error("TRANSITION_NOT_ALLOWED")
+
+    updates = {key: values[key] for key in (
+        "label", "bill_to_location_id", "ship_to_location_id")}
+    result, err = _caller_table_write(
+        "update Delivery Group",
+        lambda: client.table("delivery_groups").update(updates)
+        .eq("id", delivery_group_id).eq("batch_id", batch_id)
+        .eq("pricing_group_id", values["pricing_group_id"]))
+    if err:
+        return err
+    if not (result.data or []):
+        return _error("CAPABILITY_REQUIRED")
+    return _workspace_write_response(client, batch_id, "update_delivery_group")
+
+
+@app.route("/batches/<int:batch_id>/delivery-groups/<int:delivery_group_id>/status", methods=["PATCH"])
+@require_auth
+def update_delivery_group_status(batch_id, delivery_group_id):
+    """Reversibly remove or restore one presentation route under the active lock."""
+    data = request.get_json(silent=True) or {}
+    pricing_group_id = _int_field(data, "pricing_group_id")
+    status = (data.get("status") or "").strip().lower()
+    if pricing_group_id is None or pricing_group_id < 1:
+        return _invalid_input("pricing_group_id is required")
+    if status not in ("active", "removed"):
+        return _invalid_input("status must be active or removed")
+
+    client = get_supabase_for_caller(g.access_token)
+    groups = (client.table("pricing_groups").select("id, batch_id, status")
+              .eq("id", pricing_group_id).eq("batch_id", batch_id)
+              .limit(1).execute()).data or []
+    if not groups:
+        return _error("RECORD_NOT_FOUND")
+    if groups[0].get("status") != "active":
+        return _error("TRANSITION_NOT_ALLOWED")
+
+    routes, denied = _optional_caller_rows(
+        client.table("delivery_groups").select(
+            "id, batch_id, pricing_group_id, status")
+        .eq("id", delivery_group_id).eq("batch_id", batch_id)
+        .eq("pricing_group_id", pricing_group_id).limit(1))
+    if denied:
+        return _error("CAPABILITY_REQUIRED")
+    if not routes:
+        return _error("RECORD_NOT_FOUND")
+    route = routes[0]
+    if route.get("status") == status:
+        return _invalid_input(f"Delivery Group is already {status}")
+
+    result, err = _caller_table_write(
+        f"mark Delivery Group {status}",
+        lambda: client.table("delivery_groups").update({"status": status})
+        .eq("id", delivery_group_id).eq("batch_id", batch_id)
+        .eq("pricing_group_id", pricing_group_id).eq("status", route.get("status")))
+    if err:
+        return err
+    if not (result.data or []):
+        return _error("CAPABILITY_REQUIRED")
+    # Deliberately do not clear freight_basis_delivery_group_id.  A removed
+    # selected route remains an explicit unresolved choice until restored or
+    # replaced, which prevents a silent freight fallback (CDM-17).
+    return _workspace_write_response(client, batch_id, "update_delivery_group_status")
+
+
+@app.route("/batches/<int:batch_id>/pricing-groups/<int:pricing_group_id>", methods=["PATCH"])
+@require_auth
+def update_pricing_group(batch_id, pricing_group_id):
+    """Replace one active Pricing Group's governed commercial terms with CAS."""
+    data = request.get_json(force=True) or {}
+    client = get_supabase_for_caller(g.access_token)
+    groups = (client.table("pricing_groups").select(
+        "id, batch_id, status, content_version, legacy_freight_source"
+    ).eq("id", pricing_group_id).eq("batch_id", batch_id).limit(1).execute()).data or []
+    if not groups:
+        return _error("RECORD_NOT_FOUND")
+    existing = groups[0]
+    if existing.get("status") != "active":
+        return _error("TRANSITION_NOT_ALLOWED")
+
+    validated, err = _pricing_group_input(client, batch_id, data, existing)
+    if err:
+        return err
+    expected, updates = validated["expected"], validated["updates"]
+    if existing.get("content_version") != expected:
+        return _error("STALE_VERSION")
+
+    result, err = _caller_table_write(
+        "update Pricing Group commercial terms",
+        lambda: client.table("pricing_groups").update(updates)
+        .eq("id", pricing_group_id).eq("batch_id", batch_id)
+        .eq("content_version", expected))
+    if err:
+        return err
+    if not (result.data or []):
+        latest = (client.table("pricing_groups").select("content_version")
+                  .eq("id", pricing_group_id).eq("batch_id", batch_id)
+                  .limit(1).execute()).data or []
+        if latest and latest[0].get("content_version") != expected:
+            return _error("STALE_VERSION")
+        return _error("CAPABILITY_REQUIRED")
+    return _workspace_write_response(client, batch_id, "update_pricing_group")
+
+
+@app.route("/batches/<int:batch_id>/pricing-groups/<int:pricing_group_id>/freight-basis", methods=["PATCH"])
+@require_auth
+def set_pricing_group_freight_basis(batch_id, pricing_group_id):
+    """Select the one Delivery Group whose Ship-to drives master freight."""
+    data = request.get_json(force=True) or {}
+    expected = _int_field(data, "expected_content_version")
+    delivery_group_id = _int_field(data, "delivery_group_id")
+    if expected is None or expected < 1:
+        return _invalid_input("expected_content_version is required")
+    if delivery_group_id is None or delivery_group_id < 1:
+        return _invalid_input("delivery_group_id is required")
+
+    client = get_supabase_for_caller(g.access_token)
+    groups = (client.table("pricing_groups").select("id, batch_id, status, content_version")
+              .eq("id", pricing_group_id).eq("batch_id", batch_id).limit(1).execute()).data or []
+    if not groups:
+        return _error("RECORD_NOT_FOUND")
+    if groups[0].get("status") != "active":
+        return _error("TRANSITION_NOT_ALLOWED")
+    if groups[0].get("content_version") != expected:
+        return _error("STALE_VERSION")
+    routes = (client.table("delivery_groups")
+              .select("id, pricing_group_id, batch_id, ship_to_location_id, status")
+              .eq("id", delivery_group_id).eq("pricing_group_id", pricing_group_id)
+              .eq("batch_id", batch_id).limit(1).execute()).data or []
+    if not routes:
+        return _error("RECORD_NOT_FOUND")
+    if routes[0].get("status") != "active" or routes[0].get("ship_to_location_id") is None:
+        return _invalid_input("The freight-basis route must be active and have a Ship-to Location.")
+
+    result, err = _caller_table_write(
+        "set Pricing Group freight basis",
+        lambda: client.table("pricing_groups")
+        .update({"freight_basis_delivery_group_id": delivery_group_id})
+        .eq("id", pricing_group_id).eq("batch_id", batch_id)
+        .eq("content_version", expected))
+    if err:
+        return err
+    if not (result.data or []):
+        # The lock may have moved after the read, or another write may have won.
+        latest = (client.table("pricing_groups").select("content_version")
+                  .eq("id", pricing_group_id).eq("batch_id", batch_id)
+                  .limit(1).execute()).data or []
+        if latest and latest[0].get("content_version") != expected:
+            return _error("STALE_VERSION")
+        return _error("CAPABILITY_REQUIRED")
+    return _workspace_write_response(client, batch_id, "set_pricing_group_freight_basis")
+
+
+@app.route("/batches/<int:batch_id>/pricing-basis", methods=["POST"])
+@require_auth
+def set_batch_pricing_basis_route(batch_id):
+    """Persist Pricing Date/Release through public.set_batch_pricing_basis only."""
+    data = request.get_json(force=True) or {}
+    expected = _int_field(data, "expected_content_version")
+    pricing_date = data.get("pricing_date")
+    if expected is None or expected < 1:
+        return _invalid_input("expected_content_version is required")
+    if not _valid_date_only(pricing_date):
+        return _invalid_input("pricing_date must be a valid date in YYYY-MM-DD format")
+    if "release_id" not in data:
+        return _invalid_input("release_id is required; use null to request the automatic default")
+    release_id = None if data.get("release_id") is None else _int_field(data, "release_id")
+    if data.get("release_id") is not None and (release_id is None or release_id < 1):
+        return _invalid_input("release_id must be a positive integer or null")
+
+    client = get_supabase_for_caller(g.access_token)
+    _result, err = _rpc_call(client, "set_batch_pricing_basis", {
+        "p_batch": batch_id,
+        "p_expected_content_version": expected,
+        "p_pricing_date": pricing_date,
+        "p_release": release_id,
+    })
+    if err:
+        return err
+
+    # Read after the atomic RPC: the response proves the durable values that
+    # reopening the Batch will return. No direct table update exists here.
+    try:
+        batch = _read_batch_pricing_basis(client, batch_id=batch_id)
+    except Exception as exc:
+        if _is_upstream_timeout(exc):
+            # The RPC may already have committed. UPSTREAM_TIMEOUT deliberately
+            # instructs the caller to reopen before trying another write.
+            app.logger.error("Batch Pricing Basis read-back timed out upstream: %s", exc)
+            return _error("UPSTREAM_TIMEOUT")
+        raise
+    if batch is None:
+        return _error("RECORD_NOT_FOUND")
+    return jsonify({"batch": batch, "mutation": "set_batch_pricing_basis"})
+
+
 @app.route("/masters/customer-families", methods=["POST"])
 @require_auth
 def propose_customer_family():
@@ -1236,10 +3930,13 @@ def propose_customer_family():
     name = (data.get("name") or "").strip()
     if not name:
         return _invalid_input("name is required")
+    sector_id = _int_field(data, "sector_id")
+    if sector_id is None or sector_id < 1:
+        return _invalid_input("sector_id is required")
 
     result, err = _rpc_call(
         get_supabase_for_caller(g.access_token),
-        "propose_customer_family", {"p_name": name})
+        "propose_customer_family", {"p_name": name, "p_sector": sector_id})
     if err:
         return err
     return jsonify({"id": result.data}), 201
@@ -1262,15 +3959,46 @@ def create_minimal_prospect():
         family_id = _int_field(data, "family_id")
         if family_id is None:
             return _invalid_input("family_id must be an integer")
+    sector_id = None
+    if data.get("sector_id") is not None:
+        sector_id = _int_field(data, "sector_id")
+        if sector_id is None or sector_id < 1:
+            return _invalid_input("sector_id must be a positive integer")
+    if family_id is None and sector_id is None:
+        return _invalid_input("sector_id is required when proposing a new Family")
 
     result, err = _rpc_call(
         get_supabase_for_caller(g.access_token),
         "create_minimal_prospect",
-        {"p_display_name": display_name, "p_family_id": family_id})
+        {"p_display_name": display_name, "p_family_id": family_id, "p_sector": sector_id})
     if err:
         return err
     row = (result.data or [{}])[0]
     return jsonify({"party_id": row.get("party_id"), "family_id": row.get("family_id")}), 201
+
+
+@app.route("/masters/customer-families/<int:family_id>/sectors", methods=["POST"])
+@require_auth
+def add_customer_family_sector(family_id):
+    """Attach another active Sector through the governed CAS operation."""
+    data = request.get_json(force=True) or {}
+    sector_id = _int_field(data, "sector_id")
+    expected = _int_field(data, "expected_content_version")
+    if sector_id is None or sector_id < 1:
+        return _invalid_input("sector_id is required")
+    if expected is None or expected < 1:
+        return _invalid_input("expected_content_version is required")
+
+    _, err = _rpc_call(
+        get_supabase_for_caller(g.access_token),
+        "add_customer_family_sector", {
+            "p_family": family_id,
+            "p_sector": sector_id,
+            "p_expected_content_version": expected,
+        })
+    if err:
+        return err
+    return jsonify({"ok": True})
 
 
 @app.route("/masters/customer-families/<int:family_id>", methods=["PATCH"])

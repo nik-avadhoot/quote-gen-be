@@ -116,6 +116,54 @@ def timed(phase: str):
             "TIMING %-28s %8.1f ms", phase, (time.perf_counter() - start) * 1000)
 
 
+def is_upstream_timeout(exc: BaseException) -> bool:
+    """
+    True when `exc`, or anything in its cause chain, is a transport timeout.
+
+    Walks __cause__/__context__ because supabase-py wraps httpx errors: a
+    timeout usually arrives as a library error whose CAUSE is the
+    httpx.TimeoutException, and testing only the outermost type misses it.
+    """
+    import httpx
+    seen = set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        if isinstance(exc, (httpx.TimeoutException, TimeoutError)):
+            return True
+        exc = exc.__cause__ or exc.__context__
+    return False
+
+
+def _new_caller_transport():
+    """
+    A FRESH httpx.Client for exactly ONE caller client. Never shared, never
+    memoised at module level.
+
+    WHY THIS EXISTS. ClientOptions has postgrest_client_timeout and
+    storage_client_timeout but NO auth/GoTrue timeout field, so the Auth
+    sub-client ran on httpx's DEFAULT Timeout(5.0) while PostgREST was
+    correctly bounded at UPSTREAM_TIMEOUT_SECONDS. That mattered because
+    require_auth calls auth.get_user() on every authenticated request BEFORE
+    any table read: when TLS establishment to Supabase failed intermittently,
+    that call stalled far past every configured bound and no PostgREST request
+    was ever issued - which is exactly what the edge logs showed during the
+    observed stalls.
+
+    Supplying the transport is the only supported way to bound Auth. It is
+    supplied PER CLIENT, so the one-client-per-request and one-client-per-worker
+    boundaries are unchanged: two callers, and two concurrent workers, never
+    share a transport. Verified by tests/test_caller_context.py.
+
+    Both sub-clients of ONE client then share ONE transport. That is not the
+    documented HTTP/2 hazard: that hazard is CONCURRENT use of one client from
+    several threads, which new_caller_client already avoids by giving each
+    worker its own client. Within a request, auth and PostgREST calls are
+    sequential.
+    """
+    import httpx
+    return httpx.Client(timeout=httpx.Timeout(UPSTREAM_TIMEOUT_SECONDS))
+
+
 def _build_caller_client(access_token: str) -> Client:
     return create_client(
         _env("SUPABASE_URL"),
@@ -124,6 +172,13 @@ def _build_caller_client(access_token: str) -> Client:
             headers={"Authorization": f"Bearer {access_token}"},
             auto_refresh_token=False,
             persist_session=False,
+            # Bounds the AUTH transport, which no ClientOptions field can reach.
+            httpx_client=_new_caller_transport(),
+            # Retained deliberately. Supplying httpx_client makes both
+            # sub-clients use that transport, so these are no longer what
+            # bounds PostgREST - but they are kept so the intended bound is
+            # still stated here, and a test asserts PostgREST really is finite
+            # and equal to UPSTREAM_TIMEOUT_SECONDS rather than assuming it.
             postgrest_client_timeout=UPSTREAM_TIMEOUT_SECONDS,
             storage_client_timeout=UPSTREAM_TIMEOUT_SECONDS,
         ),
@@ -196,6 +251,50 @@ def get_supabase_for_caller(access_token: str) -> Client:
     g._qos_caller_client = client
     g._qos_caller_token = access_token
     return client
+
+
+def invoke_calculation_executor(access_token: str, batch_row_id: int) -> dict:
+    """Invoke the trusted Calculate executor with the caller's own JWT.
+
+    The publishable key only identifies the Supabase project. Authorization and
+    every database read/write still run under ``access_token``; no service-role
+    credential is available on this path. Only the executor's stable code and
+    calculation id cross back into Flask, so an upstream database message can
+    never become a browser response accidentally.
+    """
+    if not access_token or not isinstance(access_token, str):
+        raise ValueError("access_token is required to invoke Calculate")
+    if isinstance(batch_row_id, bool) or not isinstance(batch_row_id, int) or batch_row_id <= 0:
+        raise ValueError("batch_row_id must be a positive integer")
+
+    req = urllib.request.Request(
+        _env("SUPABASE_URL").rstrip("/") + "/functions/v1/calculate-batch-row",
+        data=json.dumps({"batch_row_id": batch_row_id}).encode(),
+        headers={
+            "apikey": _env("SUPABASE_PUBLISHABLE_KEY"),
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+
+    def result(status: int, raw: bytes) -> dict:
+        try:
+            payload = json.loads(raw.decode() or "{}")
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            payload = {}
+        return {
+            "status": status,
+            "error_code": payload.get("error_code") if isinstance(payload, dict) else None,
+            "batch_calculation_id": payload.get("batch_calculation_id")
+                if isinstance(payload, dict) else None,
+        }
+
+    try:
+        with urllib.request.urlopen(req, timeout=UPSTREAM_TIMEOUT_SECONDS) as resp:
+            return result(resp.status, resp.read(65537))
+    except urllib.error.HTTPError as exc:
+        return result(exc.code, exc.read(65537))
 
 
 def privileged_client(operation: str) -> Client:

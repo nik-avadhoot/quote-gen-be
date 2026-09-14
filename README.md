@@ -1,101 +1,92 @@
-# CFB Quotation Master — Backend
+# CFB Quotation Master — backend
 
-Stateless Flask API for the CFB Quotation Operating System (APSPL, CFB Division).
-Its only job is to fill the Excel master template with quote data posted by the
-frontend and return the workbook as a download.
+Flask API and Supabase repository for the CFB Quotation Operating System. It provides authenticated
+application routes, caller-scoped Supabase access, database migrations/tests, the retained
+`calculate-batch-row` Edge Function source, and Excel-template export.
 
-Frontend repo: https://github.com/nik-avadhoot/quote-gen-fe
-
-## Structure
-
-```
-├── server.py                     # Flask app — all routes, and the Vercel entry point
-├── vercel.json                   # Routes every path to the Flask app
-├── requirements.txt              # Pinned Python dependencies
-├── schema.sql                    # SQLite schema (design reference — unused, see below)
-├── CFB_Quotation_Master_v7.xlsx  # Excel master template
-└── docs/                         # Costing manual & project brief
-```
-
-## API
-
-| Route | Method | Description |
-|-------|--------|-------------|
-| `/health` | GET | Confirms the server is up and the Excel template is present |
-| `/export` | POST | Fills the template from posted JSON, returns an `.xlsx` download |
+Frontend repository: [`../quote-gen-fe`](../quote-gen-fe). Start with
+[`AGENTS.md`](AGENTS.md) and the shared
+[`../quote-gen-fe/docs/current-state.md`](../quote-gen-fe/docs/current-state.md).
 
 ## Local development
 
-```bash
-python -m venv venv && venv\Scripts\activate.bat
+```powershell
+python -m venv venv
+.\venv\Scripts\Activate.ps1
 pip install -r requirements.txt
-python server.py            # → http://localhost:3001
+python server.py
 ```
 
-### ⚠️ OPEN QUESTION — a running process cannot be identified, so backend verification is unfalsifiable
+The API normally runs at `http://localhost:3001`. `GET /health` reports service, template, and
+Supabase-configuration availability; it does not prove which source revision a pre-existing process
+has loaded, so restart deliberately before route verification.
 
-**Read this before verifying any backend change.**
+## Repository map
 
-Nothing exposed by a running server says *which code it is running*:
+- `server.py`: Flask application, route orchestration, and Excel exporter.
+- `auth.py`, `caller_context.py`, `supabase_client.py`: authentication, capability enforcement, and
+  caller/privileged Supabase clients.
+- `supabase/migrations/`: immutable ordered schema, function, grant, and database-test history.
+- `supabase/functions/calculate-batch-row/`: retained S9 Edge Function and generated engine bundle.
+- `tests/test_*.py`: focused executable backend checks.
+- `scripts/`: Edge engine bundling/executor fixtures and scoped dataset helpers.
+- `CFB_Quotation_Master_v7.xlsx`: source workbook template used by `/export`.
+- `docs/CFB_QOS_Project_Brief_v3.md`: August 2026 source business document; its architecture snapshot
+  is historical.
 
-* the startup banner prints `v2.0` — a **hardcoded constant**, unchanged across every commit
-* `/health` returns `ok`, `template`, `path`, `supabase` — **no version, no commit SHA**
-* there is no `__version__` anywhere in the codebase
-* `server.py` ends in `app.run(port=3001, debug=False)` — **the reloader is OFF**, so a running
-  process is frozen at whatever it loaded at startup and never picks up an edit on disk
+## API families
 
-**The cost, stated plainly: without a version signal, *"I restarted it"* is an assertion nobody can
-check** — not the person who said it, and not a reviewer afterwards. A verification run against a
-stale process is indistinguishable from one against a fixed process, and both produce a
-confident-looking result.
+The current Flask app includes:
 
-This is not hypothetical. During the 2026-08 defect pass a backend fix was about to be tested
-against a process that could not have contained it — the fix was uncommitted on disk and the
-reloader was off — and the test would have returned a clean "no difference" that read as evidence
-of a defect in correct code. It was caught by reading the `app.run` line, not by anything the server
-reported.
+- health and Excel export;
+- login, refresh, logout, profile/password/email, and user administration;
+- caller-scoped Producing Plant, Customer Family, Customer Location, Construction, and Pricing Basis
+  reads/mutations;
+- governed Batch creation, locks, workspace, rows, sets, pricing/delivery groups, Calculate, and
+  Atomic Send routes;
+- Quote catalogue/workspace reads.
 
-**Suggested fix, trivial and NOT RULED:** put a commit SHA or build stamp in `/health` and in the
-startup banner. Left open deliberately — it is small but carries a design question (where the
-stamp comes from in a Vercel build versus a local run), and it was out of scope for the pass that
-found it.
+Route presence does not prove deployed activation or end-to-end verification. Inspect `server.py`
+and its focused tests for the exact current contract.
 
-Until then: **restart before verifying, and treat every backend result as provisional on that.**
+## Environment boundary
 
-## Environment
+The backend reads configuration such as `CORS_ORIGINS`, `SUPABASE_URL`, a publishable/anonymous key,
+the backend-only privileged key, and optional timing/timeout settings. Values belong in approved
+local/deployment secret-management surfaces, never in documentation or Git. Do not expose a
+privileged key to the frontend.
 
-| Variable | Required | Description |
-|----------|----------|-------------|
-| `CORS_ORIGINS` | Optional | Comma-separated allowed browser origins. Defaults to `https://quote-gen-fe.vercel.app` plus the local Vite dev server. Set it to override — e.g. to add a custom domain or a preview URL. |
+The Edge Function expects its own attestation configuration. Production attestation material has
+not been provisioned; do not invent, inspect, or commit it during ordinary development.
 
-## Deploying to Vercel
+## S9 status
 
-Import this repo — no configuration needed. `vercel.json` builds `server.py`
-with `@vercel/python` and routes every path to it.
+The S9 migrations and recorded automated database verification are complete. Production secret
+provisioning, Edge Function deployment/activation, authenticated Calculate/Send/workflow proof,
+runtime Maker/Checker/Admin proof, the genuine browser and persistent journey, and Product Owner
+validation remain incomplete. S9 is not technically or Product Owner closed.
 
-Note the config uses `builds`/`routes` rather than `rewrites`. A `rewrite`
-*replaces* the request path, so the Flask app would receive the rewrite
-destination instead of `/health` or `/export` and match no route. `routes`
-hands the WSGI app the original path.
+## Verification
 
-The default CORS origins already cover `https://quote-gen-fe.vercel.app`. Set
-`CORS_ORIGINS` under Project Settings → Environment Variables only if the
-frontend lives somewhere else — a custom domain, or a preview deployment, which
-gets its own unique `*.vercel.app` domain.
+Run the standalone test file(s) that exercise the changed route or authority boundary, for example:
 
-Verify with `GET /health` — it must report `"template": true`.
+```powershell
+python tests/test_batch_calculate_send_routes.py
+python tests/test_quote_workspace_route.py
+python tests/test_auth_transport_bound.py
+```
 
-Note: Vercel Hobby caps function execution at 10s. Loading and saving the 77 KB
-template fits comfortably, but a cold start plus that work can approach the
-limit. The frontend has a client-side export fallback if a request times out.
+For Edge engine work, use the repository bundling and executor-fixture scripts and verify generated
+bundle fidelity. Database changes require the directly related database suite and security/grant
+checks. Documentation-only changes need no application regression suite.
 
-## No database
+## Non-negotiable boundaries
 
-There is no database. All quote state lives in the browser's `localStorage`,
-with JSON backup/restore in the frontend.
-
-`schema.sql` is a forward-looking design document — no code reads or writes it.
-When persistence is added, note that Vercel's filesystem is read-only at
-runtime: a committed SQLite file can be read (open it with
-`mode=ro&immutable=1`, since the schema's WAL mode needs directory write access)
-but never written. Durable storage needs a hosted database.
+- Run application data access as the authenticated caller unless a documented admin-only operation
+  requires the privileged client.
+- Never edit, rename, or delete an applied migration.
+- Preserve tenant/plant isolation, capability checks, optimistic concurrency, calculation authority,
+  Quote/audit history, and immutable revisions.
+- Keep frontend and backend calculation/export mirrors aligned; valid zeroes must not become
+  fallbacks.
+- Do not deploy or change live Supabase unless the task explicitly authorises it.

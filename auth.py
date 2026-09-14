@@ -36,6 +36,7 @@ from caller_context import (
     resolve_caller,
     has_group_capability,
     has_plant_capability,
+    is_upstream_timeout,
 )
 
 
@@ -54,11 +55,33 @@ def require_auth(f):
             return jsonify({"error": "Missing Authorization header"}), 401
 
         # Verify the token against Supabase Auth using a per-request client.
+        #
+        # A TIMEOUT IS NOT AN INVALID TOKEN. This used to answer 401 for every
+        # exception, which said "your token is bad" when the truth was "we could
+        # not reach Auth to ask". The token may be perfectly valid. The two are
+        # now separated: a transport timeout is the upstream's failure and is
+        # reported as 504 UPSTREAM_TIMEOUT; everything else keeps its 401.
+        #
+        # The bound itself lives in caller_context._new_caller_transport(): the
+        # Auth sub-client had no configurable timeout and ran on httpx's default
+        # 5s, so this is what makes the refusal ARRIVE rather than merely be
+        # caught. Catching a timeout does not enforce one.
         try:
             with timed("auth.verify_token"):
                 client = get_supabase_for_caller(token)
                 user_resp = client.auth.get_user(token)
-        except Exception:
+        except Exception as exc:
+            if is_upstream_timeout(exc):
+                # Fixed, non-sensitive wording, and deliberately NOT the
+                # write-oriented UPSTREAM_TIMEOUT text used by the mutation
+                # routes: nothing was being saved here. This is verification of
+                # a read request, so "the outcome may have been saved" would be
+                # both wrong and alarming.
+                return jsonify({
+                    "error_code": "UPSTREAM_TIMEOUT",
+                    "error": "Authentication verification did not respond in time. "
+                             "Please try again.",
+                }), 504
             return jsonify({"error": "Invalid or expired token"}), 401
         if not user_resp or not user_resp.user:
             return jsonify({"error": "Invalid or expired token"}), 401
@@ -67,10 +90,28 @@ def require_auth(f):
         # The Auth uuid was just verified above, so hand it over rather than
         # making resolve_caller re-fetch it (D1: that was a second full
         # auth.get_user() round-trip on every administrator request).
+        #
+        # SAME DISTINCTION AS ABOVE, ON THE DATABASE SIDE. resolve_caller reads
+        # app_users and the grant tables through PostgREST, so it can time out
+        # too. That used to fall into the generic handler and answer 403
+        # "Could not resolve account" - which asserts something about the
+        # ACCOUNT when the truth is that the database did not answer. The
+        # account may be perfectly fine. A timeout is the upstream's failure and
+        # is reported as such; every other database error keeps its sanitized
+        # 403, and the separate "not active" 403 below still means exactly what
+        # it says: resolution COMPLETED and returned no active caller.
         try:
             with timed("auth.resolve_caller"):
                 caller = resolve_caller(token, known_auth_uid=user_resp.user.id)
-        except Exception:
+        except Exception as exc:
+            if is_upstream_timeout(exc):
+                # Read-oriented wording again: require_auth verifies, it does
+                # not write, so nothing here may have been saved.
+                return jsonify({
+                    "error_code": "UPSTREAM_TIMEOUT",
+                    "error": "Account verification did not respond in time. "
+                             "Please try again.",
+                }), 504
             # Never leak the database error: it can carry table and column names.
             return jsonify({"error": "Could not resolve account"}), 403
         if not caller:
