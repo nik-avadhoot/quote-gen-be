@@ -30,7 +30,7 @@ has loaded, so restart deliberately before route verification.
 - `supabase/functions/calculate-batch-row/`: retained S9 Edge Function and generated engine bundle.
 - `tests/test_*.py`: focused executable backend checks.
 - `scripts/`: Edge engine bundling/executor fixtures and scoped dataset helpers.
-- `CFB_Quotation_Master_v7.xlsx`: source workbook template used by `/export`.
+- `AvadhootPacks_Quotation_Master_v7.xlsx`: source workbook template used by `/export` (renamed from `CFB_Quotation_Master_v7.xlsx`).
 - `docs/CFB_QOS_Project_Brief_v3.md`: August 2026 source business document; its architecture snapshot
   is historical.
 

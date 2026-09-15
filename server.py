@@ -2,7 +2,7 @@
 CFB Quotation Master — Export Server  (v2.0)
 ============================================
 Stateless Flask API. Its only job is to fill the Excel master template
-(CFB_Quotation_Master_v7.xlsx) with quote data posted by the frontend and
+(AvadhootPacks_Quotation_Master_v7.xlsx) with quote data posted by the frontend and
 return the workbook as a download.
 
 Local development:
@@ -17,7 +17,7 @@ Environment:
                   Defaults to the local Vite dev server when unset.
 
 Template:
-    CFB_Quotation_Master_v7.xlsx must sit in the SAME folder as this file.
+    AvadhootPacks_Quotation_Master_v7.xlsx must sit in the SAME folder as this file.
 """
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -110,7 +110,7 @@ if TIMING_ENABLED:
 
 # Path to the Excel master template — must sit beside this file
 TEMPLATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                             "CFB_Quotation_Master_v7.xlsx")
+                             "AvadhootPacks_Quotation_Master_v7.xlsx")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -192,7 +192,7 @@ def health():
 def export_xlsx():
     """
     Receives the complete quote data from the frontend, fills the Excel
-    master template (CFB_Quotation_Master_v7.xlsx), and returns the file
+    master template (AvadhootPacks_Quotation_Master_v7.xlsx), and returns the file
     as a download.
     """
     if not os.path.exists(TEMPLATE_PATH):
