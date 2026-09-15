@@ -202,7 +202,7 @@ def export_xlsx():
     items      = data.get("items",   [])
     rates      = data.get("rates",   [])
     freight    = data.get("freight", {})
-    fname      = data.get("filename", "CFB_Quote.xlsx")
+    fname      = data.get("filename", "AvadhootPacks_Quote.xlsx")
     # Fix 9: read meta fields sent by the frontend
     quote_ref       = data.get("quoteRef",      "")
     maker_name      = data.get("makerName",     "")
