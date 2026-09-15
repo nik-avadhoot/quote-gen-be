@@ -219,6 +219,16 @@ check(snapshot["calculated_by_actor"]["display_name"] == "Maker"
 check(all(not action["enabled"] and action["reason"] == "backend_activation_pending"
           for action in quote["actions"].values()),
       "U5-BE-8 every governed Quote mutation remains activation-blocked")
+check(set(quote["actions"]) == {
+          "calculate", "send", "submit", "approve", "return", "withdraw",
+          "issue", "create_revision", "amend", "reprice",
+      },
+      "U5-BE-8a the read contract names the complete accepted pending workflow")
+check(current["items"][0]["pricing_group_id"] == 81
+      and current["items"][0]["calculation_snapshot_id"] == 801
+      and snapshot["freight_set_version_id"] == 31
+      and snapshot["freight_entry_id"] == 32,
+      "U5-BE-8b exact Item and governed Freight version identities remain available")
 check(CALLS and all(call[0] == "tok-u5" for call in CALLS),
       "U5-BE-9 every Quote and supporting evidence read carries the genuine caller token")
 

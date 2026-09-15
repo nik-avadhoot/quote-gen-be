@@ -2172,7 +2172,7 @@ def _read_quote_workspace(client, quote_reference=None, revision_id=None, batch_
     family["denied_sections"] = sorted(set(denied))
     family["actions"] = {
         name: {"enabled": False, "reason": "backend_activation_pending"}
-        for name in ("calculate", "send", "approve", "return", "withdraw",
+        for name in ("calculate", "send", "submit", "approve", "return", "withdraw",
                      "issue", "create_revision", "amend", "reprice")
     }
     return family
