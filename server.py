@@ -939,6 +939,77 @@ def list_plants():
     })
 
 
+@app.route("/masters/gsm-values", methods=["GET"])
+@require_auth
+def list_paper_gsm_values():
+    """
+    The GSM Master, read as the caller.
+
+    Any authenticated caller may read it: the values populate construction
+    layer pickers in Costing and the Construction Library, and a Maker without
+    Construction Library rights still has to choose a GSM. Maintenance is the
+    governed add/retire/restore operations below (manage_construction_library).
+
+    A refused or missing table (the migration not yet activated here) answers
+    MASTER_UNAVAILABLE, never an empty list, so "no GSM values" is never
+    presented as the truth.
+    """
+    try:
+        rows = (get_supabase_for_caller(g.access_token)
+                .table("paper_gsm_values")
+                .select("id, gsm, status, content_version").execute()).data or []
+    except APIError as exc:
+        app.logger.error("GSM Master read refused: %s %s", exc.code, exc.message)
+        return _error("MASTER_UNAVAILABLE")
+    except Exception as exc:
+        if _is_upstream_timeout(exc):
+            app.logger.error("GSM Master read timed out upstream: %s", exc)
+            return _error("UPSTREAM_TIMEOUT")
+        raise
+    rows.sort(key=lambda r: (r.get("gsm") is None, r.get("gsm") or 0))
+    return jsonify({
+        "values": rows,
+        "can_manage": "manage_construction_library" in (g.caller.get("group_capabilities") or []),
+    })
+
+
+@app.route("/masters/gsm-values", methods=["POST"])
+@require_auth
+def add_paper_gsm_value():
+    """Add one GSM value through public.add_paper_gsm_value only."""
+    data = request.get_json(force=True) or {}
+    gsm = _int_field(data, "gsm")
+    if gsm is None or gsm < 1 or gsm > 2000:
+        return _invalid_input("gsm must be a whole number between 1 and 2000")
+    result, err = _rpc_call(
+        get_supabase_for_caller(g.access_token), "add_paper_gsm_value", {"p_gsm": gsm})
+    if err:
+        return err
+    return jsonify({"id": result.data}), 201
+
+
+@app.route("/masters/gsm-values/<int:value_id>/status", methods=["POST"])
+@require_auth
+def set_paper_gsm_value_status(value_id):
+    """Retire or restore a GSM value (CAS). The number itself is never edited in place."""
+    data = request.get_json(force=True) or {}
+    status = data.get("status")
+    expected = _int_field(data, "expected_content_version")
+    if status not in ("active", "retired"):
+        return _invalid_input("status must be active or retired")
+    if expected is None or expected < 1:
+        return _invalid_input("expected_content_version is required")
+    _, err = _rpc_call(
+        get_supabase_for_caller(g.access_token), "set_paper_gsm_value_status", {
+            "p_id": value_id,
+            "p_status": status,
+            "p_expected_content_version": expected,
+        })
+    if err:
+        return err
+    return jsonify({"ok": True})
+
+
 @app.route("/masters/pricing-basis-releases", methods=["GET"])
 @require_auth
 def list_pricing_basis_releases():
@@ -1701,6 +1772,7 @@ _ERROR_STATUS = {
     "SEND_NOT_READY": 422,
     "CALCULATION_EXECUTOR_UNAVAILABLE": 503,
     "CALCULATION_EXECUTION_FAILED": 500,
+    "MASTER_UNAVAILABLE": 503,
     # A genuine serialization failure is transient: the caller may safely retry
     # the SAME request unchanged. Distinct from STALE_VERSION, where retrying
     # unchanged is guaranteed to fail again.
@@ -1724,6 +1796,7 @@ _ERROR_MESSAGE = {
     "SEND_NOT_READY": "This Batch is not ready to create an immutable draft Quote candidate.",
     "CALCULATION_EXECUTOR_UNAVAILABLE": "Governed Calculate is not available in this environment.",
     "CALCULATION_EXECUTION_FAILED": "The governed calculation executor could not produce a valid result.",
+    "MASTER_UNAVAILABLE": "This master is not available in this environment.",
     "SERIALIZATION_FAILURE": "The database could not complete that under concurrent load. "
                              "Nothing was changed — please try again.",
     # D2 CORRECTION. This must NOT claim the write did not happen. A client-side
