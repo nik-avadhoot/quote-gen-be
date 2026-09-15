@@ -11,7 +11,7 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 SQL = (ROOT / "supabase" / "migrations" /
-       "20260912183000_u4_customer_family_sectors.sql").read_text(encoding="utf-8")
+       "20260915100440_u4_customer_family_sectors.sql").read_text(encoding="utf-8")
 
 PASSES, FAILURES = 0, []
 
