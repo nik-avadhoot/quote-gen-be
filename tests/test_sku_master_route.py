@@ -52,6 +52,7 @@ def check(condition, label):
 CALLS = []
 FAIL_TABLE = None
 RAISE_API_ERROR = False
+SCHEMA_PENDING = False
 CALLER = None
 _PLAIN = re.compile(r"^[a-z_][a-z0-9_]*$")
 
@@ -119,6 +120,11 @@ class FakeQuery:
     def execute(self):
         CALLS.append({"token": self.token, "table": self.table, "columns": self.columns,
                       "filters": list(self.filters), "limit": self.limit_n})
+        # Amendment 02 migration not activated: its columns and tables do not exist.
+        if SCHEMA_PENDING and self.table in ("sku_sets", "sku_set_members"):
+            raise server.APIError({"code": "PGRST205", "message": "Could not find the table"})
+        if SCHEMA_PENDING and self.table == "sku_versions" and "print_technology" in str(self.columns):
+            raise server.APIError({"code": "42703", "message": "column sku_versions.item_name does not exist"})
         if self.table == FAIL_TABLE:
             if RAISE_API_ERROR:
                 raise server.APIError({"code": "42501", "message": "permission denied"})
@@ -188,11 +194,21 @@ BASE_ROWS = {
         {"id": 1001, "sku_id": 101, "plant_id": 7, "version_no": 1, "construction_version_id": 41,
          "is_price_driving": True, "length_mm": 300.0, "width_mm": 200.0, "height_mm": 0, "box_type": "RSC",
          "ups": 1, "spec_bs": None, "spec_bct": 0, "spec_ect": None,
-         "approved_at": "2026-09-01T00:00:00Z", "approved_by": 3, "created_by": 3},
+         "approved_at": "2026-09-01T00:00:00Z", "approved_by": 3, "created_by": 3,
+         "item_name": "Fixture Carton 375", "item_short_name": "FC 375", "item_family": "RSC",
+         "item_group": "2L+2W+F", "print_quality": "As per Approved Artwork", "print_technology": "Flexo",
+         "number_of_colours": 0, "colour_detail": "PANTONE 490 C", "cobb_value": "NA",
+         "stated_item_gsm": "470 -/+ 3%", "item_weight_kg": 0.3, "stated_cs": "150 KGF",
+         "stated_bs": "MIN 8.5", "stated_ect": None, "customer_spec_version": "SPEC-7 v2"},
         {"id": 1002, "sku_id": 101, "plant_id": 7, "version_no": 2, "construction_version_id": 42,
          "is_price_driving": False, "length_mm": 300.0, "width_mm": 200.0, "height_mm": None, "box_type": "RSC",
          "ups": 2, "spec_bs": 12.5, "spec_bct": None, "spec_ect": 0,
-         "approved_at": None, "approved_by": None, "created_by": 3},
+         "approved_at": None, "approved_by": None, "created_by": 3,
+         "item_name": "Fixture Carton 375", "item_short_name": "FC 375", "item_family": "RSC",
+         "item_group": "2L+2W+F", "print_quality": None, "print_technology": None,
+         "number_of_colours": None, "colour_detail": None, "cobb_value": None,
+         "stated_item_gsm": None, "item_weight_kg": 0, "stated_cs": None,
+         "stated_bs": None, "stated_ect": None, "customer_spec_version": None},
         {"id": 1003, "sku_id": 103, "plant_id": 7, "version_no": 1, "construction_version_id": 41,
          "is_price_driving": True, "length_mm": 250.0, "width_mm": 150.0, "height_mm": 0, "box_type": "RSC",
          "ups": 1, "spec_bs": None, "spec_bct": None, "spec_ect": None,
@@ -203,6 +219,20 @@ BASE_ROWS = {
          "reference_value": "CUST-778", "status": "active", "created_by": 3},
         {"id": 2, "sku_id": 101, "plant_id": 7, "reference_kind": "alias",
          "reference_value": "Old carton", "status": "withdrawn", "created_by": 3},
+        {"id": 3, "sku_id": 101, "plant_id": 7, "reference_kind": "softcomp_code",
+         "reference_value": "011145", "status": "active", "created_by": 3},
+    ],
+    "sku_sets": [
+        {"id": 51, "plant_id": 7, "set_label": "NAG-IT-0001", "status": "confirmed", "content_version": 2,
+         "created_by": 3},
+    ],
+    "sku_set_members": [
+        {"id": 61, "set_id": 51, "sku_id": 102, "plant_id": 7, "role": "partition", "qty_per_set": 2,
+         "status": "confirmed", "created_by": 3},
+        {"id": 60, "set_id": 51, "sku_id": 101, "plant_id": 7, "role": "box", "qty_per_set": 1,
+         "status": "confirmed", "created_by": 3},
+        {"id": 62, "set_id": 51, "sku_id": 104, "plant_id": 7, "role": "plate", "qty_per_set": 1.5,
+         "status": "proposed", "created_by": 3},
     ],
     "sku_location_applicabilities": [
         {"id": 11, "sku_id": 101, "plant_id": 7, "party_id": 501, "location_id": 601, "scope": "master",
@@ -233,7 +263,10 @@ BASE_ROWS = {
     ],
     "construction_versions": [
         {"id": 41, "construction_id": 5, "version_no": 2, "ply": 5, "flute_f1": "B", "flute_f2": "A",
-         "board_gsm": 780, "approved_at": "2026-02-01T00:00:00Z", "approved_by": 3},
+         "board_gsm": 780, "approved_at": "2026-02-01T00:00:00Z", "approved_by": 3,
+         "layer_top_code": "28", "layer_top_gsm": 150, "layer_f1_code": "16", "layer_f1_gsm": 120,
+         "layer_l1_code": "18", "layer_l1_gsm": 150, "layer_f2_code": None, "layer_f2_gsm": None,
+         "layer_l2_code": "0", "layer_l2_gsm": 0},
     ],
     "constructions": [
         {"id": 5, "construction_code": "CON-000125", "name": "5-ply BC RSC", "status": "published"},
@@ -413,18 +446,28 @@ check(versions[1]["construction"] is None and versions[1]["construction_version_
       "SKU-12c an unreadable Construction version is null with its id, never a guessed or current Construction")
 check(versions[0]["plant_adoption"] == ["adopted"] and versions[1]["plant_adoption"] == [],
       "SKU-12d plant adoption is for the SKU's OWN plant only")
-check(body["unrecorded_specification_fields"] == ["printing_technology", "number_of_colours"]
-      and "printing_technology" not in spec1 and "number_of_colours" not in spec1,
-      "SKU-12e Printing Technology and colour count are declared unrecorded, not manufactured")
+qf1, qf2 = versions[0]["quote_fields"], versions[1]["quote_fields"]
+check(qf1["print_technology"] == "Flexo" and qf1["number_of_colours"] == 0 and qf1["cobb_value"] == "NA"
+      and qf1["item_weight_kg"] == 0.3 and qf1["stated_ect"] is None
+      and qf2["print_technology"] is None and qf2["item_weight_kg"] == 0,
+      "SKU-12e CDM-43 quote fields return per version with blank, NA and zero kept apart")
+check(body["schema_pending"] == {"quote_fields": False, "sku_sets": False}
+      and "unrecorded_specification_fields" not in body,
+      "SKU-12e2 with the migration active nothing is reported pending")
 check(body["detail_visibility"] == {"customer": "visible", "construction": "visible",
-                                    "plant_adoption": "visible", "locations": "visible"},
+                                    "plant_adoption": "visible", "locations": "visible", "sets": "visible"},
       "SKU-12f detail visibility is reported per section")
+check(versions[0]["construction"]["layers"]["top"] == {"bf": "28", "gsm": 150}
+      and versions[0]["construction"]["layers"]["flute_2"] == {"bf": None, "gsm": None}
+      and versions[0]["construction"]["layers"]["back_2"] == {"bf": "0", "gsm": 0},
+      "SKU-12g Construction board layers return BF and GSM per layer, blank and zero kept apart")
 
 # ─────────────────────────────── SKU-13 references and Location applicability
 refs = body["external_references"]
 check([(x["reference_kind"], x["reference_value"], x["status"]) for x in refs]
-      == [("customer_item_code", "CUST-778", "active"), ("alias", "Old carton", "withdrawn")],
-      "SKU-13 external references keep their kind, value and withdrawn status")
+      == [("customer_item_code", "CUST-778", "active"), ("alias", "Old carton", "withdrawn"),
+          ("softcomp_code", "011145", "active")],
+      "SKU-13 external references keep their kind, value and withdrawn status, SoftComp included")
 apps = {a["location_id"]: a for a in body["location_applicability"]}
 check(apps[601]["scope"] == "master" and apps[601]["approved"] is True
       and apps[601]["location"]["location_code"] == "LOC-601",
@@ -508,6 +551,82 @@ with app.test_client() as client:
     check(client.post("/masters/skus", headers=AUTH, json={}).status_code == 405
           and client.patch("/masters/skus/101", headers=AUTH, json={}).status_code == 405,
           "SKU-18b no create or edit method exists on the SKU Master routes")
+
+# ─────────────────────────────────────────── SKU-19 SKU Sets (CDM-44)
+CALLER = FULL
+r, body = get("/masters/skus/101")
+sets = body["sets"]
+check(len(sets) == 1 and sets[0]["label"] == "NAG-IT-0001" and sets[0]["role"] == "box"
+      and sets[0]["qty_per_set"] == 1 and sets[0]["member_status"] == "confirmed",
+      "SKU-19 a SKU returns the master SKU Set it belongs to, with its own role and quantity per set")
+members = sets[0]["members"]
+check([m["role"] for m in members] == ["box", "plate", "partition"]
+      and [m["qty_per_set"] for m in members] == [1, 1.5, 2],
+      "SKU-19a every member is listed box, plate, partition with its own quantity per set")
+check(members[1]["sku_id"] == 104 and members[1]["plant_item_code"] == "NAG-IT-0004"
+      and members[1]["status"] == "proposed",
+      "SKU-19b a member's identity comes from its own SKU row by id, never from code text")
+check(any(("in", "set_id", [51]) in c["filters"] for c in calls_to("sku_set_members")),
+      "SKU-19c siblings are read by set id")
+r, body = get("/masters/skus/103")
+check(body["sets"] == [],
+      "SKU-19d a SKU in no set returns an empty set list, not a guessed family")
+
+# ───────────────────────────────── SKU-20 catalogue carries the quote row
+r, body = get("/masters/skus?plant=NAG")
+by_id = {row["id"]: row for row in body["skus"]}
+row101 = by_id[101]
+check(row101["latest_version"]["quote_fields"]["item_name"] == "Fixture Carton 375"
+      and row101["latest_version"]["ups"] == 2 and row101["latest_version"]["spec_ect"] == 0,
+      "SKU-20 catalogue rows carry the latest version's quote fields and costing inputs")
+check(row101["construction"] is None and row101["latest_version"]["construction_version_id"] == 42,
+      "SKU-20a an unreadable latest Construction version stays null with its id")
+check(by_id[103]["construction"]["construction_code"] == "CON-000125"
+      and by_id[103]["construction"]["layers"]["flute_1"] == {"bf": "16", "gsm": 120},
+      "SKU-20b a readable Construction version returns its code and layers on the row")
+check(row101["references"] == {"customer_item_code": ["CUST-778"], "softcomp_code": ["011145"]},
+      "SKU-20c active Customer Item Code and SoftComp references return; withdrawn ones do not")
+check([l["location_code"] for l in row101["locations"]] == ["LOC-601", None],
+      "SKU-20d Location applicability returns codes the caller can read, null otherwise")
+check(row101["sets"][0]["role"] == "box" and by_id[102]["sets"][0]["qty_per_set"] == 2
+      and by_id[103]["sets"] == [],
+      "SKU-20e catalogue rows carry SKU Set membership with quantity per set")
+check(body["detail_visibility"] == {"customer": "visible", "construction": "visible", "references": "visible",
+                                    "locations": "visible", "sets": "visible"}
+      and body["schema_pending"] == {"quote_fields": False, "sku_sets": False},
+      "SKU-20f catalogue visibility and schema state are reported per section")
+CALLER = MAKER
+r, body = get("/masters/skus?plant=NAG")
+row = {x["id"]: x for x in body["skus"]}[101]
+check(body["detail_visibility"]["construction"] == "not_visible_to_caller" and row["construction"] is None
+      and body["detail_visibility"]["locations"] == "not_visible_to_caller"
+      and [l["location_code"] for l in row["locations"]] == [None, None],
+      "SKU-20g a Maker sees applicability rows without Location codes or Construction detail")
+
+# ─────────────────────────── SKU-21 migration not activated: honest fallback
+CALLER = FULL
+SCHEMA_PENDING = True
+r, body = get("/masters/skus?plant=NAG")
+row = {x["id"]: x for x in body["skus"]}[101]
+check(r.status_code == 200 and body["schema_pending"] == {"quote_fields": True, "sku_sets": True},
+      "SKU-21 an unactivated migration still serves the catalogue and says what is pending")
+check(row["latest_version"]["quote_fields"] is None and row["latest_version"]["length_mm"] == 300.0
+      and row["sets"] is None and body["detail_visibility"]["sets"] == "schema_pending",
+      "SKU-21a pending fields are null, never blank values, while S4-2 fields still return")
+r, body = get("/masters/skus/101")
+check(r.status_code == 200 and all(v["quote_fields"] is None for v in body["versions"])
+      and body["sets"] is None and body["schema_pending"] == {"quote_fields": True, "sku_sets": True},
+      "SKU-21b the detail route falls back the same way")
+check("column sku_versions" not in r.get_data(as_text=True),
+      "SKU-21c the database error text does not reach the client")
+SCHEMA_PENDING = False
+app.config["PROPAGATE_EXCEPTIONS"] = False
+FAIL_TABLE = "sku_set_members"
+r, body = get("/masters/skus/101")
+check(r.status_code == 200 and body["sets"] is None and body["detail_visibility"]["sets"] == "unavailable",
+      "SKU-21d a failed SKU Set read is unavailable, not pending and not an empty set")
+FAIL_TABLE = None
+app.config["PROPAGATE_EXCEPTIONS"] = None
 
 print()
 print(f"{PASSES} passed, {len(FAILURES)} failed")

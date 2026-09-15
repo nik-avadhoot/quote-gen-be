@@ -1569,14 +1569,16 @@ def list_constructions():
 # ═══════════════════════════════════════════════════════════ U2 SKU Master
 #
 # Read-only catalogue and detail over the S4-2 Family C SKU tables, read as the
-# caller. The four SKU tables are SELECT-gated on has_plant_cap(plant_id,
-# 'plant_access'); every read below carries the caller's own token, so RLS stays
-# the authority and a SKU at a plant the caller cannot access is simply absent.
+# caller, extended by Canonical Amendment 02: the quotation and costing fields on
+# each SKU version (CDM-43) and master SKU Sets with a quantity per member
+# (CDM-44). Every read carries the caller's own token; RLS
+# (has_plant_cap(plant_id, 'plant_access')) stays the authority and a SKU at a
+# plant the caller cannot access is simply absent.
 #
 # THREE DIFFERENT GATES MEET HERE, and each is answered honestly rather than by
 # letting RLS turn a denial into an empty value:
 #
-#   skus + children          plant_access (any plant)  -> 403 if none held
+#   skus + children + sets   plant_access (any plant)  -> 403 if none held
 #   parties / Families /     read_party_master (group) -> not issued without it;
 #     customer_locations                                  "not_visible_to_caller"
 #   constructions /          read_construction_library -> not issued without it;
@@ -1587,21 +1589,40 @@ def list_constructions():
 # the visibility instead, and a failed optional read is "unavailable", never a
 # guessed or current-master label.
 #
-# NOT RETURNED: actor attribution (created_by / approved_by, per the U1 and
-# Construction precedent - approval is a derived boolean), and Printing
-# Technology / number of colours, which CDM-10 names but no governed column
-# carries yet. The latter is stated in the response, not implied or borrowed
-# from the local Costing metadata.
+# SCHEMA PENDING. Amendment 02 adds version columns and the SKU Set tables in a
+# migration that is activated separately. Until it is, selecting them fails with
+# an undefined-column or unknown-table error; the route then reads the S4-2
+# columns alone and says so in `schema_pending`, instead of failing the screen or
+# presenting fields that have no storage yet as blank values.
 #
-# READ-ONLY. No propose, approve, publish, discontinue or reference/applicability
-# write is exposed. No service-role client is used.
+# NOT RETURNED: actor attribution (created_by / approved_by; approval is a
+# derived boolean), and nothing from the production-data backlog, which has no
+# storage (CDM-43).
+#
+# READ-ONLY. No propose, approve, publish, discontinue, set-membership or
+# reference write is exposed. No service-role client is used.
 _SKU_STATUSES = ("proposed", "active", "discontinued")
 _SKU_CATALOGUE_LIMIT = 200
 _SKU_SEARCH_MAX = 60
 _SKU_SEARCH_CHARS = frozenset(
     "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 ._/-")
 _SKU_COLUMNS = "id, plant_id, party_id, plant_item_code, status, replacement_sku_id, content_version"
-_SKU_UNRECORDED_SPECIFICATION_FIELDS = ("printing_technology", "number_of_colours")
+_SKU_VERSION_BASE_COLUMNS = ("id, sku_id, version_no, construction_version_id, is_price_driving, approved_at, "
+                             "length_mm, width_mm, height_mm, box_type, ups, spec_bs, spec_bct, spec_ect")
+# Amendment 02, CDM-43: quotation and costing fields on the SKU version.
+_SKU_QUOTE_FIELDS = ("item_name", "item_short_name", "item_family", "item_group", "print_quality",
+                     "print_technology", "number_of_colours", "colour_detail", "cobb_value",
+                     "stated_item_gsm", "item_weight_kg", "stated_cs", "stated_bs", "stated_ect",
+                     "customer_spec_version")
+_SKU_SPECIFICATION_KEYS = ("length_mm", "width_mm", "height_mm", "box_type", "ups", "spec_bs", "spec_bct", "spec_ect")
+# Undefined column, undefined table, and PostgREST's schema-cache forms of both.
+_SKU_SCHEMA_PENDING_CODES = frozenset({"42703", "42P01", "PGRST204", "PGRST205"})
+_SKU_SET_ROLE_ORDER = {"box": 0, "plate": 1, "partition": 2}
+_CONSTRUCTION_VERSION_COLUMNS = (
+    "id, construction_id, version_no, ply, flute_f1, flute_f2, board_gsm, approved_at, "
+    "layer_top_code, layer_top_gsm, layer_f1_code, layer_f1_gsm, layer_l1_code, layer_l1_gsm, "
+    "layer_f2_code, layer_f2_gsm, layer_l2_code, layer_l2_gsm")
+_CONSTRUCTION_LAYERS = (("top", "top"), ("flute_1", "f1"), ("back_1", "l1"), ("flute_2", "f2"), ("back_2", "l2"))
 
 
 def _sku_plant_scope(caller):
@@ -1625,6 +1646,26 @@ def _caller_rows(caller_token, table, cols, *filters):
     for method, *params in filters:
         query = getattr(query, method)(*params)
     return query.execute().data or []
+
+
+def _sku_schema_pending(exc):
+    return isinstance(exc, APIError) and str(getattr(exc, "code", "")) in _SKU_SCHEMA_PENDING_CODES
+
+
+def _read_sku_versions(caller_token, *filters):
+    """SKU versions with the Amendment 02 fields, or the S4-2 columns while that migration is pending."""
+    try:
+        cols = _SKU_VERSION_BASE_COLUMNS + ", " + ", ".join(_SKU_QUOTE_FIELDS)
+        return _caller_rows(caller_token, "sku_versions", cols, *filters), False
+    except Exception as exc:
+        if not _sku_schema_pending(exc):
+            raise
+        return _caller_rows(caller_token, "sku_versions", _SKU_VERSION_BASE_COLUMNS, *filters), True
+
+
+def _sku_quote_fields(version, pending):
+    # None means "no storage yet", which is different from a stored blank.
+    return None if pending else {k: version.get(k) for k in _SKU_QUOTE_FIELDS}
 
 
 def _sku_party_detail(caller, caller_token, party_ids):
@@ -1657,6 +1698,127 @@ def _sku_party_detail(caller, caller_token, party_ids):
     return {p["id"]: p for p in parties}, family_by_party, "visible"
 
 
+def _sku_construction_detail(caller, caller_token, cv_ids):
+    """Exact Construction version identity and board layers, keyed by construction_version_id."""
+    if "read_construction_library" not in (caller.get("group_capabilities") or []):
+        return {}, "not_visible_to_caller"
+    ids = sorted(i for i in cv_ids if i)
+    if not ids:
+        return {}, "visible"
+    try:
+        versions = _caller_rows(caller_token, "construction_versions", _CONSTRUCTION_VERSION_COLUMNS, ("in_", "id", ids))
+        con_ids = sorted({v["construction_id"] for v in versions})
+        cons = (_caller_rows(caller_token, "constructions", "id, construction_code, name, status", ("in_", "id", con_ids))
+                if con_ids else [])
+    except Exception as exc:  # noqa: BLE001
+        app.logger.warning("SKU construction detail read failed (degrading): %s", exc)
+        return {}, "unavailable"
+    con_by_id = {c["id"]: c for c in cons}
+    out = {}
+    for v in versions:
+        con = con_by_id.get(v.get("construction_id")) or {}
+        out[v["id"]] = {
+            "construction_id": v.get("construction_id"),
+            "construction_code": con.get("construction_code"), "name": con.get("name"),
+            "construction_status": con.get("status"), "version_no": v.get("version_no"),
+            "ply": v.get("ply"), "flute_f1": v.get("flute_f1"), "flute_f2": v.get("flute_f2"),
+            "board_gsm": v.get("board_gsm"), "approved": v.get("approved_at") is not None,
+            "layers": {name: {"bf": v.get(f"layer_{key}_code"), "gsm": v.get(f"layer_{key}_gsm")}
+                       for name, key in _CONSTRUCTION_LAYERS},
+        }
+    return out, "visible"
+
+
+def _sku_references(caller_token, sku_ids):
+    """Active external references grouped by SKU and kind."""
+    if not sku_ids:
+        return {}, "visible"
+    try:
+        refs = _caller_rows(caller_token, "sku_external_references", "id, sku_id, reference_kind, reference_value, status",
+                            ("in_", "sku_id", sorted(sku_ids)), ("order", "id"))
+    except Exception as exc:  # noqa: BLE001
+        app.logger.warning("SKU reference read failed (degrading): %s", exc)
+        return {}, "unavailable"
+    out = {}
+    for r in refs:
+        if r.get("status") == "active":
+            out.setdefault(r["sku_id"], {}).setdefault(r.get("reference_kind"), []).append(r.get("reference_value"))
+    return out, "visible"
+
+
+def _sku_locations(caller, caller_token, sku_ids):
+    """Location applicability per SKU; Location codes only with read_party_master."""
+    if not sku_ids:
+        return {}, "visible"
+    try:
+        apps = _caller_rows(caller_token, "sku_location_applicabilities", "id, sku_id, location_id, scope, status",
+                            ("in_", "sku_id", sorted(sku_ids)), ("order", "id"))
+    except Exception as exc:  # noqa: BLE001
+        app.logger.warning("SKU applicability read failed (degrading): %s", exc)
+        return {}, "unavailable"
+    codes, visibility = {}, "not_visible_to_caller"
+    if "read_party_master" in (caller.get("group_capabilities") or []):
+        visibility = "visible"
+        loc_ids = sorted({a["location_id"] for a in apps})
+        if loc_ids:
+            try:
+                codes = {l["id"]: l.get("location_code") for l in _caller_rows(
+                    caller_token, "customer_locations", "id, location_code", ("in_", "id", loc_ids))}
+            except Exception as exc:  # noqa: BLE001
+                app.logger.warning("SKU location code read failed (degrading): %s", exc)
+                visibility = "unavailable"
+    out = {}
+    for a in apps:
+        out.setdefault(a["sku_id"], []).append({
+            "location_id": a.get("location_id"), "location_code": codes.get(a.get("location_id")),
+            "scope": a.get("scope"), "status": a.get("status")})
+    return out, visibility
+
+
+def _sku_sets(caller_token, sku_ids):
+    """Master SKU Sets these SKUs belong to, each with every caller-visible member (CDM-44)."""
+    if not sku_ids:
+        return {}, "visible"
+    try:
+        mine = _caller_rows(caller_token, "sku_set_members", "id, set_id, sku_id, role, qty_per_set, status",
+                            ("in_", "sku_id", sorted(sku_ids)))
+        set_ids = sorted({m["set_id"] for m in mine})
+        if not set_ids:
+            return {}, "visible"
+        sets = _caller_rows(caller_token, "sku_sets", "id, set_label, status, content_version", ("in_", "id", set_ids))
+        members = _caller_rows(caller_token, "sku_set_members", "id, set_id, sku_id, role, qty_per_set, status",
+                               ("in_", "set_id", set_ids))
+        member_sku_ids = sorted({m["sku_id"] for m in members})
+        member_skus = (_caller_rows(caller_token, "skus", "id, plant_item_code, status", ("in_", "id", member_sku_ids))
+                       if member_sku_ids else [])
+    except Exception as exc:  # noqa: BLE001
+        if _sku_schema_pending(exc):
+            return {}, "schema_pending"
+        app.logger.warning("SKU Set read failed (degrading): %s", exc)
+        return {}, "unavailable"
+    set_by_id = {s["id"]: s for s in sets}
+    sku_by_id = {s["id"]: s for s in member_skus}
+    out = {}
+    for m in mine:
+        s = set_by_id.get(m["set_id"])
+        if s is None:
+            continue
+        siblings = sorted((x for x in members if x["set_id"] == s["id"]),
+                          key=lambda x: (_SKU_SET_ROLE_ORDER.get(x.get("role"), 9), x.get("id") or 0))
+        out.setdefault(m["sku_id"], []).append({
+            "id": s["id"], "label": s.get("set_label"), "status": s.get("status"),
+            "role": m.get("role"), "qty_per_set": m.get("qty_per_set"), "member_status": m.get("status"),
+            "members": [{
+                "sku_id": x["sku_id"],
+                "plant_item_code": (sku_by_id.get(x["sku_id"]) or {}).get("plant_item_code"),
+                "sku_status": (sku_by_id.get(x["sku_id"]) or {}).get("status"),
+                "sku_visible": x["sku_id"] in sku_by_id,
+                "role": x.get("role"), "qty_per_set": x.get("qty_per_set"), "status": x.get("status"),
+            } for x in siblings],
+        })
+    return out, "visible"
+
+
 def _sku_plant(plant):
     return ({"id": plant["id"], "plant_code": plant.get("plant_code"), "name": plant.get("name")}
             if plant else None)
@@ -1674,13 +1836,15 @@ def _sku_read_error(exc, what):
 @app.route("/masters/skus", methods=["GET"])
 @require_auth
 def list_skus():
-    """Bounded, filterable SKU Master catalogue read as the caller (U2).
+    """Bounded, filterable SKU Master catalogue read as the caller (U2, CDM-43/44).
 
     Filters are applied in the database query, never by loading the tenant and
     filtering in memory: `plant` (a plant code the caller holds plant_access
     at), `status`, `q` (Plant Item Code contains), `party_id` and `family_id`
     (both require read_party_master). The window is capped; `truncated` says
-    when more rows matched than were returned.
+    when more rows matched than were returned. Each row carries its latest
+    version's quote fields, Construction identity, references, Location
+    applicability and SKU Sets, each with its own visibility.
     """
     scope_codes = _sku_plant_scope(g.caller)
     if not scope_codes:
@@ -1735,11 +1899,8 @@ def list_skus():
         truncated = len(skus) > _SKU_CATALOGUE_LIMIT
         skus = skus[:_SKU_CATALOGUE_LIMIT]
 
-        versions = (_caller_rows(token, "sku_versions",
-                                 "id, sku_id, version_no, is_price_driving, approved_at, "
-                                 "length_mm, width_mm, height_mm, box_type",
-                                 ("in_", "sku_id", [s["id"] for s in skus]))
-                    if skus else [])
+        versions, quote_pending = (_read_sku_versions(token, ("in_", "sku_id", [s["id"] for s in skus]))
+                                   if skus else ([], False))
     except Exception as exc:
         handled = _sku_read_error(exc, "SKU catalogue read")
         if handled is not None:
@@ -1749,13 +1910,21 @@ def list_skus():
     versions_by_sku = {}
     for v in versions:
         versions_by_sku.setdefault(v["sku_id"], []).append(v)
-    party_by_id, family_by_party, party_detail = _sku_party_detail(
-        g.caller, token, {s["party_id"] for s in skus})
+    for vs in versions_by_sku.values():
+        vs.sort(key=lambda v: v.get("version_no") or 0)
+    sku_ids = [s["id"] for s in skus]
+    latest = {sid: vs[-1] for sid, vs in versions_by_sku.items() if vs}
+
+    party_by_id, family_by_party, party_detail = _sku_party_detail(g.caller, token, {s["party_id"] for s in skus})
+    constructions, construction_detail = _sku_construction_detail(
+        g.caller, token, {v.get("construction_version_id") for v in latest.values()})
+    references, reference_detail = _sku_references(token, sku_ids)
+    locations, location_detail = _sku_locations(g.caller, token, sku_ids)
+    sets, set_detail = _sku_sets(token, sku_ids)
 
     rows = []
     for s in skus:
-        sku_versions = sorted(versions_by_sku.get(s["id"], []), key=lambda v: v.get("version_no") or 0)
-        latest = sku_versions[-1] if sku_versions else None
+        v = latest.get(s["id"])
         rows.append({
             "id": s["id"],
             "plant_item_code": s.get("plant_item_code"),
@@ -1766,18 +1935,21 @@ def list_skus():
             "party_id": s.get("party_id"),
             "customer": party_by_id.get(s.get("party_id")),
             "family": family_by_party.get(s.get("party_id")),
-            "version_count": len(sku_versions),
+            "version_count": len(versions_by_sku.get(s["id"], [])),
             # Values pass through untouched: null stays null, 0 stays 0.
             "latest_version": ({
-                "id": latest["id"],
-                "version_no": latest.get("version_no"),
-                "approved": latest.get("approved_at") is not None,
-                "is_price_driving": latest.get("is_price_driving"),
-                "length_mm": latest.get("length_mm"),
-                "width_mm": latest.get("width_mm"),
-                "height_mm": latest.get("height_mm"),
-                "box_type": latest.get("box_type"),
-            } if latest else None),
+                "id": v["id"],
+                "version_no": v.get("version_no"),
+                "approved": v.get("approved_at") is not None,
+                "is_price_driving": v.get("is_price_driving"),
+                "construction_version_id": v.get("construction_version_id"),
+                **{k: v.get(k) for k in _SKU_SPECIFICATION_KEYS},
+                "quote_fields": _sku_quote_fields(v, quote_pending),
+            } if v else None),
+            "construction": constructions.get((v or {}).get("construction_version_id")),
+            "references": references.get(s["id"], {}) if reference_detail == "visible" else None,
+            "locations": locations.get(s["id"], []) if location_detail != "unavailable" else None,
+            "sets": sets.get(s["id"], []) if set_detail == "visible" else None,
         })
     rows.sort(key=lambda r: ((r["plant"] or {}).get("plant_code") or "",
                              r["plant_item_code"] is None, r["plant_item_code"] or "", r["id"]))
@@ -1788,7 +1960,9 @@ def list_skus():
         "filters": {"plant": plant_code, "status": status, "q": search,
                     "party_id": party_id, "family_id": family_id},
         "plant_scope": scope_codes,
-        "detail_visibility": {"customer": party_detail},
+        "detail_visibility": {"customer": party_detail, "construction": construction_detail,
+                              "references": reference_detail, "locations": location_detail, "sets": set_detail},
+        "schema_pending": {"quote_fields": quote_pending, "sku_sets": set_detail == "schema_pending"},
         "mode": "governed_read_only",
         "authority": "caller_token_rls_only",
         "mutations": "none",
@@ -1798,10 +1972,11 @@ def list_skus():
 @app.route("/masters/skus/<int:sku_id>", methods=["GET"])
 @require_auth
 def get_sku(sku_id):
-    """One SKU with its immutable versions, specifications, Construction
-    identity, external references, Location applicability and replacement
-    lineage, read as the caller (U2). A SKU the caller cannot see is 404 -
-    RLS makes "absent" and "not visible" the same answer, and neither leaks.
+    """One SKU with its immutable versions and quote fields, Construction
+    identity and layers, external references, Location applicability,
+    replacement lineage and SKU Sets, read as the caller (U2, CDM-43/44). A SKU
+    the caller cannot see is 404 - RLS makes "absent" and "not visible" the same
+    answer, and neither leaks.
     """
     if not _sku_plant_scope(g.caller):
         return _error("CAPABILITY_REQUIRED", "plant_access capability is required")
@@ -1813,13 +1988,10 @@ def get_sku(sku_id):
         if not found:
             return _error("RECORD_NOT_FOUND")
         sku = found[0]
+        versions, quote_pending = _read_sku_versions(token, ("eq", "sku_id", sku_id), ("order", "version_no"))
 
         reads = {
             "plants": ("plants", "id, plant_code, name, status", (("eq", "id", sku["plant_id"]),)),
-            "versions": ("sku_versions",
-                         "id, version_no, construction_version_id, is_price_driving, length_mm, width_mm, "
-                         "height_mm, box_type, ups, spec_bs, spec_bct, spec_ect, approved_at",
-                         (("eq", "sku_id", sku_id), ("order", "version_no"))),
             "references": ("sku_external_references", "id, reference_kind, reference_value, status",
                            (("eq", "sku_id", sku_id), ("order", "id"))),
             "applicabilities": ("sku_location_applicabilities", "id, location_id, scope, status, approved_at",
@@ -1844,25 +2016,8 @@ def get_sku(sku_id):
             return handled
         raise
 
-    versions = results["versions"]
     cv_ids = sorted({v["construction_version_id"] for v in versions})
-
-    construction_detail, cv_by_id, con_by_id = "not_visible_to_caller", {}, {}
-    if "read_construction_library" in group_caps:
-        construction_detail = "visible"
-        if cv_ids:
-            try:
-                cvs = _caller_rows(token, "construction_versions",
-                                   "id, construction_id, version_no, ply, flute_f1, flute_f2, board_gsm, approved_at",
-                                   ("in_", "id", cv_ids))
-                con_ids = sorted({c["construction_id"] for c in cvs})
-                cons = (_caller_rows(token, "constructions", "id, construction_code, name, status",
-                                     ("in_", "id", con_ids)) if con_ids else [])
-                cv_by_id = {c["id"]: c for c in cvs}
-                con_by_id = {c["id"]: c for c in cons}
-            except Exception as exc:  # noqa: BLE001
-                app.logger.warning("SKU construction detail read failed (degrading): %s", exc)
-                construction_detail = "unavailable"
+    constructions, construction_detail = _sku_construction_detail(g.caller, token, cv_ids)
 
     adoption_detail, adoptions_by_cv = "visible", {}
     if cv_ids:
@@ -1889,17 +2044,7 @@ def get_sku(sku_id):
                 location_detail = "unavailable"
 
     party_by_id, family_by_party, party_detail = _sku_party_detail(g.caller, token, {sku["party_id"]})
-
-    def _construction(cv_id):
-        cv = cv_by_id.get(cv_id)
-        if cv is None:
-            return None
-        con = con_by_id.get(cv.get("construction_id")) or {}
-        return {"construction_id": cv.get("construction_id"),
-                "construction_code": con.get("construction_code"), "name": con.get("name"),
-                "construction_status": con.get("status"), "version_no": cv.get("version_no"),
-                "ply": cv.get("ply"), "flute_f1": cv.get("flute_f1"), "flute_f2": cv.get("flute_f2"),
-                "board_gsm": cv.get("board_gsm"), "approved": cv.get("approved_at") is not None}
+    sets, set_detail = _sku_sets(token, [sku_id])
 
     replacement_rows = results.get("replacement") or []
     return jsonify({
@@ -1919,10 +2064,10 @@ def get_sku(sku_id):
             "version_no": v.get("version_no"),
             "is_price_driving": v.get("is_price_driving"),
             "approved": v.get("approved_at") is not None,
-            "specification": {k: v.get(k) for k in (
-                "length_mm", "width_mm", "height_mm", "box_type", "ups", "spec_bs", "spec_bct", "spec_ect")},
+            "specification": {k: v.get(k) for k in _SKU_SPECIFICATION_KEYS},
+            "quote_fields": _sku_quote_fields(v, quote_pending),
             "construction_version_id": v.get("construction_version_id"),
-            "construction": _construction(v.get("construction_version_id")),
+            "construction": constructions.get(v.get("construction_version_id")),
             "plant_adoption": (adoptions_by_cv.get(v.get("construction_version_id"), [])
                                if adoption_detail == "visible" else None),
         } for v in versions],
@@ -1942,9 +2087,10 @@ def get_sku(sku_id):
             "replacement_visible": (not sku.get("replacement_sku_id")) or bool(replacement_rows),
             "replaces": results["replaces"],
         },
+        "sets": sets.get(sku_id, []) if set_detail == "visible" else None,
         "detail_visibility": {"customer": party_detail, "construction": construction_detail,
-                              "plant_adoption": adoption_detail, "locations": location_detail},
-        "unrecorded_specification_fields": list(_SKU_UNRECORDED_SPECIFICATION_FIELDS),
+                              "plant_adoption": adoption_detail, "locations": location_detail, "sets": set_detail},
+        "schema_pending": {"quote_fields": quote_pending, "sku_sets": set_detail == "schema_pending"},
         "mode": "governed_read_only",
         "authority": "caller_token_rls_only",
         "mutations": "none",
