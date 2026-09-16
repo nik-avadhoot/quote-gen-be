@@ -1,8 +1,8 @@
 -- GSM Master and U4 Customer Family Sector correction: the private definer
 -- functions behind the public invoker wrappers must be executable by the caller.
 --
--- PREPARED, NOT APPLIED. Authored 2026-09-16. Apply only with the owner's
--- explicit approval.
+-- APPLIED to the live project 2026-09-16 with the owner's approval. Authored as
+-- 20260916180000; renamed to the version the live migration history recorded.
 --
 -- THE DEFECT. Each public.* wrapper below is SECURITY INVOKER, so its body
 -- runs as the calling role, and the first thing it does is call its

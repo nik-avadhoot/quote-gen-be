@@ -1,9 +1,9 @@
 """Static GSM Master / U4 private definer EXECUTE grant contract gate.
 
-The corrective migration is prepared but not applied. This offline gate proves
-the authored migration keeps the exact boundaries that must hold when it is
-activated: authenticated gains EXECUTE on exactly the five private definer
-functions the public invoker wrappers call, anon and public gain nothing, the
+The corrective migration was applied live on 2026-09-16. This offline gate
+proves the recorded migration keeps the exact boundaries it established:
+authenticated gains EXECUTE on exactly the five private definer functions the
+public invoker wrappers call, anon and public gain nothing, the
 two private-only compatibility overloads stay closed, GSM-6 is repointed rather
 than deleted, and the migration verifies the whole defect class before it
 commits. It is not a substitute for database-runtime or authenticated-caller
@@ -16,7 +16,7 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 MIGRATIONS = ROOT / "supabase" / "migrations"
-SQL = (MIGRATIONS / "20260916180000_fix_gsm_and_u4_definer_execute_grants.sql").read_text(encoding="utf-8")
+SQL = (MIGRATIONS / "20260916165004_fix_gsm_and_u4_definer_execute_grants.sql").read_text(encoding="utf-8")
 GSM = (MIGRATIONS / "20260915084131_gsm_master.sql").read_text(encoding="utf-8")
 GSM_GATES = (MIGRATIONS / "20260915084252_gsm_master_catalogue_gates.sql").read_text(encoding="utf-8")
 U4 = (MIGRATIONS / "20260915100440_u4_customer_family_sectors.sql").read_text(encoding="utf-8")
@@ -144,8 +144,9 @@ check(all(f"has_function_privilege('authenticated', 'app_private.{name}({args.re
           for name, args in COMPAT.items())
       and "raise exception 'the private-only compatibility overloads must stay unexecutable by authenticated'" in SQL,
       "DEG-22 the structural proof keeps the compatibility overloads closed")
-check("prepared, not applied" in SQL.lower(),
-      "DEG-23 the migration states it is prepared and not applied")
+check("applied to the live project 2026-09-16" in SQL.lower()
+      and not (MIGRATIONS / "20260916180000_fix_gsm_and_u4_definer_execute_grants.sql").exists(),
+      "DEG-23 the file carries the live-recorded version and states it was applied")
 
 print(f"\n{PASSES} passed, {len(FAILURES)} failed")
 if FAILURES:
