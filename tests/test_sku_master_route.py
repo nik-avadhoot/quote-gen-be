@@ -28,6 +28,9 @@ WHAT EACH GROUP WOULD CATCH:
   SKU-24  a column-header filter applied in memory, to another plant's rows, to
           an OLD version instead of the latest, silently ignored while its
           storage is pending, or reaching a master the caller may not read.
+  SKU-25  a governed SKU operation that writes a table directly, reaches the database
+          with a malformed body, uses a privileged client, loses the caller's token,
+          or blurs STALE_VERSION / NEW_SKU_REQUIRED / SCHEMA_ACTIVATION_PENDING.
   SKU-8   an unbounded catalogue, or a silent truncation.
   SKU-9   blank/zero collapse, or a stale (non-current) Family label.
   SKU-10  actor attribution leaking into selected columns or the body.
@@ -167,7 +170,7 @@ class FakeQuery:
         CALLS.append({"token": self.token, "table": self.table, "columns": self.columns,
                       "filters": list(self.filters), "limit": self.limit_n})
         # Amendment 02 migration not activated: its columns and tables do not exist.
-        if SCHEMA_PENDING and self.table in ("sku_sets", "sku_set_members"):
+        if SCHEMA_PENDING and self.table in ("sku_sets", "sku_set_members", "sku_master_events"):
             raise server.APIError({"code": "PGRST205", "message": "Could not find the table"})
         pending_cols = ("print_technology", "item_name", "item_short_name")
         if SCHEMA_PENDING and self.table == "sku_versions" and (
@@ -195,12 +198,31 @@ class FakeAuth:
         return type("AuthResponse", (), {"user": user})()
 
 
+RPC_CALLS = []
+RPC_RAISE = None      # an APIError code the next RPC raises, or None
+RPC_RESULT = 7001
+
+
+class FakeRpc:
+    def __init__(self, token, name, params):
+        self.token, self.name, self.params = token, name, params
+
+    def execute(self):
+        RPC_CALLS.append({"token": self.token, "name": self.name, "params": self.params})
+        if RPC_RAISE:
+            raise server.APIError({"code": RPC_RAISE, "message": "database said no"})
+        return type("Response", (), {"data": RPC_RESULT})()
+
+
 class FakeClient:
     def __init__(self, token):
         self.token, self.auth = token, FakeAuth()
 
     def table(self, name):
         return FakeQuery(self.token, name)
+
+    def rpc(self, name, params):
+        return FakeRpc(self.token, name, params)
 
 
 def fake_client(token):
@@ -509,11 +531,13 @@ check(qf1["print_technology"] == "Flexo" and qf1["number_of_colours"] == 0 and q
       and qf1["item_weight_kg"] == 0.3 and qf1["stated_ect"] is None
       and qf2["print_technology"] is None and qf2["item_weight_kg"] == 0,
       "SKU-12e CDM-43 quote fields return per version with blank, NA and zero kept apart")
-check(body["schema_pending"] == {"quote_fields": False, "sku_sets": False, "pricing_portfolio": False}
+check(body["schema_pending"] == {"quote_fields": False, "sku_sets": False, "pricing_portfolio": False,
+                                 "governed_operations": False}
       and "unrecorded_specification_fields" not in body,
       "SKU-12e2 with the migration active nothing is reported pending")
 check(body["detail_visibility"] == {"customer": "visible", "construction": "visible",
-                                    "plant_adoption": "visible", "locations": "visible", "sets": "visible"},
+                                    "plant_adoption": "visible", "locations": "visible", "sets": "visible",
+                                    "history": "visible"},
       "SKU-12f detail visibility is reported per section")
 check(versions[0]["construction"]["layers"]["top"] == {"bf": "28", "gsm": 150}
       and versions[0]["construction"]["layers"]["flute_2"] == {"bf": None, "gsm": None}
@@ -606,9 +630,11 @@ check(CALLS and all(c["token"] == "tok-u2-sku" for c in CALLS),
 check(body["mutations"] == "none" and body["authority"] == "caller_token_rls_only",
       "SKU-18a the response declares itself read-only and caller-token scoped")
 with app.test_client() as client:
-    check(client.post("/masters/skus", headers=AUTH, json={}).status_code == 405
-          and client.patch("/masters/skus/101", headers=AUTH, json={}).status_code == 405,
-          "SKU-18b no create or edit method exists on the SKU Master routes")
+    RPC_CALLS.clear()
+    check(client.patch("/masters/skus/101", headers=AUTH, json={}).status_code == 405
+          and client.post("/masters/skus", headers=AUTH, json={}).status_code in (400, 403) and not RPC_CALLS,
+          "SKU-18b there is no generic edit of a SKU; a proposal with an empty body is refused before the database "
+          "(repointed for Amendment 04: named governed operations now exist)")
 
 # ─────────────────────────────────────────── SKU-19 SKU Sets (CDM-44)
 CALLER = FULL
@@ -673,7 +699,9 @@ check(row["latest_version"]["quote_fields"] is None and row["latest_version"]["l
       "SKU-21a pending fields are null, never blank values, while S4-2 fields still return")
 r, body = get("/masters/skus/101")
 check(r.status_code == 200 and all(v["quote_fields"] is None for v in body["versions"])
-      and body["sets"] is None and body["schema_pending"] == {"quote_fields": True, "sku_sets": True, "pricing_portfolio": True},
+      and body["sets"] is None and body["history"] is None
+      and body["schema_pending"] == {"quote_fields": True, "sku_sets": True, "pricing_portfolio": True,
+                                     "governed_operations": True},
       "SKU-21b the detail route falls back the same way")
 check("column sku_versions" not in r.get_data(as_text=True),
       "SKU-21c the database error text does not reach the client")
@@ -974,9 +1002,17 @@ check(r.status_code == 400 and body.get("error_code") == "INVALID_INPUT" and not
       "SKU-23e a value outside the closed vocabulary is refused before any read")
 
 # It is READ-ONLY and it decides NOTHING about price.
-sku_rules = [rule for rule in app.url_map.iter_rules() if str(rule).startswith("/masters/skus")]
-check(sku_rules and all(set(rule.methods) <= {"GET", "HEAD", "OPTIONS"} for rule in sku_rules),
-      "SKU-23f the SKU Master exposes no write method at all, so nothing can set a portfolio here")
+sku_rules = [rule for rule in app.url_map.iter_rules() if str(rule).startswith("/masters/sku")]
+write_rules = sorted(str(rule) for rule in sku_rules if set(rule.methods) - {"GET", "HEAD", "OPTIONS"})
+check(write_rules == sorted([
+        "/masters/skus", "/masters/skus/<int:sku_id>/versions", "/masters/sku-versions/<int:version_id>",
+        "/masters/sku-versions/<int:version_id>/approve", "/masters/skus/<int:sku_id>/plant-item-code",
+        "/masters/skus/<int:sku_id>/publish", "/masters/skus/<int:sku_id>/discontinue",
+        "/masters/skus/<int:sku_id>/reactivate", "/masters/skus/<int:sku_id>/withdraw",
+        "/masters/skus/<int:sku_id>/pricing-portfolio", "/masters/skus/<int:sku_id>/references",
+        "/masters/sku-references/<int:reference_id>/withdraw"]),
+      "SKU-23f every SKU write is a NAMED governed operation; only /pricing-portfolio (and a proposal) sets a "
+      "portfolio (repointed for Amendment 04)")
 r, body = get("/masters/skus?plant=NAG")
 response_keys = set()
 
@@ -1020,6 +1056,118 @@ check(r.status_code == 200 and body["sku"]["pricing_portfolio"] is None
 SCHEMA_PENDING = False
 
 print()
+
+# ─────────────────────────── SKU-25 governed operations (Canonical Amendment 04)
+SCHEMA_PENDING = False
+CALLER = {"id": 9, "active": True, "plant_capabilities": {"NAG": ["plant_access", "manage_sku_master"]},
+          "group_capabilities": []}
+
+
+def post(path, body, method="post"):
+    CALLS.clear()
+    RPC_CALLS.clear()
+    with app.test_client() as client:
+        response = getattr(client, method)(path, headers=AUTH, json=body)
+    return response, (response.get_json(silent=True) or {})
+
+
+FIELDS = {"construction_version_id": 41, "length_mm": 300, "width_mm": 200, "height_mm": 0, "item_name": " Carton "}
+r, body = post("/masters/skus", {"plant_code": "NAG", "party_id": 501, "pricing_portfolio": "Strategic",
+                                 "is_price_driving": True, "fields": FIELDS})
+check(r.status_code == 201 and body == {"id": 7001} and [c["name"] for c in RPC_CALLS] == ["sku_propose"],
+      "SKU-25 a proposal is one call to public.sku_propose")
+check(RPC_CALLS[0]["params"] == {"p_plant": 7, "p_party": 501, "p_pricing_portfolio": "Strategic",
+                                 "p_is_price_driving": True,
+                                 "p_fields": {"construction_version_id": 41, "length_mm": 300, "width_mm": 200,
+                                              "height_mm": 0, "item_name": "Carton"}}
+      and RPC_CALLS[0]["token"] == "tok-u2-sku",
+      "SKU-25a with the plant resolved, zero kept as zero, text trimmed, and the caller's own token")
+check(not [c for c in CALLS if c["table"] != "plants"],
+      "SKU-25b no SKU table is written directly - the only table read is the Plant Master")
+
+for bad_body, label in (
+        ({"plant_code": "PUN", "party_id": 501, "pricing_portfolio": "Strategic", "is_price_driving": True,
+          "fields": FIELDS}, "a plant outside plant_access"),):
+    r, body = post("/masters/skus", bad_body)
+    check(r.status_code == 403 and body.get("error_code") == "CAPABILITY_REQUIRED" and not RPC_CALLS,
+          f"SKU-25c {label} is refused 403 before the database")
+for bad_body, label in (
+        ({"plant_code": "NAG", "party_id": 501, "pricing_portfolio": None, "is_price_driving": True, "fields": FIELDS},
+         "a missing portfolio"),
+        ({"plant_code": "NAG", "party_id": 501, "pricing_portfolio": "Strategic", "is_price_driving": "yes",
+          "fields": FIELDS}, "an unstated price-driving flag"),
+        ({"plant_code": "NAG", "party_id": 501, "pricing_portfolio": "Strategic", "is_price_driving": True,
+          "fields": {"length_mm": 300}}, "no Construction version"),
+        ({"plant_code": "NAG", "party_id": 501, "pricing_portfolio": "Strategic", "is_price_driving": True,
+          "fields": {**FIELDS, "price": 9}}, "an unknown field"),
+        ({"plant_code": "NAG", "party_id": 501, "pricing_portfolio": "Strategic", "is_price_driving": True,
+          "fields": {**FIELDS, "length_mm": -1}}, "a negative dimension"),
+        ({"plant_code": "NAG", "party_id": 501, "pricing_portfolio": "Strategic", "is_price_driving": True,
+          "fields": {**FIELDS, "print_technology": "Laser"}}, "a print technology outside the vocabulary")):
+    r, body = post("/masters/skus", bad_body)
+    check(r.status_code == 400 and body.get("error_code") == "INVALID_INPUT" and not RPC_CALLS,
+          f"SKU-25d {label} is INVALID_INPUT before the database")
+
+r, body = post("/masters/skus/101/versions", {"expected_content_version": 2, "is_price_driving": False,
+                                              "fields": {"item_name": "Renamed"}})
+check(r.status_code == 201 and RPC_CALLS[0]["name"] == "sku_create_version"
+      and RPC_CALLS[0]["params"]["p_expected_content_version"] == 2,
+      "SKU-25e a new version carries the token the caller read (D8)")
+r, body = post("/masters/skus/101/versions", {"is_price_driving": False, "fields": {"item_name": "Renamed"}})
+check(r.status_code == 400 and not RPC_CALLS, "SKU-25f and without a token it never reaches the database")
+
+RPC_RAISE = "PT423"
+r, body = post("/masters/skus/101/versions", {"expected_content_version": 2, "is_price_driving": False,
+                                              "fields": {"width_mm": 210}})
+check(r.status_code == 422 and body.get("error_code") == "NEW_SKU_REQUIRED"
+      and "database said no" not in r.get_data(as_text=True),
+      "SKU-25g a new-SKU field change answers the stable NEW_SKU_REQUIRED, never the database text")
+RPC_RAISE = "PT409"
+r, body = post("/masters/skus/101/publish", {"expected_content_version": 1})
+check(r.status_code == 409 and body.get("error_code") == "STALE_VERSION",
+      "SKU-25h a stale token is 409 STALE_VERSION, never a silent overwrite")
+RPC_RAISE = "PGRST202"
+r, body = post("/masters/skus/101/publish", {"expected_content_version": 1})
+check(r.status_code == 503 and body.get("error_code") == "SCHEMA_ACTIVATION_PENDING",
+      "SKU-25i before the migration is applied the operation answers SCHEMA_ACTIVATION_PENDING")
+RPC_RAISE = "42501"
+r, body = post("/masters/skus/101/pricing-portfolio", {"expected_content_version": 1, "pricing_portfolio": "Strategic"})
+check(r.status_code == 403 and body.get("error_code") == "CAPABILITY_REQUIRED",
+      "SKU-25j the database's capability refusal is 403 CAPABILITY_REQUIRED")
+RPC_RAISE = "22023"
+r, body = post("/masters/skus/101/withdraw", {"expected_content_version": 1})
+check(r.status_code == 422 and body.get("error_code") == "TRANSITION_NOT_ALLOWED",
+      "SKU-25k an illegal lifecycle step is 422 TRANSITION_NOT_ALLOWED")
+RPC_RAISE = None
+
+r, body = post("/masters/skus/101/discontinue", {"expected_content_version": 3, "reason": "  "})
+check(r.status_code == 400 and not RPC_CALLS, "SKU-25l discontinuing without a reason never reaches the database (D4)")
+r, body = post("/masters/skus/101/discontinue", {"expected_content_version": 3, "reason": " superseded ",
+                                                 "replacement_sku_id": 102})
+check(r.status_code == 200 and RPC_CALLS[0]["params"] == {"p_sku": 101, "p_expected_content_version": 3,
+                                                          "p_reason": "superseded", "p_replacement_sku": 102},
+      "SKU-25m a discontinuation carries its reason and its replacement link")
+r, body = post("/masters/skus/101/plant-item-code", {"expected_content_version": 3, "plant_item_code": " NAG-9 "})
+check(r.status_code == 200 and RPC_CALLS[0]["name"] == "sku_assign_plant_item_code"
+      and RPC_CALLS[0]["params"]["p_code"] == "NAG-9",
+      "SKU-25n code assignment is its own operation - it does not publish (D3)")
+r, body = post("/masters/sku-versions/1002", {"expected_content_version": 1, "fields": {"number_of_colours": 0}},
+               method="patch")
+check(r.status_code == 200 and RPC_CALLS[0]["name"] == "sku_update_draft_version"
+      and RPC_CALLS[0]["params"]["p_fields"] == {"number_of_colours": 0}
+      and RPC_CALLS[0]["params"]["p_is_price_driving"] is None,
+      "SKU-25o a draft is edited in place, with zero colours kept as zero (D2)")
+r, body = post("/masters/sku-versions/1002/approve", {"expected_content_version": 1})
+check(r.status_code == 200 and RPC_CALLS[0]["name"] == "sku_approve_version",
+      "SKU-25p approval is one governed call")
+r, body = post("/masters/skus/101/references", {"expected_content_version": 3, "reference_kind": "nickname",
+                                                "reference_value": "x"})
+check(r.status_code == 400 and not RPC_CALLS, "SKU-25q an unknown reference kind is refused before the database (D5)")
+r, body = post("/masters/sku-references/3/withdraw", {"expected_content_version": 3})
+check(r.status_code == 200 and RPC_CALLS[0]["name"] == "sku_withdraw_reference",
+      "SKU-25r a reference is withdrawn, never edited in place (D5)")
+check(all(c["token"] == "tok-u2-sku" for c in RPC_CALLS), "SKU-25s every governed call carries the caller's token")
+
 print(f"{PASSES} passed, {len(FAILURES)} failed")
 if FAILURES:
     for f in FAILURES:

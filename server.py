@@ -1601,7 +1601,8 @@ def list_constructions():
 #
 # READ-ONLY. No propose, approve, publish, discontinue, set-membership or
 # reference write is exposed. No service-role client is used.
-_SKU_STATUSES = ("proposed", "active", "discontinued")
+# Amendment 04 D4 adds "withdrawn": a proposal that never went live (terminal).
+_SKU_STATUSES = ("proposed", "active", "discontinued", "withdrawn")
 _SKU_CATALOGUE_LIMIT = 200
 _SKU_SEARCH_MAX = 60
 _SKU_SEARCH_CHARS = frozenset(
@@ -1685,10 +1686,19 @@ def _sku_schema_pending(exc):
 
 
 def _read_sku_versions(caller_token, *filters):
-    """SKU versions with the Amendment 02 fields, or the S4-2 columns while that migration is pending."""
+    """SKU versions with the Amendment 02 fields, or the S4-2 columns while that migration is pending.
+
+    The version's own compare-and-swap token (Amendment 04) is read when it exists;
+    until that migration is applied a row simply carries no `content_version`.
+    """
+    quote_cols = _SKU_VERSION_BASE_COLUMNS + ", " + ", ".join(_SKU_QUOTE_FIELDS)
     try:
-        cols = _SKU_VERSION_BASE_COLUMNS + ", " + ", ".join(_SKU_QUOTE_FIELDS)
-        return _caller_rows(caller_token, "sku_versions", cols, *filters), False
+        return _caller_rows(caller_token, "sku_versions", quote_cols + ", content_version", *filters), False
+    except Exception as exc:
+        if not _sku_schema_pending(exc):
+            raise
+    try:
+        return _caller_rows(caller_token, "sku_versions", quote_cols, *filters), False
     except Exception as exc:
         if not _sku_schema_pending(exc):
             raise
@@ -2318,7 +2328,7 @@ def list_skus():
     args = request.args
     status = (args.get("status") or "").strip() or None
     if status is not None and status not in _SKU_STATUSES:
-        return _invalid_input("status must be proposed, active or discontinued")
+        return _invalid_input("status must be proposed, active, discontinued or withdrawn")
     plant_code = (args.get("plant") or "").strip() or None
     if plant_code is not None and plant_code not in scope_codes:
         return _error("CAPABILITY_REQUIRED", "plant_access capability is required at the requested plant")
@@ -2560,6 +2570,19 @@ def get_sku(sku_id):
     party_by_id, family_by_party, party_detail = _sku_party_detail(g.caller, token, {sku["party_id"]})
     sets, set_detail = _sku_sets(token, [sku_id])
 
+    # Amendment 04 D9: the append-only history of governed operations on this SKU.
+    history, history_detail = None, "visible"
+    try:
+        history = _caller_rows(token, "sku_master_events",
+                               "id, entity, entity_id, operation, actor, occurred_at, reason, before_state, after_state",
+                               ("eq", "sku_id", sku_id), ("order", "id"))
+    except Exception as exc:  # noqa: BLE001 - optional detail degrades, never fails the SKU read
+        if _sku_schema_pending(exc):
+            history_detail = "schema_pending"
+        else:
+            app.logger.warning("SKU history read failed (degrading): %s", exc)
+            history_detail = "unavailable"
+
     replacement_rows = results.get("replacement") or []
     return jsonify({
         "sku": {
@@ -2579,6 +2602,8 @@ def get_sku(sku_id):
             "version_no": v.get("version_no"),
             "is_price_driving": v.get("is_price_driving"),
             "approved": v.get("approved_at") is not None,
+            # Amendment 04 D8: the token a draft edit or approval must present.
+            "content_version": v.get("content_version"),
             "specification": {k: v.get(k) for k in _SKU_SPECIFICATION_KEYS},
             "quote_fields": _sku_quote_fields(v, quote_pending),
             "construction_version_id": v.get("construction_version_id"),
@@ -2603,15 +2628,302 @@ def get_sku(sku_id):
             "replaces": results["replaces"],
         },
         "sets": sets.get(sku_id, []) if set_detail == "visible" else None,
+        "history": history if history_detail == "visible" else None,
         "detail_visibility": {"customer": party_detail, "construction": construction_detail,
-                              "plant_adoption": adoption_detail, "locations": location_detail, "sets": set_detail},
+                              "plant_adoption": adoption_detail, "locations": location_detail, "sets": set_detail,
+                              "history": history_detail},
         "schema_pending": {"quote_fields": quote_pending, "sku_sets": set_detail == "schema_pending",
-                            "pricing_portfolio": portfolio_pending},
+                            "pricing_portfolio": portfolio_pending,
+                            # The governed operations and their history arrive together (Amendment 04).
+                            "governed_operations": history_detail == "schema_pending"},
         "mode": "governed_read_only",
         "authority": "caller_token_rls_only",
         "mutations": "none",
     })
 
+
+
+# ── SKU Master governed operations (Canonical Amendment 04, slice 1) ──────────
+#
+# Every write is ONE call to a `public.sku_*` invoker wrapper as the caller; the
+# database decides authority (manage_sku_master, or make_quote for a proposal at
+# that plant), field classes (a dimension, Construction, box type or strength change
+# is a NEW SKU - PT423), the lifecycle, and compare-and-swap (PT409). No service-role
+# client is used and nothing is written to a table directly: the direct path is
+# closed by the migration. These routes only shape and bound the request first, so
+# a malformed body is INVALID_INPUT before any database call.
+#
+# Until migration 20260916200000 is applied the wrappers do not exist; PostgREST
+# answers PGRST202 and the route returns SCHEMA_ACTIVATION_PENDING rather than a
+# generic failure.
+_SKU_OP_ERRORS = {"PT423": "NEW_SKU_REQUIRED", "PGRST202": "SCHEMA_ACTIVATION_PENDING",
+                  "42883": "SCHEMA_ACTIVATION_PENDING", "23514": "TRANSITION_NOT_ALLOWED",
+                  "23505": "TRANSITION_NOT_ALLOWED"}
+_SKU_TEXT_FIELDS = ("box_type", "item_name", "item_short_name", "item_family", "item_group", "print_quality",
+                    "print_technology", "colour_detail", "cobb_value", "stated_item_gsm", "stated_cs",
+                    "stated_bs", "stated_ect", "customer_spec_version")
+_SKU_NUMBER_FIELDS = ("length_mm", "width_mm", "height_mm", "spec_bs", "spec_bct", "spec_ect", "item_weight_kg")
+_SKU_INTEGER_FIELDS = ("construction_version_id", "ups", "number_of_colours")
+_SKU_REFERENCE_KINDS = ("customer_item_code", "softcomp_code", "legacy_plant_item_code", "alias", "other")
+_SKU_PRINT_TECHNOLOGIES = ("Flexo", "CMYK", "Offset", "Unprinted")
+_SKU_TEXT_MAX = 200
+_SKU_REASON_MAX = 500
+
+
+def _sku_op_fields(data):
+    """Validate a specification field set. Returns (fields, error_response)."""
+    fields = data.get("fields")
+    if not isinstance(fields, dict):
+        return None, _invalid_input("fields must be an object")
+    clean = {}
+    for key, value in fields.items():
+        if key in _SKU_TEXT_FIELDS:
+            if value is not None and (not isinstance(value, str) or len(value) > _SKU_TEXT_MAX):
+                return None, _invalid_input(f"{key} must be text of at most {_SKU_TEXT_MAX} characters, or null")
+            if key == "print_technology" and value is not None and value not in _SKU_PRINT_TECHNOLOGIES:
+                return None, _invalid_input("print_technology must be Flexo, CMYK, Offset or Unprinted")
+            if key == "box_type" and (value is None or not value.strip()):
+                return None, _invalid_input("box_type cannot be blank")
+            # A blank text is a cleared value, stored as null - never an empty string.
+            clean[key] = value.strip() if isinstance(value, str) and value.strip() else None
+        elif key in _SKU_NUMBER_FIELDS:
+            if value is not None and (isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0):
+                return None, _invalid_input(f"{key} must be a number of zero or more, or null")
+            clean[key] = value
+        elif key in _SKU_INTEGER_FIELDS:
+            if value is None and key != "construction_version_id" and key != "ups":
+                clean[key] = None
+                continue
+            if isinstance(value, bool) or not isinstance(value, int) or value < (1 if key != "number_of_colours" else 0):
+                return None, _invalid_input(f"{key} must be a whole number")
+            clean[key] = value
+        else:
+            return None, _invalid_input(f"{key} is not a SKU specification field")
+    return clean, None
+
+
+def _sku_op_expected(data):
+    expected = _int_field(data, "expected_content_version")
+    if expected is None or expected < 1:
+        return None, _invalid_input("expected_content_version is required")
+    return expected, None
+
+
+def _sku_op_reason(data, required=False):
+    reason = data.get("reason")
+    if reason is not None and not isinstance(reason, str):
+        return None, _invalid_input("reason must be text")
+    reason = (reason or "").strip()
+    if len(reason) > _SKU_REASON_MAX:
+        return None, _invalid_input(f"reason must be at most {_SKU_REASON_MAX} characters")
+    if required and not reason:
+        return None, _invalid_input("a reason is required")
+    return reason or None, None
+
+
+def _sku_rpc(name, params):
+    return _rpc_call(get_supabase_for_caller(g.access_token), name, params, error_map=_SKU_OP_ERRORS)
+
+
+def _sku_op_body():
+    data = request.get_json(silent=True)
+    return data if isinstance(data, dict) else {}
+
+
+@app.route("/masters/skus", methods=["POST"])
+@require_auth
+def propose_sku_route():
+    """Propose a SKU with its first specification version (D1: a Maker may, for speed)."""
+    data = _sku_op_body()
+    plant_code = data.get("plant_code")
+    if plant_code not in _sku_plant_scope(g.caller):
+        return _error("CAPABILITY_REQUIRED", "plant_access capability is required at the requested plant")
+    party_id = _int_field(data, "party_id")
+    if party_id is None or party_id < 1:
+        return _invalid_input("party_id is required")
+    if data.get("pricing_portfolio") not in _SKU_PORTFOLIOS:
+        return _invalid_input("pricing_portfolio must be Transactional or Strategic")
+    if not isinstance(data.get("is_price_driving"), bool):
+        return _invalid_input("is_price_driving must be true or false")
+    fields, bad = _sku_op_fields(data)
+    if bad:
+        return bad
+    if "construction_version_id" not in fields:
+        return _invalid_input("a Construction version is required")
+    try:
+        plants = _caller_rows(g.access_token, "plants", "id, plant_code", ("eq", "plant_code", plant_code))
+    except Exception as exc:
+        handled = _sku_read_error(exc, "SKU proposal plant read")
+        if handled is not None:
+            return handled
+        raise
+    if not plants:
+        return _error("RECORD_NOT_FOUND")
+    result, err = _sku_rpc("sku_propose", {
+        "p_plant": plants[0]["id"], "p_party": party_id, "p_pricing_portfolio": data["pricing_portfolio"],
+        "p_is_price_driving": data["is_price_driving"], "p_fields": fields})
+    if err:
+        return err
+    return jsonify({"id": result.data}), 201
+
+
+@app.route("/masters/skus/<int:sku_id>/versions", methods=["POST"])
+@require_auth
+def create_sku_version_route(sku_id):
+    """A new specification version (D2). A new-SKU field change is refused NEW_SKU_REQUIRED."""
+    data = _sku_op_body()
+    expected, bad = _sku_op_expected(data)
+    if bad:
+        return bad
+    if not isinstance(data.get("is_price_driving"), bool):
+        return _invalid_input("is_price_driving must be true or false")
+    fields, bad = _sku_op_fields(data)
+    if bad:
+        return bad
+    if not fields:
+        return _invalid_input("a new version must change at least one field")
+    result, err = _sku_rpc("sku_create_version", {
+        "p_sku": sku_id, "p_expected_content_version": expected,
+        "p_is_price_driving": data["is_price_driving"], "p_fields": fields})
+    if err:
+        return err
+    return jsonify({"id": result.data}), 201
+
+
+@app.route("/masters/sku-versions/<int:version_id>", methods=["PATCH"])
+@require_auth
+def update_sku_draft_version_route(version_id):
+    """Edit an unapproved draft version in place (D2)."""
+    data = _sku_op_body()
+    expected, bad = _sku_op_expected(data)
+    if bad:
+        return bad
+    price_driving = data.get("is_price_driving")
+    if price_driving is not None and not isinstance(price_driving, bool):
+        return _invalid_input("is_price_driving must be true, false or omitted")
+    fields, bad = _sku_op_fields(data)
+    if bad:
+        return bad
+    _, err = _sku_rpc("sku_update_draft_version", {
+        "p_version": version_id, "p_expected_content_version": expected,
+        "p_is_price_driving": price_driving, "p_fields": fields})
+    return err or jsonify({"ok": True})
+
+
+def _sku_simple_op(rpc, id_param, entity_id, extra=None):
+    data = _sku_op_body()
+    expected, bad = _sku_op_expected(data)
+    if bad:
+        return bad
+    params = {id_param: entity_id, "p_expected_content_version": expected, **(extra or {})}
+    _, err = _sku_rpc(rpc, params)
+    return err or jsonify({"ok": True})
+
+
+@app.route("/masters/sku-versions/<int:version_id>/approve", methods=["POST"])
+@require_auth
+def approve_sku_version_route(version_id):
+    """Approve a version (manage_sku_master; the proposer may approve their own - D1)."""
+    return _sku_simple_op("sku_approve_version", "p_version", version_id)
+
+
+@app.route("/masters/skus/<int:sku_id>/plant-item-code", methods=["POST"])
+@require_auth
+def assign_sku_plant_item_code_route(sku_id):
+    """Assign the permanent Plant Item Code (D3). It does not publish."""
+    data = _sku_op_body()
+    code = data.get("plant_item_code")
+    if not isinstance(code, str) or not code.strip() or len(code.strip()) > 60:
+        return _invalid_input("plant_item_code must be 1 to 60 characters")
+    return _sku_simple_op("sku_assign_plant_item_code", "p_sku", sku_id, {"p_code": code.strip()})
+
+
+@app.route("/masters/skus/<int:sku_id>/publish", methods=["POST"])
+@require_auth
+def publish_sku_route(sku_id):
+    """Proposed -> Active: needs a code, an approved version and a portfolio (D3)."""
+    return _sku_simple_op("sku_publish", "p_sku", sku_id)
+
+
+@app.route("/masters/skus/<int:sku_id>/discontinue", methods=["POST"])
+@require_auth
+def discontinue_sku_route(sku_id):
+    """Active -> Discontinued with a reason and an optional linked replacement (D4)."""
+    data = _sku_op_body()
+    reason, bad = _sku_op_reason(data, required=True)
+    if bad:
+        return bad
+    replacement = data.get("replacement_sku_id")
+    if replacement is not None:
+        replacement = _int_field(data, "replacement_sku_id")
+        if replacement is None or replacement < 1:
+            return _invalid_input("replacement_sku_id must be a SKU id or null")
+    return _sku_simple_op("sku_discontinue", "p_sku", sku_id,
+                          {"p_reason": reason, "p_replacement_sku": replacement})
+
+
+@app.route("/masters/skus/<int:sku_id>/reactivate", methods=["POST"])
+@require_auth
+def reactivate_sku_route(sku_id):
+    """Discontinued -> Active; identity is kept and the replacement link is cleared (D4)."""
+    reason, bad = _sku_op_reason(_sku_op_body())
+    if bad:
+        return bad
+    return _sku_simple_op("sku_reactivate", "p_sku", sku_id, {"p_reason": reason})
+
+
+@app.route("/masters/skus/<int:sku_id>/withdraw", methods=["POST"])
+@require_auth
+def withdraw_sku_route(sku_id):
+    """Proposed -> Withdrawn, terminal (D4, CDM-31)."""
+    reason, bad = _sku_op_reason(_sku_op_body())
+    if bad:
+        return bad
+    return _sku_simple_op("sku_withdraw", "p_sku", sku_id, {"p_reason": reason})
+
+
+@app.route("/masters/skus/<int:sku_id>/pricing-portfolio", methods=["POST"])
+@require_auth
+def set_sku_pricing_portfolio_route(sku_id):
+    """Reclassify in place (CDM-45 C-03). Recorded only: it sets no price."""
+    data = _sku_op_body()
+    if data.get("pricing_portfolio") not in _SKU_PORTFOLIOS:
+        return _invalid_input("pricing_portfolio must be Transactional or Strategic")
+    reason, bad = _sku_op_reason(data)
+    if bad:
+        return bad
+    return _sku_simple_op("sku_set_pricing_portfolio", "p_sku", sku_id,
+                          {"p_pricing_portfolio": data["pricing_portfolio"], "p_reason": reason})
+
+
+@app.route("/masters/skus/<int:sku_id>/references", methods=["POST"])
+@require_auth
+def add_sku_reference_route(sku_id):
+    """Add an external reference (D5)."""
+    data = _sku_op_body()
+    expected, bad = _sku_op_expected(data)
+    if bad:
+        return bad
+    kind, value = data.get("reference_kind"), data.get("reference_value")
+    if kind not in _SKU_REFERENCE_KINDS:
+        return _invalid_input("reference_kind is not a recognised kind")
+    if not isinstance(value, str) or not value.strip() or len(value.strip()) > 120:
+        return _invalid_input("reference_value must be 1 to 120 characters")
+    result, err = _sku_rpc("sku_add_reference", {
+        "p_sku": sku_id, "p_expected_content_version": expected, "p_kind": kind, "p_value": value.strip()})
+    if err:
+        return err
+    return jsonify({"id": result.data}), 201
+
+
+@app.route("/masters/sku-references/<int:reference_id>/withdraw", methods=["POST"])
+@require_auth
+def withdraw_sku_reference_route(reference_id):
+    """Withdraw a reference; the SKU's token guards it (D5, D8)."""
+    reason, bad = _sku_op_reason(_sku_op_body())
+    if bad:
+        return bad
+    return _sku_simple_op("sku_withdraw_reference", "p_reference", reference_id, {"p_reason": reason})
 
 @app.route("/masters/customer-families", methods=["GET"])
 @require_auth
@@ -2825,6 +3137,8 @@ _ERROR_STATUS = {
     # exist. Distinct from INVALID_INPUT (the caller asked wrongly) and from
     # MASTER_UNAVAILABLE (the whole master is absent in this environment).
     "SCHEMA_ACTIVATION_PENDING": 503,
+    # Amendment 04 D2 / CDM-10: the change asked for is a new SKU, not a version.
+    "NEW_SKU_REQUIRED": 422,
     # A genuine serialization failure is transient: the caller may safely retry
     # the SAME request unchanged. Distinct from STALE_VERSION, where retrying
     # unchanged is guaranteed to fail again.
@@ -2851,6 +3165,8 @@ _ERROR_MESSAGE = {
     "MASTER_UNAVAILABLE": "This master is not available in this environment.",
     "SCHEMA_ACTIVATION_PENDING": "That field's storage is not activated in this environment yet, "
                                  "so it cannot be read or filtered.",
+    "NEW_SKU_REQUIRED": "A dimension, Construction, box type or strength change is a new SKU, not a new "
+                        "version. Propose it as a new SKU instead.",
     "SERIALIZATION_FAILURE": "The database could not complete that under concurrent load. "
                              "Nothing was changed — please try again.",
     # D2 CORRECTION. This must NOT claim the write did not happen. A client-side
