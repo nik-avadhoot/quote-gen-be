@@ -18,6 +18,10 @@ WHAT EACH GROUP WOULD CATCH:
           a denial into "no customer" for a NOT NULL party_id.
   SKU-5/6 unvalidated or in-memory filters; a literal `_` search matching as a
           LIKE wildcard.
+  SKU-22  the one identity box widened past identity (a lifecycle, plant or
+          specification value matching), narrowed below it (a code or Customer
+          name missed), leaking another plant's rows into a sub-query, or going
+          quiet when a field has no storage or the caller may not read it.
   SKU-8   an unbounded catalogue, or a silent truncation.
   SKU-9   blank/zero collapse, or a stale (non-current) Family label.
   SKU-10  actor attribution leaking into selected columns or the body.
@@ -123,7 +127,10 @@ class FakeQuery:
         # Amendment 02 migration not activated: its columns and tables do not exist.
         if SCHEMA_PENDING and self.table in ("sku_sets", "sku_set_members"):
             raise server.APIError({"code": "PGRST205", "message": "Could not find the table"})
-        if SCHEMA_PENDING and self.table == "sku_versions" and "print_technology" in str(self.columns):
+        pending_cols = ("print_technology", "item_name", "item_short_name")
+        if SCHEMA_PENDING and self.table == "sku_versions" and (
+                any(c in str(self.columns) for c in pending_cols)
+                or any(f[1] in pending_cols for f in self.filters)):
             raise server.APIError({"code": "42703", "message": "column sku_versions.item_name does not exist"})
         if self.table == FAIL_TABLE:
             if RAISE_API_ERROR:
@@ -367,7 +374,7 @@ check(("eq", "status", "active") in filters and ("in", "plant_id", [7]) in filte
 check([row["id"] for row in body["skus"]] == [101] and body["filters"]["status"] == "active",
       "SKU-6a only the matching SKU returns, and the applied filters are echoed")
 r, body = get("/masters/skus?q=IT_0")
-check(("ilike", "plant_item_code", "%IT\\_0%") in calls_to("skus")[0]["filters"],
+check(any(("ilike", "plant_item_code", "%IT\\_0%") in c["filters"] for c in calls_to("skus")),
       "SKU-6b the Plant Item Code search is a database ilike with `_` escaped")
 check([row["id"] for row in body["skus"]] == [103],
       "SKU-6c a literal `_` search does not match `-` as a wildcard would")
@@ -627,6 +634,136 @@ check(r.status_code == 200 and body["sets"] is None and body["detail_visibility"
       "SKU-21d a failed SKU Set read is unavailable, not pending and not an empty set")
 FAIL_TABLE = None
 app.config["PROPAGATE_EXCEPTIONS"] = None
+
+# ──────────────────────────────── SKU-22 one search box, identity factors only
+#
+# Identity is: Plant Item Code, Item Name, Item Short Name, Customer Item Code,
+# SoftComp Code and the owning Customer's name. Nothing else - lifecycle, plant,
+# portfolio and every specification field keep their own controls.
+CALLER = FULL
+
+
+def search_ids(q, extra=""):
+    _r, b = get(f"/masters/skus?q={q}{extra}")
+    return sorted(row["id"] for row in b["skus"]), b
+
+
+ids, body = search_ids("NAG-IT-0001")
+check(ids == [101], "SKU-22 the Plant Item Code is an identity factor")
+ids, _b = search_ids("Carton")
+check(ids == [101], "SKU-22a the SKU version Item Name is an identity factor")
+ids, _b = search_ids("FC")
+check(ids == [101], "SKU-22b the Item Short Name is an identity factor")
+ids, _b = search_ids("CUST-778")
+check(ids == [101], "SKU-22c the Customer Item Code reference is an identity factor")
+ids, _b = search_ids("011145")
+check(ids == [101], "SKU-22d the SoftComp Code reference is an identity factor")
+ids, _b = search_ids("Prospect")
+check(ids == [103, 104], "SKU-22e the linked Customer's name is an identity factor")
+
+check(search_ids("RSC")[0] == [] and search_ids("2L")[0] == [],
+      "SKU-22f a specification value (box type, item group) is NOT searched")
+check(search_ids("discontinued")[0] == [] and search_ids("Nagpur")[0] == [],
+      "SKU-22g lifecycle and plant are NOT searched - they keep their own controls")
+check(search_ids("Old")[0] == [],
+      "SKU-22h a withdrawn alias is neither an active reference nor a searched kind")
+
+ids, body = search_ids("Distillers%20011145")
+check(ids == [101],
+      "SKU-22i words narrow: a Customer word and a code word must both match the same SKU")
+check(search_ids("Distillers")[0] == [101, 102] and search_ids("011145")[0] == [101],
+      "SKU-22j and each of those words alone matches more than the pair does")
+
+r, body = get("/masters/skus?q=Fixture")
+check(sorted(row["id"] for row in body["skus"]) == [101, 102, 103, 104]
+      and all(row["plant"]["plant_code"] == "NAG" for row in body["skus"]),
+      "SKU-22k a match at a plant outside plant_access never returns")
+# A search sub-query is the one that selects nothing but an id, so these two
+# checks cover exactly the reads the search added and no others.
+search_calls = [c for c in CALLS if c["columns"] in ("id", "sku_id")]
+for table in ("skus", "sku_versions", "sku_external_references"):
+    of_table = [c for c in search_calls if c["table"] == table]
+    check(of_table and all(("in", "plant_id", [7, 8]) in c["filters"] for c in of_table),
+          f"SKU-22l every {table} sub-query is bounded to the caller's plant_access plants")
+check(len(search_calls) >= 6 and all(c["limit"] is not None for c in search_calls),
+      "SKU-22m every search read is bounded by a limit")
+check([c["table"] for c in search_calls if c["table"] not in
+       ("skus", "sku_versions", "sku_external_references", "parties")] == [],
+      "SKU-22ma and the search reads no table beyond the identity factors")
+
+ids, body = search_ids("Fixture", "&status=active")
+check(ids == [101] and any(("eq", "status", "active") in c["filters"] for c in calls_to("skus")),
+      "SKU-22n the lifecycle filter bounds the search itself, in the database")
+ids, body = search_ids("Fixture", "&family_id=202")
+check(ids == [101, 102],
+      "SKU-22o the Customer Family filter bounds the search the same way")
+
+r, body = get("/masters/skus?q=Fixture")
+check(body["search"]["terms"] == ["Fixture"] and body["search"]["executed"] is True
+      and body["search"]["degraded"] is False and body["search"]["scan_truncated"] is False
+      and body["search"]["fields"] == {"plant_item_code": "searched", "item_name": "searched",
+                                       "item_short_name": "searched", "customer_item_code": "searched",
+                                       "softcomp_code": "searched", "customer_name": "searched"},
+      "SKU-22p the response states which identity fields were actually searched")
+r, body = get("/masters/skus")
+check(body["search"] is None,
+      "SKU-22q a request with no search carries no search report")
+r, body = get("/masters/skus?q=Fixture%20fixture%20FIXTURE")
+check(body["search"]["terms"] == ["Fixture"],
+      "SKU-22r repeated words are de-duplicated rather than re-queried")
+
+r, body = get("/masters/skus?q=" + "%20".join(f"a{n}" for n in range(6)))
+check(r.status_code == 400 and body.get("error_code") == "INVALID_INPUT" and not CALLS,
+      "SKU-22s more words than the bound is refused 400 before any read")
+
+# Amendment 02 not activated: the two name fields have no storage at all.
+SCHEMA_PENDING = True
+r, body = get("/masters/skus?q=Carton")
+check(r.status_code == 200 and body["search"]["fields"]["item_name"] == "schema_pending"
+      and body["search"]["fields"]["item_short_name"] == "schema_pending"
+      and body["search"]["degraded"] is True,
+      "SKU-22t without the Amendment 02 migration the name fields report schema_pending")
+check(body["skus"] == [] and body["search"]["fields"]["plant_item_code"] == "searched",
+      "SKU-22u the name match is missed VISIBLY, and the code fields still search")
+check("column sku_versions" not in r.get_data(as_text=True),
+      "SKU-22v the database error text does not reach the client")
+SCHEMA_PENDING = False
+
+# A Maker without read_party_master: the Customer-name pass is not issued at
+# all, because RLS would answer "no such Customer" and drop rows in silence.
+CALLER = MAKER
+r, body = get("/masters/skus?q=Distillers")
+check(body["search"]["fields"]["customer_name"] == "not_visible_to_caller"
+      and body["search"]["degraded"] is True and not calls_to("parties"),
+      "SKU-22w without read_party_master the Customer-name pass is declared, not attempted")
+check(body["skus"] == [],
+      "SKU-22x and the rows it would have matched are missing visibly, not silently")
+
+CALLER = FULL
+app.config["PROPAGATE_EXCEPTIONS"] = False
+FAIL_TABLE = "sku_external_references"
+r, body = get("/masters/skus?q=011145")
+check(r.status_code == 200 and body["search"]["fields"]["customer_item_code"] == "unavailable"
+      and body["search"]["fields"]["softcomp_code"] == "unavailable"
+      and body["search"]["degraded"] is True,
+      "SKU-22y a failed code sub-query degrades that field, it does not fail the screen")
+FAIL_TABLE = None
+RAISE_API_ERROR = True
+FAIL_TABLE = "sku_versions"
+r, body = get("/masters/skus?q=Carton")
+check(r.status_code == 403 and body.get("error_code") == "CAPABILITY_REQUIRED",
+      "SKU-22z a genuine permission denial in a sub-query is refused, never degraded to no match")
+FAIL_TABLE = None
+RAISE_API_ERROR = False
+app.config["PROPAGATE_EXCEPTIONS"] = None
+
+ROWS = dict(BASE_ROWS, skus=[
+    {"id": 6000 + i, "plant_id": 7, "party_id": 501, "plant_item_code": f"BULK-{i:04d}",
+     "status": "active", "replacement_sku_id": None, "content_version": 1} for i in range(420)])
+r, body = get("/masters/skus?q=BULK")
+check(body["search"]["scan_truncated"] is True and len(body["skus"]) == 200 and body["truncated"] is True,
+      "SKU-22aa reaching a per-field scan bound is reported, never a silent partial search")
+ROWS = BASE_ROWS
 
 print()
 print(f"{PASSES} passed, {len(FAILURES)} failed")

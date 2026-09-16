@@ -1606,6 +1606,28 @@ _SKU_CATALOGUE_LIMIT = 200
 _SKU_SEARCH_MAX = 60
 _SKU_SEARCH_CHARS = frozenset(
     "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 ._/-")
+# One search box, IDENTITY ONLY.
+#
+# `q` matches identity factors and nothing else: the Plant Item Code, the SKU
+# version's Item Name and Item Short Name, the Customer Item Code and SoftComp
+# Code external references, and the owning Customer's name. Lifecycle, plant,
+# portfolio and every specification field keep their own controls and are
+# deliberately NOT searched from this box.
+#
+# Each word must match SOMEWHERE - words narrow, they never widen - so
+# "pernod 375" finds a Customer plus a code fragment on the same SKU.
+_SKU_SEARCH_MAX_TERMS = 5
+_SKU_SEARCH_WORKERS = 8
+# Each sub-query is bounded. Reaching a bound is REPORTED, never silent.
+_SKU_SEARCH_CANDIDATE_LIMIT = 400
+_SKU_SEARCH_PARTY_LIMIT = 200
+_SKU_SEARCH_FIELDS = ("plant_item_code", "item_name", "item_short_name",
+                      "customer_item_code", "softcomp_code", "customer_name")
+# Amendment 02 storage: searched only once that migration is applied.
+_SKU_SEARCH_VERSION_FIELDS = ("item_name", "item_short_name")
+# The two reference kinds that are CODES (CDM-10, Amendment 02 B-05).
+# `alias`, `other` and `legacy_plant_item_code` are not searched from this box.
+_SKU_SEARCH_REFERENCE_FIELDS = ("customer_item_code", "softcomp_code")
 _SKU_COLUMNS = "id, plant_id, party_id, plant_item_code, status, replacement_sku_id, content_version"
 _SKU_VERSION_BASE_COLUMNS = ("id, sku_id, version_no, construction_version_id, is_price_driving, approved_at, "
                              "length_mm, width_mm, height_mm, box_type, ups, spec_bs, spec_bct, spec_ect")
@@ -1833,6 +1855,122 @@ def _sku_read_error(exc, what):
     return None
 
 
+def _sku_search_terms(search):
+    """Whitespace words, de-duplicated case-insensitively, order preserved."""
+    seen, terms = set(), []
+    for word in (search or "").split():
+        key = word.casefold()
+        if key not in seen:
+            seen.add(key)
+            terms.append(word)
+    return terms
+
+
+def _sku_like(term):
+    # `_` and `%` are LIKE wildcards; escape them so a code search stays literal.
+    return "%" + term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+
+
+def _sku_search_field_states(caller):
+    """What the one search box can cover for THIS caller, before any read."""
+    fields = {name: "searched" for name in _SKU_SEARCH_FIELDS}
+    if "read_party_master" not in (caller.get("group_capabilities") or []):
+        fields["customer_name"] = "not_visible_to_caller"
+    return fields
+
+
+def _sku_search_candidates(caller, caller_token, terms, plant_ids, scope_filters):
+    """Resolve an identity search to SKU ids, entirely in the database.
+
+    CALLER-SCOPED BY CONSTRUCTION. Every sub-query carries the caller's own
+    token AND `plant_id in <the caller's plant_access plants>`, so a row at
+    another plant is never loaded, let alone filtered out in memory. The
+    Customer-name pass reads party identity only - never SKUs - and then
+    re-enters through that same plant-scoped `skus` query.
+
+    HONEST DEGRADATION. `fields` reports what was ACTUALLY searched:
+
+      * `item_name` / `item_short_name` are `schema_pending` until the
+        Amendment 02 migration is applied - they have no storage yet, so a SKU
+        whose only match would be its name cannot be found, and the screen says
+        so instead of reading as "no match";
+      * `customer_name` is `not_visible_to_caller` without `read_party_master`,
+        because RLS would otherwise answer "no such Customer" and silently drop
+        every row a Customer-name word would have matched;
+      * any other failed sub-query is `unavailable`.
+
+    Returns (sorted ids, fields, scanned_to_limit). `scanned_to_limit` says a
+    bound was reached, so more rows may match than were scanned.
+    """
+    fields = _sku_search_field_states(caller)
+
+    def _sku_ids(*filters):
+        rows = _caller_rows(caller_token, "skus", "id", ("in_", "plant_id", plant_ids), *scope_filters,
+                            *filters, ("order", "id"), ("limit", _SKU_SEARCH_CANDIDATE_LIMIT))
+        return {r["id"] for r in rows}, len(rows) >= _SKU_SEARCH_CANDIDATE_LIMIT
+
+    def _child_sku_ids(table, *filters):
+        rows = _caller_rows(caller_token, table, "sku_id", ("in_", "plant_id", plant_ids),
+                            *filters, ("order", "id"), ("limit", _SKU_SEARCH_CANDIDATE_LIMIT))
+        return {r["sku_id"] for r in rows}, len(rows) >= _SKU_SEARCH_CANDIDATE_LIMIT
+
+    def _run(item):
+        term, field = item
+        like = _sku_like(term)
+        try:
+            if field == "plant_item_code":
+                return item, _sku_ids(("ilike", "plant_item_code", like))
+            if field in _SKU_SEARCH_VERSION_FIELDS:
+                return item, _child_sku_ids("sku_versions", ("ilike", field, like))
+            if field in _SKU_SEARCH_REFERENCE_FIELDS:
+                return item, _child_sku_ids("sku_external_references",
+                                            ("eq", "reference_kind", field), ("eq", "status", "active"),
+                                            ("ilike", "reference_value", like))
+            parties = _caller_rows(caller_token, "parties", "id", ("ilike", "display_name", like),
+                                   ("order", "id"), ("limit", _SKU_SEARCH_PARTY_LIMIT))
+            capped = len(parties) >= _SKU_SEARCH_PARTY_LIMIT
+            if not parties:
+                return item, (set(), capped)
+            ids, more = _sku_ids(("in_", "party_id", [p["id"] for p in parties]))
+            return item, (ids, capped or more)
+        except Exception as exc:  # noqa: BLE001 - classified by the caller, below
+            return item, exc
+
+    work = [(t, f) for t in terms for f in _SKU_SEARCH_FIELDS if fields[f] == "searched"]
+    results = {}
+    if work:
+        with timed("skus.identity_search_parallel"):
+            with ThreadPoolExecutor(max_workers=min(len(work), _SKU_SEARCH_WORKERS)) as pool:
+                results = dict(pool.map(_run, work))
+
+    # Classify failures FIRST, so a field that has no storage, or could not be
+    # read, is excluded from EVERY term rather than silently narrowing one.
+    for (_term, field), outcome in results.items():
+        if not isinstance(outcome, Exception):
+            continue
+        if _sku_schema_pending(outcome) and field in _SKU_SEARCH_VERSION_FIELDS:
+            fields[field] = "schema_pending"
+        elif _sku_read_error(outcome, "SKU identity search") is not None:
+            raise outcome
+        else:
+            app.logger.warning("SKU identity search on %s failed (degrading): %s", field, outcome)
+            fields[field] = "unavailable"
+
+    scanned, per_term = False, []
+    for term in terms:
+        ids = set()
+        for field in _SKU_SEARCH_FIELDS:
+            if fields[field] != "searched":
+                continue
+            outcome = results.get((term, field))
+            if isinstance(outcome, tuple):
+                ids |= outcome[0]
+                scanned = scanned or outcome[1]
+        per_term.append(ids)
+    matched = set.intersection(*per_term) if per_term else set()
+    return sorted(matched), fields, scanned
+
+
 @app.route("/masters/skus", methods=["GET"])
 @require_auth
 def list_skus():
@@ -1840,11 +1978,20 @@ def list_skus():
 
     Filters are applied in the database query, never by loading the tenant and
     filtering in memory: `plant` (a plant code the caller holds plant_access
-    at), `status`, `q` (Plant Item Code contains), `party_id` and `family_id`
-    (both require read_party_master). The window is capped; `truncated` says
-    when more rows matched than were returned. Each row carries its latest
-    version's quote fields, Construction identity, references, Location
-    applicability and SKU Sets, each with its own visibility.
+    at), `status`, `party_id` and `family_id` (both require read_party_master),
+    and `q`. The window is capped; `truncated` says when more rows matched than
+    were returned. Each row carries its latest version's quote fields,
+    Construction identity, references, Location applicability and SKU Sets,
+    each with its own visibility.
+
+    `q` IS ONE BOX OVER IDENTITY ONLY - Plant Item Code, Item Name, Item Short
+    Name, Customer Item Code, SoftComp Code and the owning Customer's name.
+    Lifecycle, plant, portfolio and specification stay on their own controls.
+    Every word must match somewhere, so words narrow the result. `search.fields`
+    reports which of those six were ACTUALLY searched, because Item Name has no
+    storage until the Amendment 02 migration is applied and Customer name needs
+    `read_party_master`: the box degrades visibly rather than missing rows in
+    silence. `search.scan_truncated` says a per-field bound was reached.
     """
     scope_codes = _sku_plant_scope(g.caller)
     if not scope_codes:
@@ -1860,6 +2007,9 @@ def list_skus():
     search = (args.get("q") or "").strip() or None
     if search is not None and (len(search) > _SKU_SEARCH_MAX or not set(search) <= _SKU_SEARCH_CHARS):
         return _invalid_input("q must be at most 60 letters, digits, spaces or . _ / - characters")
+    terms = _sku_search_terms(search)
+    if len(terms) > _SKU_SEARCH_MAX_TERMS:
+        return _invalid_input(f"q must be at most {_SKU_SEARCH_MAX_TERMS} words")
     party_id, bad = _positive_int_arg(args, "party_id")
     if bad:
         return bad
@@ -1884,18 +2034,26 @@ def list_skus():
         if party_id is not None:
             party_filter = {party_id} if party_filter is None else party_filter & {party_id}
 
-        skus = []
+        skus, search_ran, search_scanned = [], False, False
+        search_fields = _sku_search_field_states(g.caller)
         if plant_by_id and party_filter != set():
-            filters = [("in_", "plant_id", sorted(plant_by_id))]
+            # Status and Customer scope bound the identity search too, so the
+            # capped candidate window holds only rows the screen would show.
+            scope_filters = []
             if status:
-                filters.append(("eq", "status", status))
-            if search:
-                # `_` is a LIKE wildcard; escape it so a code search stays literal.
-                filters.append(("ilike", "plant_item_code", "%" + search.replace("_", "\\_") + "%"))
+                scope_filters.append(("eq", "status", status))
             if party_filter is not None:
-                filters.append(("in_", "party_id", sorted(party_filter)))
-            filters += [("order", "id"), ("limit", _SKU_CATALOGUE_LIMIT + 1)]
-            skus = _caller_rows(token, "skus", _SKU_COLUMNS, *filters)
+                scope_filters.append(("in_", "party_id", sorted(party_filter)))
+            filters = [("in_", "plant_id", sorted(plant_by_id))] + scope_filters
+            matched = None
+            if terms:
+                search_ran = True
+                matched, search_fields, search_scanned = _sku_search_candidates(
+                    g.caller, token, terms, sorted(plant_by_id), scope_filters)
+                filters.append(("in_", "id", matched))
+            if matched is None or matched:
+                filters += [("order", "id"), ("limit", _SKU_CATALOGUE_LIMIT + 1)]
+                skus = _caller_rows(token, "skus", _SKU_COLUMNS, *filters)
         truncated = len(skus) > _SKU_CATALOGUE_LIMIT
         skus = skus[:_SKU_CATALOGUE_LIMIT]
 
@@ -1959,6 +2117,11 @@ def list_skus():
         "limit": _SKU_CATALOGUE_LIMIT,
         "filters": {"plant": plant_code, "status": status, "q": search,
                     "party_id": party_id, "family_id": family_id},
+        # What the one identity box actually covered on THIS request.
+        "search": ({"q": search, "terms": terms, "executed": search_ran, "fields": search_fields,
+                    "scan_truncated": search_scanned,
+                    "degraded": any(state != "searched" for state in search_fields.values())}
+                   if terms else None),
         "plant_scope": scope_codes,
         "detail_visibility": {"customer": party_detail, "construction": construction_detail,
                               "references": reference_detail, "locations": location_detail, "sets": set_detail},
