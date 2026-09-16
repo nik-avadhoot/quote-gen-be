@@ -18,6 +18,9 @@ WHAT EACH GROUP WOULD CATCH:
           a denial into "no customer" for a NOT NULL party_id.
   SKU-5/6 unvalidated or in-memory filters; a literal `_` search matching as a
           LIKE wildcard.
+  SKU-23  the CDM-45 pricing portfolio guessed, defaulted, made writable, or
+          allowed to reach a pricing decision; a portfolio filter silently
+          ignored while its storage is pending.
   SKU-22  the one identity box widened past identity (a lifecycle, plant or
           specification value matching), narrowed below it (a code or Customer
           name missed), leaking another plant's rows into a sub-query, or going
@@ -132,6 +135,11 @@ class FakeQuery:
                 any(c in str(self.columns) for c in pending_cols)
                 or any(f[1] in pending_cols for f in self.filters)):
             raise server.APIError({"code": "42703", "message": "column sku_versions.item_name does not exist"})
+        # Amendment 03 migration not activated: skus.pricing_portfolio does not exist.
+        if SCHEMA_PENDING and self.table == "skus" and (
+                "pricing_portfolio" in str(self.columns)
+                or any(f[1] == "pricing_portfolio" for f in self.filters)):
+            raise server.APIError({"code": "42703", "message": "column skus.pricing_portfolio does not exist"})
         if self.table == FAIL_TABLE:
             if RAISE_API_ERROR:
                 raise server.APIError({"code": "42501", "message": "permission denied"})
@@ -187,15 +195,15 @@ BASE_ROWS = {
     # Actor attribution is present ON PURPOSE so the projection checks can fail.
     "skus": [
         {"id": 101, "plant_id": 7, "party_id": 501, "plant_item_code": "NAG-IT-0001", "status": "active",
-         "replacement_sku_id": None, "content_version": 2, "created_by": 3},
+         "replacement_sku_id": None, "content_version": 2, "created_by": 3, "pricing_portfolio": "Strategic"},
         {"id": 102, "plant_id": 7, "party_id": 501, "plant_item_code": None, "status": "proposed",
-         "replacement_sku_id": None, "content_version": 1, "created_by": 3},
+         "replacement_sku_id": None, "content_version": 1, "created_by": 3, "pricing_portfolio": "Transactional"},
         {"id": 103, "plant_id": 7, "party_id": 502, "plant_item_code": "NAG_IT_0003", "status": "discontinued",
-         "replacement_sku_id": 101, "content_version": 4, "created_by": 3},
+         "replacement_sku_id": 101, "content_version": 4, "created_by": 3, "pricing_portfolio": "Transactional"},
         {"id": 104, "plant_id": 7, "party_id": 502, "plant_item_code": "NAG-IT-0004", "status": "discontinued",
-         "replacement_sku_id": 999, "content_version": 3, "created_by": 3},
+         "replacement_sku_id": 999, "content_version": 3, "created_by": 3, "pricing_portfolio": "Strategic"},
         {"id": 201, "plant_id": 8, "party_id": 503, "plant_item_code": "PUN-IT-0001", "status": "active",
-         "replacement_sku_id": None, "content_version": 1, "created_by": 3},
+         "replacement_sku_id": None, "content_version": 1, "created_by": 3, "pricing_portfolio": "Strategic"},
     ],
     "sku_versions": [
         {"id": 1001, "sku_id": 101, "plant_id": 7, "version_no": 1, "construction_version_id": 41,
@@ -458,7 +466,7 @@ check(qf1["print_technology"] == "Flexo" and qf1["number_of_colours"] == 0 and q
       and qf1["item_weight_kg"] == 0.3 and qf1["stated_ect"] is None
       and qf2["print_technology"] is None and qf2["item_weight_kg"] == 0,
       "SKU-12e CDM-43 quote fields return per version with blank, NA and zero kept apart")
-check(body["schema_pending"] == {"quote_fields": False, "sku_sets": False}
+check(body["schema_pending"] == {"quote_fields": False, "sku_sets": False, "pricing_portfolio": False}
       and "unrecorded_specification_fields" not in body,
       "SKU-12e2 with the migration active nothing is reported pending")
 check(body["detail_visibility"] == {"customer": "visible", "construction": "visible",
@@ -600,7 +608,7 @@ check(row101["sets"][0]["role"] == "box" and by_id[102]["sets"][0]["qty_per_set"
       "SKU-20e catalogue rows carry SKU Set membership with quantity per set")
 check(body["detail_visibility"] == {"customer": "visible", "construction": "visible", "references": "visible",
                                     "locations": "visible", "sets": "visible"}
-      and body["schema_pending"] == {"quote_fields": False, "sku_sets": False},
+      and body["schema_pending"] == {"quote_fields": False, "sku_sets": False, "pricing_portfolio": False},
       "SKU-20f catalogue visibility and schema state are reported per section")
 CALLER = MAKER
 r, body = get("/masters/skus?plant=NAG")
@@ -615,14 +623,14 @@ CALLER = FULL
 SCHEMA_PENDING = True
 r, body = get("/masters/skus?plant=NAG")
 row = {x["id"]: x for x in body["skus"]}[101]
-check(r.status_code == 200 and body["schema_pending"] == {"quote_fields": True, "sku_sets": True},
+check(r.status_code == 200 and body["schema_pending"] == {"quote_fields": True, "sku_sets": True, "pricing_portfolio": True},
       "SKU-21 an unactivated migration still serves the catalogue and says what is pending")
 check(row["latest_version"]["quote_fields"] is None and row["latest_version"]["length_mm"] == 300.0
       and row["sets"] is None and body["detail_visibility"]["sets"] == "schema_pending",
       "SKU-21a pending fields are null, never blank values, while S4-2 fields still return")
 r, body = get("/masters/skus/101")
 check(r.status_code == 200 and all(v["quote_fields"] is None for v in body["versions"])
-      and body["sets"] is None and body["schema_pending"] == {"quote_fields": True, "sku_sets": True},
+      and body["sets"] is None and body["schema_pending"] == {"quote_fields": True, "sku_sets": True, "pricing_portfolio": True},
       "SKU-21b the detail route falls back the same way")
 check("column sku_versions" not in r.get_data(as_text=True),
       "SKU-21c the database error text does not reach the client")
@@ -764,6 +772,75 @@ r, body = get("/masters/skus?q=BULK")
 check(body["search"]["scan_truncated"] is True and len(body["skus"]) == 200 and body["truncated"] is True,
       "SKU-22aa reaching a per-field scan bound is reported, never a silent partial search")
 ROWS = BASE_ROWS
+
+# ──────────────────────── SKU-23 the CDM-45 pricing portfolio, recorded only
+CALLER = FULL
+r, body = get("/masters/skus?plant=NAG")
+rows_by_id = {row["id"]: row for row in body["skus"]}
+check(rows_by_id[101]["pricing_portfolio"] == "Strategic"
+      and rows_by_id[103]["pricing_portfolio"] == "Transactional",
+      "SKU-23 every SKU row carries its recorded pricing portfolio")
+check(body["schema_pending"]["pricing_portfolio"] is False,
+      "SKU-23a and the response says its storage is activated")
+r, body = get("/masters/skus/101")
+check(body["sku"]["pricing_portfolio"] == "Strategic",
+      "SKU-23b the detail route carries it too")
+
+r, body = get("/masters/skus?plant=NAG&portfolio=Strategic")
+check(sorted(row["id"] for row in body["skus"]) == [101, 104]
+      and body["filters"]["portfolio"] == "Strategic",
+      "SKU-23c the portfolio filter selects only that portfolio, and is echoed")
+check(any(("eq", "pricing_portfolio", "Strategic") in c["filters"] for c in calls_to("skus")),
+      "SKU-23d the filter is applied in the database, never in memory")
+r, body = get("/masters/skus?portfolio=Premium")
+check(r.status_code == 400 and body.get("error_code") == "INVALID_INPUT" and not calls_to("skus"),
+      "SKU-23e a value outside the closed vocabulary is refused before any read")
+
+# It is READ-ONLY and it decides NOTHING about price.
+sku_rules = [rule for rule in app.url_map.iter_rules() if str(rule).startswith("/masters/skus")]
+check(sku_rules and all(set(rule.methods) <= {"GET", "HEAD", "OPTIONS"} for rule in sku_rules),
+      "SKU-23f the SKU Master exposes no write method at all, so nothing can set a portfolio here")
+r, body = get("/masters/skus?plant=NAG")
+response_keys = set()
+
+
+def collect_keys(node):
+    if isinstance(node, dict):
+        response_keys.update(node.keys())
+        for value in node.values():
+            collect_keys(value)
+    elif isinstance(node, list):
+        for value in node:
+            collect_keys(value)
+
+
+collect_keys(body)
+# `is_price_driving` is CDM-10: it records whether a SKU VERSION changed a
+# price-driving specification. It predates CDM-45 and is not derived from the
+# portfolio; every other pricing-shaped key would be.
+pricing_keys = sorted(key for key in response_keys if key != "is_price_driving"
+                      and any(word in key for word in ("rate", "margin", "discount", "price", "floor")))
+check(body["mutations"] == "none" and not pricing_keys,
+      "SKU-23g no rate, margin, discount, price or floor field is derived from the portfolio")
+
+# Amendment 03 not activated: the column does not exist.
+SCHEMA_PENDING = True
+r, body = get("/masters/skus?plant=NAG")
+check(r.status_code == 200 and body["schema_pending"]["pricing_portfolio"] is True
+      and all(row["pricing_portfolio"] is None for row in body["skus"]),
+      "SKU-23h without the Amendment 03 migration the portfolio is null and reported pending")
+check(body["skus"] and body["skus"][0]["plant_item_code"] is not None,
+      "SKU-23i and the rest of the catalogue still serves")
+r, body = get("/masters/skus?plant=NAG&portfolio=Strategic")
+check(r.status_code == 503 and body.get("error_code") == "SCHEMA_ACTIVATION_PENDING",
+      "SKU-23j a portfolio filter is REFUSED while pending, never silently ignored")
+check("pricing_portfolio" not in r.get_data(as_text=True).lower().replace("pricing portfolio", ""),
+      "SKU-23k and the database column name does not reach the client")
+r, body = get("/masters/skus/101")
+check(r.status_code == 200 and body["sku"]["pricing_portfolio"] is None
+      and body["schema_pending"]["pricing_portfolio"] is True,
+      "SKU-23l the detail route falls back the same way")
+SCHEMA_PENDING = False
 
 print()
 print(f"{PASSES} passed, {len(FAILURES)} failed")

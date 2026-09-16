@@ -1629,6 +1629,11 @@ _SKU_SEARCH_VERSION_FIELDS = ("item_name", "item_short_name")
 # `alias`, `other` and `legacy_plant_item_code` are not searched from this box.
 _SKU_SEARCH_REFERENCE_FIELDS = ("customer_item_code", "softcomp_code")
 _SKU_COLUMNS = "id, plant_id, party_id, plant_item_code, status, replacement_sku_id, content_version"
+# Amendment 03, CDM-45: the SKU's pricing portfolio. Mandatory in the database,
+# read-only here, and it CREATES NO PRICING RULE - nothing in this file, the
+# costing engine or any rate path reads it to decide a price.
+_SKU_PORTFOLIOS = ("Transactional", "Strategic")
+_SKU_COLUMNS_WITH_PORTFOLIO = _SKU_COLUMNS + ", pricing_portfolio"
 _SKU_VERSION_BASE_COLUMNS = ("id, sku_id, version_no, construction_version_id, is_price_driving, approved_at, "
                              "length_mm, width_mm, height_mm, box_type, ups, spec_bs, spec_bct, spec_ect")
 # Amendment 02, CDM-43: quotation and costing fields on the SKU version.
@@ -1683,6 +1688,30 @@ def _read_sku_versions(caller_token, *filters):
         if not _sku_schema_pending(exc):
             raise
         return _caller_rows(caller_token, "sku_versions", _SKU_VERSION_BASE_COLUMNS, *filters), True
+
+
+class _SkuPortfolioPending(Exception):
+    """The CDM-45 column is not activated AND the request asked to filter on it."""
+
+
+def _read_skus(caller_token, *filters):
+    """SKU rows with the CDM-45 portfolio, or without it while that migration is pending."""
+    try:
+        return _caller_rows(caller_token, "skus", _SKU_COLUMNS_WITH_PORTFOLIO, *filters), False
+    except Exception as exc:
+        if not _sku_schema_pending(exc):
+            raise
+        # Dropping the column from the SELECT is honest; dropping a FILTER the
+        # caller asked for is not - it would answer a different question and
+        # look like "no such portfolio". That case is refused instead.
+        if any(len(f) > 1 and f[1] == "pricing_portfolio" for f in filters):
+            raise _SkuPortfolioPending from exc
+        return _caller_rows(caller_token, "skus", _SKU_COLUMNS, *filters), True
+
+
+def _sku_portfolio(sku, pending):
+    # None means "no storage yet", which is different from a stored value.
+    return None if pending else sku.get("pricing_portfolio")
 
 
 def _sku_quote_fields(version, pending):
@@ -2004,6 +2033,9 @@ def list_skus():
     plant_code = (args.get("plant") or "").strip() or None
     if plant_code is not None and plant_code not in scope_codes:
         return _error("CAPABILITY_REQUIRED", "plant_access capability is required at the requested plant")
+    portfolio = (args.get("portfolio") or "").strip() or None
+    if portfolio is not None and portfolio not in _SKU_PORTFOLIOS:
+        return _invalid_input("portfolio must be Transactional or Strategic")
     search = (args.get("q") or "").strip() or None
     if search is not None and (len(search) > _SKU_SEARCH_MAX or not set(search) <= _SKU_SEARCH_CHARS):
         return _invalid_input("q must be at most 60 letters, digits, spaces or . _ / - characters")
@@ -2034,7 +2066,7 @@ def list_skus():
         if party_id is not None:
             party_filter = {party_id} if party_filter is None else party_filter & {party_id}
 
-        skus, search_ran, search_scanned = [], False, False
+        skus, search_ran, search_scanned, portfolio_pending = [], False, False, False
         search_fields = _sku_search_field_states(g.caller)
         if plant_by_id and party_filter != set():
             # Status and Customer scope bound the identity search too, so the
@@ -2042,6 +2074,8 @@ def list_skus():
             scope_filters = []
             if status:
                 scope_filters.append(("eq", "status", status))
+            if portfolio:
+                scope_filters.append(("eq", "pricing_portfolio", portfolio))
             if party_filter is not None:
                 scope_filters.append(("in_", "party_id", sorted(party_filter)))
             filters = [("in_", "plant_id", sorted(plant_by_id))] + scope_filters
@@ -2053,12 +2087,16 @@ def list_skus():
                 filters.append(("in_", "id", matched))
             if matched is None or matched:
                 filters += [("order", "id"), ("limit", _SKU_CATALOGUE_LIMIT + 1)]
-                skus = _caller_rows(token, "skus", _SKU_COLUMNS, *filters)
+                skus, portfolio_pending = _read_skus(token, *filters)
         truncated = len(skus) > _SKU_CATALOGUE_LIMIT
         skus = skus[:_SKU_CATALOGUE_LIMIT]
 
         versions, quote_pending = (_read_sku_versions(token, ("in_", "sku_id", [s["id"] for s in skus]))
                                    if skus else ([], False))
+    except _SkuPortfolioPending:
+        return _error("SCHEMA_ACTIVATION_PENDING",
+                      "The SKU pricing portfolio storage is not activated in this environment yet, "
+                      "so the catalogue cannot be filtered by it.")
     except Exception as exc:
         handled = _sku_read_error(exc, "SKU catalogue read")
         if handled is not None:
@@ -2087,6 +2125,8 @@ def list_skus():
             "id": s["id"],
             "plant_item_code": s.get("plant_item_code"),
             "status": s.get("status"),
+            # Recorded only. No pricing is inferred from it (CDM-45, C-04).
+            "pricing_portfolio": _sku_portfolio(s, portfolio_pending),
             "replacement_sku_id": s.get("replacement_sku_id"),
             "content_version": s.get("content_version"),
             "plant": _sku_plant(plant_by_id.get(s.get("plant_id"))),
@@ -2115,7 +2155,7 @@ def list_skus():
         "skus": rows,
         "truncated": truncated,
         "limit": _SKU_CATALOGUE_LIMIT,
-        "filters": {"plant": plant_code, "status": status, "q": search,
+        "filters": {"plant": plant_code, "status": status, "q": search, "portfolio": portfolio,
                     "party_id": party_id, "family_id": family_id},
         # What the one identity box actually covered on THIS request.
         "search": ({"q": search, "terms": terms, "executed": search_ran, "fields": search_fields,
@@ -2125,7 +2165,8 @@ def list_skus():
         "plant_scope": scope_codes,
         "detail_visibility": {"customer": party_detail, "construction": construction_detail,
                               "references": reference_detail, "locations": location_detail, "sets": set_detail},
-        "schema_pending": {"quote_fields": quote_pending, "sku_sets": set_detail == "schema_pending"},
+        "schema_pending": {"quote_fields": quote_pending, "sku_sets": set_detail == "schema_pending",
+                            "pricing_portfolio": portfolio_pending},
         "mode": "governed_read_only",
         "authority": "caller_token_rls_only",
         "mutations": "none",
@@ -2147,7 +2188,7 @@ def get_sku(sku_id):
     token = g.access_token
 
     try:
-        found = _caller_rows(token, "skus", _SKU_COLUMNS, ("eq", "id", sku_id), ("limit", 1))
+        found, portfolio_pending = _read_skus(token, ("eq", "id", sku_id), ("limit", 1))
         if not found:
             return _error("RECORD_NOT_FOUND")
         sku = found[0]
@@ -2215,6 +2256,7 @@ def get_sku(sku_id):
             "id": sku["id"],
             "plant_item_code": sku.get("plant_item_code"),
             "status": sku.get("status"),
+            "pricing_portfolio": _sku_portfolio(sku, portfolio_pending),
             "replacement_sku_id": sku.get("replacement_sku_id"),
             "content_version": sku.get("content_version"),
             "plant": _sku_plant((results["plants"] or [None])[0]),
@@ -2253,7 +2295,8 @@ def get_sku(sku_id):
         "sets": sets.get(sku_id, []) if set_detail == "visible" else None,
         "detail_visibility": {"customer": party_detail, "construction": construction_detail,
                               "plant_adoption": adoption_detail, "locations": location_detail, "sets": set_detail},
-        "schema_pending": {"quote_fields": quote_pending, "sku_sets": set_detail == "schema_pending"},
+        "schema_pending": {"quote_fields": quote_pending, "sku_sets": set_detail == "schema_pending",
+                            "pricing_portfolio": portfolio_pending},
         "mode": "governed_read_only",
         "authority": "caller_token_rls_only",
         "mutations": "none",
@@ -2467,6 +2510,11 @@ _ERROR_STATUS = {
     "CALCULATION_EXECUTOR_UNAVAILABLE": 503,
     "CALCULATION_EXECUTION_FAILED": 500,
     "MASTER_UNAVAILABLE": 503,
+    # A field whose storage migration has not been applied yet. The request is
+    # well formed and the caller is entitled to it; the column simply does not
+    # exist. Distinct from INVALID_INPUT (the caller asked wrongly) and from
+    # MASTER_UNAVAILABLE (the whole master is absent in this environment).
+    "SCHEMA_ACTIVATION_PENDING": 503,
     # A genuine serialization failure is transient: the caller may safely retry
     # the SAME request unchanged. Distinct from STALE_VERSION, where retrying
     # unchanged is guaranteed to fail again.
@@ -2491,6 +2539,8 @@ _ERROR_MESSAGE = {
     "CALCULATION_EXECUTOR_UNAVAILABLE": "Governed Calculate is not available in this environment.",
     "CALCULATION_EXECUTION_FAILED": "The governed calculation executor could not produce a valid result.",
     "MASTER_UNAVAILABLE": "This master is not available in this environment.",
+    "SCHEMA_ACTIVATION_PENDING": "That field's storage is not activated in this environment yet, "
+                                 "so it cannot be read or filtered.",
     "SERIALIZATION_FAILURE": "The database could not complete that under concurrent load. "
                              "Nothing was changed — please try again.",
     # D2 CORRECTION. This must NOT claim the write did not happen. A client-side
