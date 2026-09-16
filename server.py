@@ -1674,7 +1674,9 @@ def _caller_rows(caller_token, table, cols, *filters):
     """One caller-token read. Each filter is (method, *params), e.g. ("eq", "id", 5)."""
     query = new_caller_client(caller_token).table(table).select(cols)
     for method, *params in filters:
-        query = getattr(query, method)(*params)
+        # "not_in_" / "not_is_" negate through PostgREST's `not` modifier.
+        target = query.not_ if method.startswith("not_") else query
+        query = getattr(target, method[4:] if method.startswith("not_") else method)(*params)
     return query.execute().data or []
 
 
@@ -1946,6 +1948,15 @@ def _sku_search_candidates(caller, caller_token, terms, plant_ids, scope_filters
                             *filters, ("order", "id"), ("limit", _SKU_SEARCH_CANDIDATE_LIMIT))
         return {r["sku_id"] for r in rows}, len(rows) >= _SKU_SEARCH_CANDIDATE_LIMIT
 
+    # A name matches the SKU's LATEST version only - the name the grid shows.
+    # Versions and revisions are not part of the search window (ruled
+    # 2026-09-16), so an older version's name no longer finds the SKU.
+    def _latest_version_sku_ids(field, like):
+        rows = _caller_rows(caller_token, "sku_versions", "id, sku_id", ("in_", "plant_id", plant_ids),
+                            ("ilike", field, like), ("order", "id"), ("limit", _SKU_SEARCH_CANDIDATE_LIMIT))
+        ids, more = _sku_latest_version_match(caller_token, plant_ids, rows)
+        return ids, len(rows) >= _SKU_SEARCH_CANDIDATE_LIMIT or more
+
     def _run(item):
         term, field = item
         like = _sku_like(term)
@@ -1953,7 +1964,7 @@ def _sku_search_candidates(caller, caller_token, terms, plant_ids, scope_filters
             if field == "plant_item_code":
                 return item, _sku_ids(("ilike", "plant_item_code", like))
             if field in _SKU_SEARCH_VERSION_FIELDS:
-                return item, _child_sku_ids("sku_versions", ("ilike", field, like))
+                return item, _latest_version_sku_ids(field, like)
             if field in _SKU_SEARCH_REFERENCE_FIELDS:
                 return item, _child_sku_ids("sku_external_references",
                                             ("eq", "reference_kind", field), ("eq", "status", "active"),
@@ -2003,6 +2014,274 @@ def _sku_search_candidates(caller, caller_token, terms, plant_ids, scope_filters
     return sorted(matched), fields, scanned
 
 
+# ── Column-header filters (Product Owner rulings, 2026-09-16) ─────────────────
+#
+# Each grid column can be filtered from its header, Excel-style, and every
+# filter is applied IN THE DATABASE and AS THE CALLER:
+#
+#   * every sub-query carries the caller's own token and
+#     `plant_id in <the caller's plant_access plants>`, exactly like the
+#     identity box, so no other plant's or tenant's row is ever loaded;
+#   * a version field matches the SKU's LATEST version only - the value the
+#     grid shows - never an older one (ruled);
+#   * a field whose storage is not activated is refused with
+#     SCHEMA_ACTIVATION_PENDING rather than silently ignored, and a field the
+#     caller may not read is refused CAPABILITY_REQUIRED before any read;
+#   * every sub-query is capped, and reaching a cap is REPORTED per filter.
+#
+# A filter composes with the identity box by AND. The box stays identity-only.
+# `f=<field>:<op>:<value>` is repeated once per filter. Values for `in` are
+# separated by `|`; `between` is `min,max` with either side optional.
+_SKU_FILTER_MAX = 8
+_SKU_FILTER_VALUE_MAX = 60
+_SKU_FILTER_VALUE_CHARS = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 ._/-,|+")
+_SKU_FILTER_LIMIT = 400
+_SKU_FILTER_PARTY_LIMIT = 200
+_SKU_FILTER_VERSION_LIMIT = 2000
+_SKU_PRINT_TECHNOLOGIES = ("Flexo", "CMYK", "Offset", "Unprinted")
+_TEXT_OPS = ("contains", "blank", "not_blank")
+_NUMBER_OPS = ("between", "blank", "not_blank")
+
+
+def _filter_spec(kind, ftype, ops, **extra):
+    return {"kind": kind, "type": ftype, "ops": ops, **extra}
+
+
+_SKU_COLUMN_FILTERS = {
+    # skus row
+    "plant_item_code": _filter_spec("sku", "text", _TEXT_OPS, column="plant_item_code"),
+    "status": _filter_spec("sku", "enum", ("in",), column="status", values=_SKU_STATUSES),
+    "pricing_portfolio": _filter_spec("sku", "enum", ("in",), column="pricing_portfolio", values=_SKU_PORTFOLIOS),
+    # active external references of one kind
+    "customer_item_code": _filter_spec("reference", "text", _TEXT_OPS),
+    "softcomp_code": _filter_spec("reference", "text", _TEXT_OPS, pending="amendment_02"),
+    # group-gated masters
+    "customer": _filter_spec("customer", "text", ("contains",), capability="read_party_master"),
+    "location_code": _filter_spec("location", "text", _TEXT_OPS, capability="read_party_master"),
+    # the latest SKU version (S4-2 storage)
+    **{name: _filter_spec("version", "number", _NUMBER_OPS, column=name)
+       for name in ("length_mm", "width_mm", "height_mm", "ups")},
+    # the latest SKU version (Amendment 02 storage)
+    **{name: _filter_spec("version", "text", _TEXT_OPS, column=name, pending="amendment_02")
+       for name in ("item_name", "item_short_name", "item_family", "item_group", "print_quality",
+                    "colour_detail", "cobb_value", "stated_item_gsm", "stated_cs", "stated_bs",
+                    "stated_ect", "customer_spec_version")},
+    "print_technology": _filter_spec("version", "enum", ("in", "blank", "not_blank"), column="print_technology",
+                                     values=_SKU_PRINT_TECHNOLOGIES, pending="amendment_02"),
+    "number_of_colours": _filter_spec("version", "number", _NUMBER_OPS, column="number_of_colours",
+                                      pending="amendment_02"),
+    "item_weight_kg": _filter_spec("version", "number", _NUMBER_OPS, column="item_weight_kg",
+                                   pending="amendment_02"),
+    # the latest version's Construction version
+    "ply": _filter_spec("construction", "number", _NUMBER_OPS, column="ply",
+                        capability="read_construction_library"),
+    **{name: _filter_spec("construction", "text", _TEXT_OPS, column=name, capability="read_construction_library")
+       for name in ("flute_f1", "flute_f2", "layer_top_code", "layer_f1_code", "layer_l1_code",
+                    "layer_f2_code", "layer_l2_code")},
+    **{name: _filter_spec("construction", "number", _NUMBER_OPS, column=name,
+                          capability="read_construction_library")
+       for name in ("layer_top_gsm", "layer_f1_gsm", "layer_l1_gsm", "layer_f2_gsm", "layer_l2_gsm")},
+}
+
+
+class _SkuFilterPending(Exception):
+    """A column filter asked for a field whose storage is not activated."""
+
+
+def _parse_number(raw):
+    raw = raw.strip()
+    if raw == "":
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        raise ValueError("not a number") from None
+
+
+def _sku_parse_column_filters(raw_filters, caller):
+    """Validate every `f` parameter before any read. Returns (filters, error_response)."""
+    if len(raw_filters) > _SKU_FILTER_MAX:
+        return None, _invalid_input(f"at most {_SKU_FILTER_MAX} column filters")
+    parsed, seen = [], set()
+    group_caps = caller.get("group_capabilities") or []
+    for raw in raw_filters:
+        parts = (raw or "").split(":", 2)
+        if len(parts) < 2:
+            return None, _invalid_input("f must be field:operator[:value]")
+        field, op = parts[0].strip(), parts[1].strip()
+        value = parts[2] if len(parts) == 3 else ""
+        spec = _SKU_COLUMN_FILTERS.get(field)
+        if spec is None:
+            return None, _invalid_input(f"{field or 'that field'} cannot be filtered")
+        if op not in spec["ops"]:
+            return None, _invalid_input(f"{field} does not support {op or 'an empty operator'}")
+        if field in seen:
+            return None, _invalid_input(f"{field} is filtered more than once")
+        seen.add(field)
+        if len(value) > _SKU_FILTER_VALUE_MAX or not set(value) <= _SKU_FILTER_VALUE_CHARS:
+            return None, _invalid_input("filter values are at most 60 letters, digits, spaces or . _ / - , | + characters")
+        item = {"field": field, "op": op, "value": None}
+        if op == "contains":
+            if not value.strip():
+                return None, _invalid_input(f"{field} contains needs a value")
+            item["value"] = value.strip()
+        elif op == "in":
+            values = [v.strip() for v in value.split("|") if v.strip()]
+            allowed = spec.get("values") or ()
+            if not values or any(v not in allowed for v in values):
+                return None, _invalid_input(f"{field} accepts only {', '.join(allowed)}")
+            item["value"] = sorted(set(values), key=values.index)
+        elif op == "between":
+            bounds = value.split(",")
+            try:
+                low, high = (_parse_number(bounds[0]), _parse_number(bounds[1])) if len(bounds) == 2 else (None, None)
+            except ValueError:
+                return None, _invalid_input(f"{field} between needs numbers")
+            if len(bounds) != 2 or (low is None and high is None) or (
+                    low is not None and high is not None and low > high):
+                return None, _invalid_input(f"{field} between needs min,max with at least one bound")
+            item["value"] = [low, high]
+        elif value.strip():
+            return None, _invalid_input(f"{field} {op} takes no value")
+        # Refused before any read: RLS would otherwise turn "you may not read
+        # this master" into "nothing matches".
+        if spec.get("capability") and spec["capability"] not in group_caps:
+            return None, _error("CAPABILITY_REQUIRED",
+                                f"{spec['capability']} capability is required to filter by {field}")
+        parsed.append(item)
+    return parsed, None
+
+
+def _sku_value_filters(column, op, value):
+    """The database filter tuples for one operator on one column."""
+    if op == "contains":
+        return [("ilike", column, _sku_like(value))]
+    if op == "in":
+        return [("in_", column, value)]
+    if op == "between":
+        low, high = value
+        return ([("gte", column, low)] if low is not None else []) + (
+            [("lte", column, high)] if high is not None else [])
+    if op == "blank":
+        return [("is_", column, "null")]
+    return [("not_is_", column, "null")]
+
+
+def _sku_latest_version_match(token, plant_ids, version_rows):
+    """SKU ids whose LATEST version is one of `version_rows` (id, sku_id).
+
+    Reads only the version numbers of the SKUs already matched, inside the
+    caller's plants, capped. Returns (sku ids, capped)."""
+    matched_versions = {r["id"] for r in version_rows}
+    sku_ids = sorted({r["sku_id"] for r in version_rows})
+    if not sku_ids:
+        return set(), False
+    rows = _caller_rows(token, "sku_versions", "id, sku_id, version_no", ("in_", "plant_id", plant_ids),
+                        ("in_", "sku_id", sku_ids), ("order", "id"), ("limit", _SKU_FILTER_VERSION_LIMIT))
+    latest = {}
+    for r in rows:
+        best = latest.get(r["sku_id"])
+        if best is None or (r.get("version_no") or 0) > (best.get("version_no") or 0):
+            latest[r["sku_id"]] = r
+    return ({sid for sid, r in latest.items() if r["id"] in matched_versions},
+            len(rows) >= _SKU_FILTER_VERSION_LIMIT)
+
+
+def _sku_amendment_02_active(token, plant_ids):
+    try:
+        _caller_rows(token, "sku_versions", "item_name", ("in_", "plant_id", plant_ids), ("limit", 1))
+        return True
+    except Exception as exc:
+        if _sku_schema_pending(exc):
+            return False
+        raise
+
+
+def _sku_resolve_column_filters(token, plant_ids, filters):
+    """Turn parsed filters into database constraints on the `skus` read.
+
+    Returns (sku_filters, include_ids, exclude_ids, report):
+      sku_filters  - tuples applied to the skus query itself;
+      include_ids  - None, or the set of SKU ids EVERY child-table filter allows;
+      exclude_ids  - SKU ids a "blank" child filter rules out;
+      report       - one entry per filter: what was applied and whether a cap was reached.
+    """
+    sku_filters, include, exclude, report = [], None, set(), []
+
+    def narrow(ids):
+        nonlocal include
+        include = set(ids) if include is None else include & set(ids)
+
+    for item in filters:
+        field, op, value = item["field"], item["op"], item["value"]
+        spec = _SKU_COLUMN_FILTERS[field]
+        capped = False
+        kind = spec["kind"]
+        if spec.get("pending") == "amendment_02" and kind == "reference" and not _sku_amendment_02_active(token, plant_ids):
+            raise _SkuFilterPending(field)
+        if kind == "sku":
+            sku_filters += _sku_value_filters(spec["column"], op, value)
+        elif kind == "reference":
+            flt = [("eq", "reference_kind", field), ("eq", "status", "active")]
+            if op == "contains":
+                flt.append(("ilike", "reference_value", _sku_like(value)))
+            rows = _caller_rows(token, "sku_external_references", "sku_id", ("in_", "plant_id", plant_ids),
+                                *flt, ("order", "id"), ("limit", _SKU_FILTER_LIMIT))
+            capped = len(rows) >= _SKU_FILTER_LIMIT
+            ids = {r["sku_id"] for r in rows}
+            if op == "blank":
+                exclude |= ids
+            else:
+                narrow(ids)
+        elif kind == "customer":
+            parties = _caller_rows(token, "parties", "id", ("ilike", "display_name", _sku_like(value)),
+                                   ("order", "id"), ("limit", _SKU_FILTER_PARTY_LIMIT))
+            capped = len(parties) >= _SKU_FILTER_PARTY_LIMIT
+            sku_filters.append(("in_", "party_id", [p["id"] for p in parties]))
+        elif kind == "location":
+            flt = []
+            if op == "contains":
+                locations = _caller_rows(token, "customer_locations", "id",
+                                         ("ilike", "location_code", _sku_like(value)),
+                                         ("order", "id"), ("limit", _SKU_FILTER_PARTY_LIMIT))
+                capped = len(locations) >= _SKU_FILTER_PARTY_LIMIT
+                flt.append(("in_", "location_id", [l["id"] for l in locations]))
+            rows = _caller_rows(token, "sku_location_applicabilities", "sku_id", ("in_", "plant_id", plant_ids),
+                                *flt, ("order", "id"), ("limit", _SKU_FILTER_LIMIT))
+            capped = capped or len(rows) >= _SKU_FILTER_LIMIT
+            ids = {r["sku_id"] for r in rows}
+            if op == "blank":
+                exclude |= ids
+            else:
+                narrow(ids)
+        else:
+            if kind == "version":
+                try:
+                    versions = _caller_rows(token, "sku_versions", "id, sku_id", ("in_", "plant_id", plant_ids),
+                                            *_sku_value_filters(spec["column"], op, value),
+                                            ("order", "id"), ("limit", _SKU_FILTER_LIMIT))
+                except Exception as exc:
+                    if spec.get("pending") and _sku_schema_pending(exc):
+                        raise _SkuFilterPending(field) from exc
+                    raise
+                capped = len(versions) >= _SKU_FILTER_LIMIT
+            else:  # construction: the Construction version first, then the SKU versions that use it
+                cvs = _caller_rows(token, "construction_versions", "id",
+                                   *_sku_value_filters(spec["column"], op, value),
+                                   ("order", "id"), ("limit", _SKU_FILTER_LIMIT))
+                capped = len(cvs) >= _SKU_FILTER_LIMIT
+                versions = (_caller_rows(token, "sku_versions", "id, sku_id", ("in_", "plant_id", plant_ids),
+                                         ("in_", "construction_version_id", [c["id"] for c in cvs]),
+                                         ("order", "id"), ("limit", _SKU_FILTER_LIMIT)) if cvs else [])
+                capped = capped or len(versions) >= _SKU_FILTER_LIMIT
+            ids, more = _sku_latest_version_match(token, plant_ids, versions)
+            capped = capped or more
+            narrow(ids)
+        report.append({"field": field, "op": op, "value": value, "state": "applied", "scan_truncated": capped})
+    return sku_filters, include, exclude, report
+
+
 @app.route("/masters/skus", methods=["GET"])
 @require_auth
 def list_skus():
@@ -2024,7 +2303,13 @@ def list_skus():
     reports which of those seven were ACTUALLY searched, because Item Name has no
     storage until the Amendment 02 migration is applied and Customer name needs
     `read_party_master`: the box degrades visibly rather than missing rows in
-    silence. `search.scan_truncated` says a per-field bound was reached.
+    silence. `search.scan_truncated` says a per-field bound was reached. An
+    Item Name or Item Short Name matches the LATEST version only.
+
+    `f` (repeatable) filters one grid column from its header - see
+    `_SKU_COLUMN_FILTERS`. Every filter is resolved in the database inside the
+    caller's plants, version fields match the latest version, pending storage
+    is refused SCHEMA_ACTIVATION_PENDING, and `column_filters` reports each one.
     """
     scope_codes = _sku_plant_scope(g.caller)
     if not scope_codes:
@@ -2055,6 +2340,9 @@ def list_skus():
     if (party_id or family_id) and "read_party_master" not in (g.caller.get("group_capabilities") or []):
         return _error("CAPABILITY_REQUIRED",
                       "read_party_master capability is required to filter by customer or family")
+    column_filters, bad = _sku_parse_column_filters(args.getlist("f"), g.caller)
+    if bad:
+        return bad
 
     token = g.access_token
     try:
@@ -2072,7 +2360,12 @@ def list_skus():
 
         skus, search_ran, search_scanned, portfolio_pending = [], False, False, False
         search_fields = _sku_search_field_states(g.caller)
-        if plant_by_id and party_filter != set():
+        filter_report, filter_empty = [], False
+        if plant_by_id and party_filter != set() and column_filters:
+            column_sku_filters, include_ids, exclude_ids, filter_report = _sku_resolve_column_filters(
+                token, sorted(plant_by_id), column_filters)
+            filter_empty = include_ids is not None and not (include_ids - exclude_ids)
+        if plant_by_id and party_filter != set() and not filter_empty:
             # Status and Customer scope bound the identity search too, so the
             # capped candidate window holds only rows the screen would show.
             scope_filters = []
@@ -2082,6 +2375,13 @@ def list_skus():
                 scope_filters.append(("eq", "pricing_portfolio", portfolio))
             if party_filter is not None:
                 scope_filters.append(("in_", "party_id", sorted(party_filter)))
+            if column_filters:
+                # Column filters bound the identity search too, like status does.
+                scope_filters += column_sku_filters
+                if include_ids is not None:
+                    scope_filters.append(("in_", "id", sorted(include_ids - exclude_ids)))
+                elif exclude_ids:
+                    scope_filters.append(("not_in_", "id", sorted(exclude_ids)))
             filters = [("in_", "plant_id", sorted(plant_by_id))] + scope_filters
             matched = None
             if terms:
@@ -2100,6 +2400,10 @@ def list_skus():
     except _SkuPortfolioPending:
         return _error("SCHEMA_ACTIVATION_PENDING",
                       "The SKU pricing portfolio storage is not activated in this environment yet, "
+                      "so the catalogue cannot be filtered by it.")
+    except _SkuFilterPending as pending:
+        return _error("SCHEMA_ACTIVATION_PENDING",
+                      f"The storage for {pending.args[0]} is not activated in this environment yet, "
                       "so the catalogue cannot be filtered by it.")
     except Exception as exc:
         handled = _sku_read_error(exc, "SKU catalogue read")
@@ -2161,6 +2465,8 @@ def list_skus():
         "limit": _SKU_CATALOGUE_LIMIT,
         "filters": {"plant": plant_code, "status": status, "q": search, "portfolio": portfolio,
                     "party_id": party_id, "family_id": family_id},
+        # What each column-header filter actually applied on THIS request.
+        "column_filters": filter_report,
         # What the one identity box actually covered on THIS request.
         "search": ({"q": search, "terms": terms, "executed": search_ran, "fields": search_fields,
                     "scan_truncated": search_scanned,

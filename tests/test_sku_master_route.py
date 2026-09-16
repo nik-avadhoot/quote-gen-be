@@ -25,6 +25,9 @@ WHAT EACH GROUP WOULD CATCH:
           specification value matching), narrowed below it (a code or Customer
           name missed), leaking another plant's rows into a sub-query, or going
           quiet when a field has no storage or the caller may not read it.
+  SKU-24  a column-header filter applied in memory, to another plant's rows, to
+          an OLD version instead of the latest, silently ignored while its
+          storage is pending, or reaching a master the caller may not read.
   SKU-8   an unbounded catalogue, or a silent truncation.
   SKU-9   blank/zero collapse, or a stale (non-current) Family label.
   SKU-10  actor attribution leaking into selected columns or the body.
@@ -86,6 +89,13 @@ def like_regex(pattern):
 
 def matches(row, flt):
     kind, col, val = flt
+    if kind.startswith("not_"):
+        return not matches(row, (kind[4:], col, val))
+    if kind == "is":
+        return row.get(col) is None
+    if kind in ("gte", "lte"):
+        v = row.get(col)
+        return v is not None and (v >= val if kind == "gte" else v <= val)
     if kind == "eq":
         return row.get(col) == val
     if kind == "in":
@@ -95,10 +105,39 @@ def matches(row, flt):
     return True
 
 
+class _Not:
+    def __init__(self, query):
+        self.query = query
+
+    def in_(self, col, vals):
+        self.query.filters.append(("not_in", col, list(vals)))
+        return self.query
+
+    def is_(self, col, val):
+        self.query.filters.append(("not_is", col, val))
+        return self.query
+
+
 class FakeQuery:
     def __init__(self, token, table):
         self.token, self.table = token, table
         self.columns, self.filters, self.limit_n = None, [], None
+
+    @property
+    def not_(self):
+        return _Not(self)
+
+    def is_(self, col, val):
+        self.filters.append(("is", col, val))
+        return self
+
+    def gte(self, col, val):
+        self.filters.append(("gte", col, val))
+        return self
+
+    def lte(self, col, val):
+        self.filters.append(("lte", col, val))
+        return self
 
     def select(self, columns):
         self.columns = columns
@@ -702,7 +741,9 @@ check(sorted(row["id"] for row in body["skus"]) == [101, 102, 103, 104]
       "SKU-22k a match at a plant outside plant_access never returns")
 # A search sub-query is the one that selects nothing but an id, so these two
 # checks cover exactly the reads the search added and no others.
-search_calls = [c for c in CALLS if c["columns"] in ("id", "sku_id")]
+# Name matches now also read the matched SKUs' version numbers to keep only
+# the LATEST version, so those reads count as search reads too.
+search_calls = [c for c in CALLS if c["columns"] in ("id", "sku_id", "id, sku_id", "id, sku_id, version_no")]
 for table in ("skus", "sku_versions", "sku_external_references"):
     of_table = [c for c in search_calls if c["table"] == table]
     check(of_table and all(("in", "plant_id", [7, 8]) in c["filters"] for c in of_table),
@@ -787,6 +828,126 @@ ROWS = dict(BASE_ROWS, skus=[
 r, body = get("/masters/skus?q=BULK")
 check(body["search"]["scan_truncated"] is True and len(body["skus"]) == 200 and body["truncated"] is True,
       "SKU-22aa reaching a per-field scan bound is reported, never a silent partial search")
+ROWS = BASE_ROWS
+
+# ─────────────── SKU-22ae the name match reads the LATEST version only (ruled)
+ROWS = dict(BASE_ROWS, sku_versions=[dict(v, item_name="Retired Name 180") if v["id"] == 1001 else v
+                                      for v in BASE_ROWS["sku_versions"]])
+check(search_ids("Retired")[0] == [],
+      "SKU-22ae an OLDER version's Item Name no longer finds the SKU - only the latest version's does")
+check(search_ids("Carton")[0] == [101],
+      "SKU-22af the latest version's Item Name still finds it")
+ROWS = BASE_ROWS
+
+# ──────────────────────────── SKU-24 column-header filters, server-side
+CALLER = FULL
+
+
+def filtered(*fs, extra=""):
+    query = "&".join("f=" + f.replace("|", "%7C").replace(" ", "%20").replace("+", "%2B") for f in fs)
+    r, b = get(f"/masters/skus?{query}{extra}")
+    return r, b, sorted(row["id"] for row in b.get("skus", []))
+
+
+r, body, ids = filtered("plant_item_code:contains:IT-000")
+check(r.status_code == 200 and ids == [101, 104, 201],
+      "SKU-24 a text filter on the Plant Item Code matches as contains, `_` stays literal")
+check(any(("ilike", "plant_item_code", "%IT-000%") in c["filters"] and ("in", "plant_id", [7, 8]) in c["filters"]
+          for c in calls_to("skus")),
+      "SKU-24a it is applied in the skus query itself, inside the caller's plants")
+check(body["column_filters"] == [{"field": "plant_item_code", "op": "contains", "value": "IT-000",
+                                  "state": "applied", "scan_truncated": False}],
+      "SKU-24b the response reports what each column filter applied")
+_r, _b, ids = filtered("plant_item_code:blank")
+check(ids == [102], "SKU-24c 'is blank' finds a SKU with no Plant Item Code yet (CDM-09)")
+_r, _b, ids = filtered("status:in:proposed|discontinued")
+check(ids == [102, 103, 104], "SKU-24d a lifecycle header filter selects several values at once")
+
+_r, body, ids = filtered("height_mm:blank")
+check(ids == [101],
+      "SKU-24e a version field matches the LATEST version: 101's latest height is blank, its older version's 0 is not")
+_r, _b, ids = filtered("height_mm:between:0,0")
+check(ids == [103],
+      "SKU-24f and zero is not blank: only 103's latest version records 0")
+_r, _b, ids = filtered("ups:between:2,")
+check(ids == [101], "SKU-24g an open-ended between is a bound on one side")
+check(all(("in", "plant_id", [7, 8]) in c["filters"] and c["limit"] is not None
+          for c in calls_to("sku_versions") if c["columns"] in ("id, sku_id", "id, sku_id, version_no")),
+      "SKU-24h every version sub-query is bounded to plant_access plants and capped")
+
+_r, _b, ids = filtered("customer_item_code:contains:778")
+check(ids == [101], "SKU-24i a reference filter matches active references of that kind")
+_r, _b, ids = filtered("customer_item_code:blank")
+check(ids == [102, 103, 104, 201], "SKU-24j 'is blank' on a reference excludes SKUs that carry one")
+_r, _b, ids = filtered("location_code:contains:LOC-601")
+check(ids == [101], "SKU-24k a Location code filter resolves through applicability, in the database")
+_r, _b, ids = filtered("customer:contains:Prospect")
+check(ids == [103, 104], "SKU-24l a Customer filter matches the owning Customer's name")
+_r, _b, ids = filtered("flute_f1:contains:B")
+check(ids == [103],
+      "SKU-24m a Construction filter matches the LATEST version's Construction (101's latest uses an unreadable one)")
+_r, _b, ids = filtered("layer_top_gsm:between:150,150", "plant_item_code:contains:0003")
+check(ids == [103], "SKU-24n filters combine by AND")
+
+_r, _b, ids = filtered("plant_item_code:contains:NAG", extra="&q=Distillers")
+check(ids == [101], "SKU-24o a header filter AND the identity box: the box stays identity-only, the filter narrows")
+
+r, body, _ids = filtered("plant_item_code:contains:IT", extra="&plant=NAG")
+check(r.status_code == 200 and all(row["plant"]["plant_code"] == "NAG" for row in body["skus"]),
+      "SKU-24p the plant dropdown still bounds the filter")
+
+CALLER = MAKER
+r, body, _ids = filtered("customer:contains:Fixture")
+check(r.status_code == 403 and body.get("error_code") == "CAPABILITY_REQUIRED" and not CALLS,
+      "SKU-24q a Customer filter without read_party_master is refused before any read")
+r, body, _ids = filtered("ply:between:5,5")
+check(r.status_code == 403 and body.get("error_code") == "CAPABILITY_REQUIRED" and not CALLS,
+      "SKU-24r a Construction filter without read_construction_library is refused before any read")
+r, body, ids = filtered("plant_item_code:contains:IT")
+check(r.status_code == 200 and all(row["plant"]["plant_code"] == "NAG" for row in body["skus"])
+      and all(("in", "plant_id", [7]) in c["filters"] for c in calls_to("skus")
+              if ("ilike", "plant_item_code", "%IT%") in c["filters"]),
+      "SKU-24s a Maker's filter never reaches a plant outside plant_access")
+CALLER = FULL
+
+for bad, label in (("nonsense:contains:x", "an unknown field"), ("plant_item_code:between:1,2", "a wrong operator"),
+                   ("status:in:archived", "a value outside the vocabulary"), ("ups:between:a,b", "a non-number"),
+                   ("ups:between:5,1", "an inverted range"), ("plant_item_code:contains:%3Cx%3E", "a disallowed character"),
+                   ("plant_item_code:blank:x", "a value on a valueless operator")):
+    r, body, _ids = filtered(bad)
+    check(r.status_code == 400 and body.get("error_code") == "INVALID_INPUT" and not CALLS,
+          f"SKU-24t {label} is refused 400 before any read")
+r, body, _ids = filtered(*[f"{f}:blank" for f in ("plant_item_code", "height_mm", "width_mm", "length_mm", "ups",
+                                                   "customer_item_code", "location_code", "flute_f1", "flute_f2")])
+check(r.status_code == 400 and not CALLS, "SKU-24u more than eight column filters is refused before any read")
+
+SCHEMA_PENDING = True
+r, body, _ids = filtered("item_name:contains:Carton")
+check(r.status_code == 503 and body.get("error_code") == "SCHEMA_ACTIVATION_PENDING"
+      and "column sku_versions" not in r.get_data(as_text=True),
+      "SKU-24v a filter on an Amendment 02 field is refused while its storage is pending, never ignored")
+r, body, _ids = filtered("softcomp_code:contains:011")
+check(r.status_code == 503 and body.get("error_code") == "SCHEMA_ACTIVATION_PENDING",
+      "SKU-24w the SoftComp Code filter is pending too - its reference kind cannot exist yet")
+r, body, _ids = filtered("pricing_portfolio:in:Strategic")
+check(r.status_code == 503 and body.get("error_code") == "SCHEMA_ACTIVATION_PENDING",
+      "SKU-24x a portfolio header filter is refused while Amendment 03 is pending")
+SCHEMA_PENDING = False
+
+r, body, ids = filtered("print_technology:in:Flexo")
+check(r.status_code == 200 and ids == [], "SKU-24y an activated enum filter on the latest version (101 v2 is blank)")
+r, body, ids = filtered("customer_item_code:contains:NOPE")
+check(r.status_code == 200 and body["skus"] == [] and body["column_filters"][0]["state"] == "applied",
+      "SKU-24z a filter that matches nothing is an empty answer with its report, not an error")
+check(not any(c["table"] == "skus" and c["columns"] != "id" and c["limit"] == 201 for c in CALLS),
+      "SKU-24aa and it issues no catalogue read once a child filter has ruled every SKU out")
+
+ROWS = dict(BASE_ROWS, sku_external_references=[
+    {"id": 7000 + i, "sku_id": 101, "plant_id": 7, "reference_kind": "customer_item_code",
+     "reference_value": f"BULK-{i}", "status": "active"} for i in range(420)])
+r, body, ids = filtered("customer_item_code:contains:BULK")
+check(body["column_filters"][0]["scan_truncated"] is True,
+      "SKU-24ab reaching a filter's scan cap is reported per filter, never silent")
 ROWS = BASE_ROWS
 
 # ──────────────────────── SKU-23 the CDM-45 pricing portfolio, recorded only
