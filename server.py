@@ -1609,8 +1609,9 @@ _SKU_SEARCH_CHARS = frozenset(
 # One search box, IDENTITY ONLY.
 #
 # `q` matches identity factors and nothing else: the Plant Item Code, the SKU
-# version's Item Name and Item Short Name, the Customer Item Code and SoftComp
-# Code external references, and the owning Customer's name. Lifecycle, plant,
+# version's Item Name and Item Short Name, the Customer Item Code, SoftComp Code
+# and legacy (retired) Plant Item Code external references, and the owning
+# Customer's name. Lifecycle, plant,
 # portfolio and every specification field keep their own controls and are
 # deliberately NOT searched from this box.
 #
@@ -1622,12 +1623,14 @@ _SKU_SEARCH_WORKERS = 8
 _SKU_SEARCH_CANDIDATE_LIMIT = 400
 _SKU_SEARCH_PARTY_LIMIT = 200
 _SKU_SEARCH_FIELDS = ("plant_item_code", "item_name", "item_short_name",
-                      "customer_item_code", "softcomp_code", "customer_name")
+                      "customer_item_code", "softcomp_code", "legacy_plant_item_code", "customer_name")
 # Amendment 02 storage: searched only once that migration is applied.
 _SKU_SEARCH_VERSION_FIELDS = ("item_name", "item_short_name")
-# The two reference kinds that are CODES (CDM-10, Amendment 02 B-05).
-# `alias`, `other` and `legacy_plant_item_code` are not searched from this box.
-_SKU_SEARCH_REFERENCE_FIELDS = ("customer_item_code", "softcomp_code")
+# The reference kinds that are CODES (CDM-10, Amendment 02 B-05). A retired
+# Plant Item Code finds its SKU (Product Owner, 2026-09-16), so
+# `legacy_plant_item_code` is searched too. `alias` and `other` are not codes
+# and are not searched from this box.
+_SKU_SEARCH_REFERENCE_FIELDS = ("customer_item_code", "softcomp_code", "legacy_plant_item_code")
 _SKU_COLUMNS = "id, plant_id, party_id, plant_item_code, status, replacement_sku_id, content_version"
 # Amendment 03, CDM-45: the SKU's pricing portfolio. Mandatory in the database,
 # read-only here, and it CREATES NO PRICING RULE - nothing in this file, the
@@ -2014,10 +2017,11 @@ def list_skus():
     each with its own visibility.
 
     `q` IS ONE BOX OVER IDENTITY ONLY - Plant Item Code, Item Name, Item Short
-    Name, Customer Item Code, SoftComp Code and the owning Customer's name.
+    Name, Customer Item Code, SoftComp Code, legacy Plant Item Code and the
+    owning Customer's name.
     Lifecycle, plant, portfolio and specification stay on their own controls.
     Every word must match somewhere, so words narrow the result. `search.fields`
-    reports which of those six were ACTUALLY searched, because Item Name has no
+    reports which of those seven were ACTUALLY searched, because Item Name has no
     storage until the Amendment 02 migration is applied and Customer name needs
     `read_party_master`: the box degrades visibly rather than missing rows in
     silence. `search.scan_truncated` says a per-field bound was reached.

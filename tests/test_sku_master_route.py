@@ -236,6 +236,10 @@ BASE_ROWS = {
          "reference_value": "Old carton", "status": "withdrawn", "created_by": 3},
         {"id": 3, "sku_id": 101, "plant_id": 7, "reference_kind": "softcomp_code",
          "reference_value": "011145", "status": "active", "created_by": 3},
+        {"id": 4, "sku_id": 103, "plant_id": 7, "reference_kind": "legacy_plant_item_code",
+         "reference_value": "APS-RET-0003", "status": "active", "created_by": 3},
+        {"id": 5, "sku_id": 104, "plant_id": 7, "reference_kind": "legacy_plant_item_code",
+         "reference_value": "APS-RET-0004", "status": "withdrawn", "created_by": 3},
     ],
     "sku_sets": [
         {"id": 51, "plant_id": 7, "set_label": "NAG-IT-0001", "status": "confirmed", "content_version": 2,
@@ -646,7 +650,8 @@ app.config["PROPAGATE_EXCEPTIONS"] = None
 # ──────────────────────────────── SKU-22 one search box, identity factors only
 #
 # Identity is: Plant Item Code, Item Name, Item Short Name, Customer Item Code,
-# SoftComp Code and the owning Customer's name. Nothing else - lifecycle, plant,
+# SoftComp Code, legacy Plant Item Code and the owning Customer's name. Nothing
+# else - lifecycle, plant,
 # portfolio and every specification field keep their own controls.
 CALLER = FULL
 
@@ -668,6 +673,15 @@ ids, _b = search_ids("011145")
 check(ids == [101], "SKU-22d the SoftComp Code reference is an identity factor")
 ids, _b = search_ids("Prospect")
 check(ids == [103, 104], "SKU-22e the linked Customer's name is an identity factor")
+ids, _b = search_ids("APS-RET-0003")
+check(ids == [103], "SKU-22ab a retired (legacy) Plant Item Code finds its SKU")
+check(search_ids("APS-RET-0004")[0] == [],
+      "SKU-22ac a withdrawn legacy Plant Item Code is not an active reference and finds nothing")
+check(search_ids("APS-RET")[0] == [103]
+      and any(("eq", "reference_kind", "legacy_plant_item_code") in c["filters"]
+              and ("eq", "status", "active") in c["filters"] and ("in", "plant_id", [7, 8]) in c["filters"]
+              for c in calls_to("sku_external_references")),
+      "SKU-22ad the legacy code pass is its own kind, active-only and bounded to plant_access plants")
 
 check(search_ids("RSC")[0] == [] and search_ids("2L")[0] == [],
       "SKU-22f a specification value (box type, item group) is NOT searched")
@@ -711,7 +725,8 @@ check(body["search"]["terms"] == ["Fixture"] and body["search"]["executed"] is T
       and body["search"]["degraded"] is False and body["search"]["scan_truncated"] is False
       and body["search"]["fields"] == {"plant_item_code": "searched", "item_name": "searched",
                                        "item_short_name": "searched", "customer_item_code": "searched",
-                                       "softcomp_code": "searched", "customer_name": "searched"},
+                                       "softcomp_code": "searched", "legacy_plant_item_code": "searched",
+                                       "customer_name": "searched"},
       "SKU-22p the response states which identity fields were actually searched")
 r, body = get("/masters/skus")
 check(body["search"] is None,
@@ -753,6 +768,7 @@ FAIL_TABLE = "sku_external_references"
 r, body = get("/masters/skus?q=011145")
 check(r.status_code == 200 and body["search"]["fields"]["customer_item_code"] == "unavailable"
       and body["search"]["fields"]["softcomp_code"] == "unavailable"
+      and body["search"]["fields"]["legacy_plant_item_code"] == "unavailable"
       and body["search"]["degraded"] is True,
       "SKU-22y a failed code sub-query degrades that field, it does not fail the screen")
 FAIL_TABLE = None
