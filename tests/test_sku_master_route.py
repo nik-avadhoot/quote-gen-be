@@ -172,6 +172,8 @@ class FakeQuery:
         # Amendment 02 migration not activated: its columns and tables do not exist.
         if SCHEMA_PENDING and self.table in ("sku_sets", "sku_set_members", "sku_master_events"):
             raise server.APIError({"code": "PGRST205", "message": "Could not find the table"})
+        if SCHEMA_PENDING and self.table == "sku_location_applicabilities" and "content_version" in str(self.columns):
+            raise server.APIError({"code": "42703", "message": "column content_version does not exist"})
         pending_cols = ("print_technology", "item_name", "item_short_name")
         if SCHEMA_PENDING and self.table == "sku_versions" and (
                 any(c in str(self.columns) for c in pending_cols)
@@ -211,6 +213,9 @@ class FakeRpc:
         RPC_CALLS.append({"token": self.token, "name": self.name, "params": self.params})
         if RPC_RAISE:
             raise server.APIError({"code": RPC_RAISE, "message": "database said no"})
+        if self.name == "sku_master_location_options":
+            return type("Response", (), {"data": [{"id": 601, "location_code": "LOC-601", "status": "active",
+                                                    "bill_to_eligible": True, "ship_to_eligible": True}]})()
         return type("Response", (), {"data": RPC_RESULT})()
 
 
@@ -316,9 +321,11 @@ BASE_ROWS = {
     ],
     "sku_location_applicabilities": [
         {"id": 11, "sku_id": 101, "plant_id": 7, "party_id": 501, "location_id": 601, "scope": "master",
-         "status": "approved", "approved_at": "2026-09-02T00:00:00Z", "approved_by": 3, "created_by": 3},
+         "status": "approved", "approved_at": "2026-09-02T00:00:00Z", "approved_by": 3, "created_by": 3,
+         "content_version": 2},
         {"id": 12, "sku_id": 101, "plant_id": 7, "party_id": 501, "location_id": 602, "scope": "batch_only",
-         "status": "proposed", "approved_at": None, "approved_by": None, "created_by": 3},
+         "status": "proposed", "approved_at": None, "approved_by": None, "created_by": 3,
+         "content_version": 1},
     ],
     "parties": [
         {"id": 501, "customer_code": "CUST-501", "display_name": "Fixture Distillers Unit 1",
@@ -532,7 +539,7 @@ check(qf1["print_technology"] == "Flexo" and qf1["number_of_colours"] == 0 and q
       and qf2["print_technology"] is None and qf2["item_weight_kg"] == 0,
       "SKU-12e CDM-43 quote fields return per version with blank, NA and zero kept apart")
 check(body["schema_pending"] == {"quote_fields": False, "sku_sets": False, "pricing_portfolio": False,
-                                 "governed_operations": False}
+                                 "governed_operations": False, "location_applicability_operations": False}
       and "unrecorded_specification_fields" not in body,
       "SKU-12e2 with the migration active nothing is reported pending")
 check(body["detail_visibility"] == {"customer": "visible", "construction": "visible",
@@ -552,7 +559,7 @@ check([(x["reference_kind"], x["reference_value"], x["status"]) for x in refs]
       "SKU-13 external references keep their kind, value and withdrawn status, SoftComp included")
 apps = {a["location_id"]: a for a in body["location_applicability"]}
 check(apps[601]["scope"] == "master" and apps[601]["approved"] is True
-      and apps[601]["location"]["location_code"] == "LOC-601",
+      and apps[601]["content_version"] == 2 and apps[601]["location"]["location_code"] == "LOC-601",
       "SKU-13a an approved master applicability carries its Location identity")
 check(apps[602]["scope"] == "batch_only" and apps[602]["approved"] is False and apps[602]["location"] is None,
       "SKU-13b a Location the caller cannot read is null, not invented")
@@ -581,6 +588,14 @@ check(not calls_to("construction_versions") and not calls_to("constructions")
 check(all(v["construction"] is None and v["construction_version_id"] in (41, 42) for v in body["versions"])
       and body["sku"]["customer"] is None,
       "SKU-15b versions keep their Construction version identity without a guessed label")
+CALLER = {"id": 9, "active": True,
+          "plant_capabilities": {"NAG": ["plant_access", "manage_sku_master"]}, "group_capabilities": []}
+RPC_CALLS.clear()
+r, body = get("/masters/skus/101")
+check(r.status_code == 200 and body["detail_visibility"]["locations"] == "not_visible_to_caller"
+      and body["location_options"][0]["location_code"] == "LOC-601"
+      and any(c["name"] == "sku_master_location_options" and c["token"] == "tok-u2-sku" for c in RPC_CALLS),
+      "SKU-15c manage_sku_master gets governed active options without gaining general Customer Master visibility")
 
 # ─────────────────────────────────────────── SKU-16 optional reads degrade
 CALLER = FULL
@@ -703,7 +718,7 @@ r, body = get("/masters/skus/101")
 check(r.status_code == 200 and all(v["quote_fields"] is None for v in body["versions"])
       and body["sets"] is None and body["history"] is None
       and body["schema_pending"] == {"quote_fields": True, "sku_sets": True, "pricing_portfolio": True,
-                                     "governed_operations": True},
+                                     "governed_operations": True, "location_applicability_operations": True},
       "SKU-21b the detail route falls back the same way")
 check("column sku_versions" not in r.get_data(as_text=True),
       "SKU-21c the database error text does not reach the client")
@@ -1012,7 +1027,11 @@ check(write_rules == sorted([
         "/masters/skus/<int:sku_id>/publish", "/masters/skus/<int:sku_id>/discontinue",
         "/masters/skus/<int:sku_id>/reactivate", "/masters/skus/<int:sku_id>/withdraw",
         "/masters/skus/<int:sku_id>/pricing-portfolio", "/masters/skus/<int:sku_id>/references",
-        "/masters/sku-references/<int:reference_id>/withdraw"]),
+        "/masters/sku-references/<int:reference_id>/withdraw",
+        "/masters/skus/<int:sku_id>/location-applicabilities",
+        "/masters/sku-location-applicabilities/<int:applicability_id>/approve",
+        "/masters/sku-location-applicabilities/<int:applicability_id>/withdraw",
+        "/masters/sku-location-applicabilities/<int:applicability_id>/reactivate"]),
       "SKU-23f every SKU write is a NAMED governed operation; only /pricing-portfolio (and a proposal) sets a "
       "portfolio (repointed for Amendment 04)")
 r, body = get("/masters/skus?plant=NAG")
@@ -1169,6 +1188,28 @@ r, body = post("/masters/sku-references/3/withdraw", {"expected_content_version"
 check(r.status_code == 200 and RPC_CALLS[0]["name"] == "sku_withdraw_reference",
       "SKU-25r a reference is withdrawn, never edited in place (D5)")
 check(all(c["token"] == "tok-u2-sku" for c in RPC_CALLS), "SKU-25s every governed call carries the caller's token")
+
+r, body = post("/masters/skus/101/location-applicabilities",
+               {"expected_content_version": 2, "location_id": 601})
+check(r.status_code == 201 and RPC_CALLS[0]["name"] == "sku_propose_master_applicability"
+      and RPC_CALLS[0]["params"] == {"p_sku": 101, "p_expected_content_version": 2, "p_location": 601},
+      "SKU-26 master applicability proposal is one governed call using the SKU token")
+r, body = post("/masters/sku-location-applicabilities/11/approve", {"expected_content_version": 1})
+check(r.status_code == 200 and RPC_CALLS[0]["name"] == "sku_approve_master_applicability",
+      "SKU-26a approval uses the applicability token")
+r, body = post("/masters/sku-location-applicabilities/11/withdraw",
+               {"expected_content_version": 2, "reason": "  "})
+check(r.status_code == 400 and not RPC_CALLS, "SKU-26b withdrawal without a reason never reaches the database")
+r, body = post("/masters/sku-location-applicabilities/11/withdraw",
+               {"expected_content_version": 2, "reason": " customer request "})
+check(r.status_code == 200 and RPC_CALLS[0]["name"] == "sku_withdraw_master_applicability"
+      and RPC_CALLS[0]["params"]["p_reason"] == "customer request",
+      "SKU-26c withdrawal is governed and carries its reason")
+r, body = post("/masters/sku-location-applicabilities/11/reactivate",
+               {"expected_content_version": 3, "reason": " restored "})
+check(r.status_code == 200 and RPC_CALLS[0]["name"] == "sku_reactivate_master_applicability"
+      and RPC_CALLS[0]["params"]["p_reason"] == "restored",
+      "SKU-26d reactivation is governed and carries its reason")
 
 print(f"{PASSES} passed, {len(FAILURES)} failed")
 if FAILURES:

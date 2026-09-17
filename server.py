@@ -2525,8 +2525,6 @@ def get_sku(sku_id):
             "plants": ("plants", "id, plant_code, name, status", (("eq", "id", sku["plant_id"]),)),
             "references": ("sku_external_references", "id, reference_kind, reference_value, status",
                            (("eq", "sku_id", sku_id), ("order", "id"))),
-            "applicabilities": ("sku_location_applicabilities", "id, location_id, scope, status, approved_at",
-                                (("eq", "sku_id", sku_id), ("order", "id"))),
             "replaces": ("skus", "id, plant_item_code, status",
                          (("eq", "replacement_sku_id", sku_id), ("order", "id"))),
         }
@@ -2541,6 +2539,20 @@ def get_sku(sku_id):
         with timed("skus.detail_reads_parallel"):
             with ThreadPoolExecutor(max_workers=len(reads)) as pool:
                 results = dict(pool.map(_run, reads.items()))
+
+        applicability_pending = False
+        try:
+            applicabilities = _caller_rows(
+                token, "sku_location_applicabilities",
+                "id, location_id, scope, status, approved_at, content_version",
+                ("eq", "sku_id", sku_id), ("order", "id"))
+        except Exception as exc:
+            if not _sku_schema_pending(exc):
+                raise
+            applicability_pending = True
+            applicabilities = _caller_rows(
+                token, "sku_location_applicabilities", "id, location_id, scope, status, approved_at",
+                ("eq", "sku_id", sku_id), ("order", "id"))
     except Exception as exc:
         handled = _sku_read_error(exc, "SKU detail read")
         if handled is not None:
@@ -2560,19 +2572,28 @@ def get_sku(sku_id):
             app.logger.warning("SKU plant adoption read failed (degrading): %s", exc)
             adoption_detail = "unavailable"
 
-    applicabilities = results["applicabilities"]
-    location_detail, loc_by_id = "not_visible_to_caller", {}
+    location_detail, loc_by_id, location_options, can_manage = "not_visible_to_caller", {}, [], False
     if "read_party_master" in group_caps:
         location_detail = "visible"
-        loc_ids = sorted({a["location_id"] for a in applicabilities})
-        if loc_ids:
+        try:
+            location_options = _caller_rows(
+                token, "customer_locations", "id, location_code, status, bill_to_eligible, ship_to_eligible",
+                ("eq", "party_id", sku["party_id"]), ("order", "location_code"))
+            loc_by_id = {l["id"]: l for l in location_options}
+        except Exception as exc:  # noqa: BLE001
+            app.logger.warning("SKU location detail read failed (degrading): %s", exc)
+            location_detail = "unavailable"
+            location_options = []
+    else:
+        plant_row = (results["plants"] or [None])[0] or {}
+        plant_code = plant_row.get("plant_code")
+        can_manage = "manage_sku_master" in ((g.caller.get("plant_capabilities") or {}).get(plant_code) or [])
+        if can_manage and not applicability_pending:
             try:
-                loc_by_id = {l["id"]: l for l in _caller_rows(
-                    token, "customer_locations", "id, location_code, status, bill_to_eligible, ship_to_eligible",
-                    ("in_", "id", loc_ids))}
-            except Exception as exc:  # noqa: BLE001
-                app.logger.warning("SKU location detail read failed (degrading): %s", exc)
-                location_detail = "unavailable"
+                location_options = (get_supabase_for_caller(token)
+                                    .rpc("sku_master_location_options", {"p_sku": sku_id}).execute().data or [])
+            except Exception as exc:  # noqa: BLE001 - governed options degrade without widening master reads
+                app.logger.warning("SKU governed Location options read failed (degrading): %s", exc)
 
     party_by_id, family_by_party, party_detail = _sku_party_detail(g.caller, token, {sku["party_id"]})
     sets, set_detail = _sku_sets(token, [sku_id])
@@ -2625,10 +2646,12 @@ def get_sku(sku_id):
         "location_applicability": [{
             "id": a["id"], "location_id": a.get("location_id"), "scope": a.get("scope"),
             "status": a.get("status"), "approved": a.get("approved_at") is not None,
+            "content_version": a.get("content_version"),
             "location": ({k: loc_by_id[a["location_id"]].get(k) for k in (
                 "location_code", "status", "bill_to_eligible", "ship_to_eligible")}
                 if a.get("location_id") in loc_by_id else None),
         } for a in applicabilities],
+        "location_options": location_options if location_detail == "visible" or can_manage else None,
         "lineage": {
             "replaced_by": (replacement_rows[0] if replacement_rows else None),
             "replacement_visible": (not sku.get("replacement_sku_id")) or bool(replacement_rows),
@@ -2642,7 +2665,8 @@ def get_sku(sku_id):
         "schema_pending": {"quote_fields": quote_pending, "sku_sets": set_detail == "schema_pending",
                             "pricing_portfolio": portfolio_pending,
                             # The governed operations and their history arrive together (Amendment 04).
-                            "governed_operations": history_detail == "schema_pending"},
+                            "governed_operations": history_detail == "schema_pending",
+                            "location_applicability_operations": applicability_pending},
         "mode": "governed_read_only",
         "authority": "caller_token_rls_only",
         "mutations": "none",
@@ -2931,6 +2955,50 @@ def withdraw_sku_reference_route(reference_id):
     if bad:
         return bad
     return _sku_simple_op("sku_withdraw_reference", "p_reference", reference_id, {"p_reason": reason})
+
+
+@app.route("/masters/skus/<int:sku_id>/location-applicabilities", methods=["POST"])
+@require_auth
+def propose_sku_location_applicability_route(sku_id):
+    """Propose master applicability for one active Location of this SKU's Customer."""
+    data = _sku_op_body()
+    expected, bad = _sku_op_expected(data)
+    if bad:
+        return bad
+    location_id = _int_field(data, "location_id")
+    if location_id is None or location_id < 1:
+        return _invalid_input("location_id is required")
+    result, err = _sku_rpc("sku_propose_master_applicability", {
+        "p_sku": sku_id, "p_expected_content_version": expected, "p_location": location_id})
+    if err:
+        return err
+    return jsonify({"id": result.data}), 201
+
+
+@app.route("/masters/sku-location-applicabilities/<int:applicability_id>/approve", methods=["POST"])
+@require_auth
+def approve_sku_location_applicability_route(applicability_id):
+    return _sku_simple_op("sku_approve_master_applicability", "p_applicability", applicability_id)
+
+
+@app.route("/masters/sku-location-applicabilities/<int:applicability_id>/withdraw", methods=["POST"])
+@require_auth
+def withdraw_sku_location_applicability_route(applicability_id):
+    reason, bad = _sku_op_reason(_sku_op_body(), required=True)
+    if bad:
+        return bad
+    return _sku_simple_op("sku_withdraw_master_applicability", "p_applicability", applicability_id,
+                          {"p_reason": reason})
+
+
+@app.route("/masters/sku-location-applicabilities/<int:applicability_id>/reactivate", methods=["POST"])
+@require_auth
+def reactivate_sku_location_applicability_route(applicability_id):
+    reason, bad = _sku_op_reason(_sku_op_body(), required=True)
+    if bad:
+        return bad
+    return _sku_simple_op("sku_reactivate_master_applicability", "p_applicability", applicability_id,
+                          {"p_reason": reason})
 
 @app.route("/masters/customer-families", methods=["GET"])
 @require_auth
