@@ -113,6 +113,33 @@ TEMPLATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                              "AvadhootPacks_Quotation_Master_v7.xlsx")
 
 
+def _backend_build_identity():
+    """Return a non-secret identity for the source loaded by this process."""
+    artifact_sha256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+    for key in (
+        "QOS_BACKEND_REVISION",
+        "VERCEL_GIT_COMMIT_SHA",
+        "GIT_COMMIT_SHA",
+        "SOURCE_VERSION",
+        "RENDER_GIT_COMMIT",
+    ):
+        value = os.environ.get(key, "").strip()
+        if value:
+            return {
+                "revision": value,
+                "revision_source": key,
+                "artifact_sha256": artifact_sha256,
+            }
+    return {
+        "revision": artifact_sha256[:12],
+        "revision_source": "server.py sha256",
+        "artifact_sha256": artifact_sha256,
+    }
+
+
+BACKEND_BUILD = _backend_build_identity()
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # HELPER FUNCTIONS
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -167,7 +194,7 @@ def health():
     """
     Frontend calls this on load to confirm the server is running, the Excel
     template file is present, and Supabase is reachable.
-    Returns: { ok: true, template: true/false, supabase: true/false }
+    Returns service dependencies plus the exact backend build loaded here.
     """
     try:
         get_supabase_anon()
@@ -180,6 +207,7 @@ def health():
         "template": os.path.exists(TEMPLATE_PATH),
         "path":     TEMPLATE_PATH,
         "supabase": supabase_ok,
+        "build":    BACKEND_BUILD,
     })
 
 
@@ -209,6 +237,7 @@ def export_xlsx():
     quote_date_str  = data.get("quoteDate",     "")
     effective_from  = data.get("effectiveFrom", "")
     effective_to    = data.get("effectiveTo",   "")
+    beta_export     = data.get("beta") is True
 
     wb     = openpyxl.load_workbook(TEMPLATE_PATH)
     ws_cbb = wb["CBB+PP"]
@@ -294,7 +323,8 @@ def export_xlsx():
     except ValueError:
         ws_cbb["B4"] = datetime.now()
     mat_codes = ", ".join(i["spec"].get("material_code", "") for i in items if i["spec"].get("material_code"))
-    ws_cbb["D4"] = (f"{quote_ref} | {mat_codes}") if quote_ref else mat_codes
+    reference_line = (f"{quote_ref} | {mat_codes}") if quote_ref else mat_codes
+    ws_cbb["D4"] = f"BETA | {reference_line}" if beta_export else reference_line
 
     # Rate parameters
     interest = num(f0.get("interest"),   0.5)

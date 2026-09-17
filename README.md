@@ -18,8 +18,11 @@ python server.py
 ```
 
 The API normally runs at `http://localhost:3001`. `GET /health` reports service, template, and
-Supabase-configuration availability; it does not prove which source revision a pre-existing process
-has loaded, so restart deliberately before route verification.
+Supabase-configuration availability together with `build.revision`, `build.revision_source`, and a
+deterministic `build.artifact_sha256`. Deployments should set `QOS_BACKEND_REVISION`; otherwise the
+service uses the platform commit identifier when available and a server artifact hash as its safe
+fallback. Restart deliberately before route verification, then record the identity returned by the
+running process.
 
 ## Repository map
 
