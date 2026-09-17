@@ -125,6 +125,20 @@ export function resolveField(field, ctx = {}) {
   return { ...UNRESOLVED };
 }
 
+// Resolve the six Batch Profile commercial defaults once for consumers that
+// render or persist both Box and PP values. Keeping this beside resolveField
+// prevents Batch Builder placeholders and Send from reintroducing literal
+// fallbacks that skip the selected Sector tier.
+export function resolveBatchCommercialDefaults(batchProfile, sector, calcDefaults) {
+  const value=(field,isPP)=>resolveField(field,{
+    rowOverride:'',batchProfile,sector,calcDefaults,isPP,
+  }).value;
+  return {
+    waste:value('waste',false),convRate:value('convRate',false),margin:value('margin',false),
+    wastePP:value('waste',true),convRatePP:value('convRate',true),marginPP:value('margin',true),
+  };
+}
+
 /**
  * Resolve customer Payment-Terms Interest (CDM-18, Amendment 01 A-01 to A-04).
  *

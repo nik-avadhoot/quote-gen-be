@@ -36,6 +36,7 @@ const FILES = [
   'engine/calcDefaults.js',
   'engine/resolveAuthority.js',
   'engine/interestBasis.js',
+  'lib/constructionIdentity.js',
 ];
 
 const sha256 = (buf) => createHash('sha256').update(buf).digest('hex');

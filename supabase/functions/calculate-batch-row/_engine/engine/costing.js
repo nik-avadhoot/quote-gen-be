@@ -15,6 +15,7 @@
 import { DEFAULT_BOX_TRIM_DATA, TAKEUP, TRIM } from './costingTables.js';
 import { CALC_DEFAULTS } from './calcDefaults.js';
 import { resolveFreight } from './resolveAuthority.js';
+import { constructionLayerIssues } from '../lib/constructionIdentity.js';
 
 // DEFAULT_FREIGHT is an application MIRROR, not an approved Freight Master.
 // This label is what a snapshot records for it, and it can never occupy the
@@ -43,6 +44,10 @@ export const calcCosting=(spec,rates,freight,boxTrimData,resolvedFreightRate)=>{
     flutingBCF=0.10,setCode,rowType}=spec;
   const isBoard=boxType==="Board"||boxType==="PP"; // PP = plates/partitions: flat piece formula
   if(!+L||!+W||(!isBoard&&!+H))return null;
+  // A partial paper stack is not a cheaper construction; it is no construction.
+  // Fail before arithmetic so omitted BF/grade or GSM can never become zero-cost
+  // layers in a seemingly usable result, including through non-UI callers.
+  if(constructionLayerIssues(spec).length)return null;
   // PP-aware rates: Plate/Partition rows use P&P waste and conv rates.
   // NOTE: must use a proper "is this actually unset" check, not `||` — several
   // sectors (Textile, Cooler, Petrol, Edible-Oil, Footwear, Elec-LED, Beauty,
@@ -219,8 +224,11 @@ export const checkMissingInfo=(spec,result,freightResolution)=>{
   const needsH=spec.boxType!=="Board"&&spec.boxType!=="PP";
   if(!spec.L||!spec.W||(needsH&&!+spec.H))
     B.push(needsH?"Box dimensions (L×W×H) not entered":"Board dimensions (L×W) not entered — H not required for flat Board pieces");
-  if(!Object.values(spec.layers||{}).some(l=>l.code&&l.gsm))
-                                     B.push("Paper construction not specified — enter at least one layer");
+  const layerIssues=constructionLayerIssues(spec);
+  if(layerIssues.length){
+    const affected=[...new Set(layerIssues.map(issue=>issue.key))].join(", ");
+    B.push(`Paper construction incomplete — grade/BF and positive GSM required for ${affected}`);
+  }
   if(!spec.delivery)                 B.push("Freight not specified");
   if(!spec.volume||+spec.volume===0) B.push("Monthly volume (nos/month) not provided");
   if(!spec.sector)                   W.push("Sector not selected — sector defaults not applied");
@@ -315,6 +323,10 @@ export const buildSpecFromRow=(row,constEntry,prof)=>{
     // 3) construction library boxType for Box rows, 4) RSC fallback.
     boxType:row.boxType||(isPartType?"PP":(constEntry.boxType||"RSC")),
     ply:constEntry.ply||5,ups:row.ups||1,
+    // Row-owned descriptive SKU metadata. Preserve 0 colours distinctly from blank;
+    // neither field participates in calculation until an approved mechanism consumes it.
+    printing_technology:row.printing_technology??"",
+    number_of_colours:row.number_of_colours??"",
     flute_F1:constEntry.flute_F1||"B",flute_F2:constEntry.flute_F2||"A",
     layers:constEntry.layers||{TOP:{code:"",gsm:""},F1:{code:"",gsm:""},L1:{code:"",gsm:""},F2:{code:"",gsm:""},L2:{code:"",gsm:""}},
     board_gsm:constEntry.board_gsm||row.board_gsm||"",

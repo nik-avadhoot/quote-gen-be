@@ -3,7 +3,7 @@ export const MANIFEST = {
   "files": [
     {
       "path": "engine/costing.js",
-      "sha256": "9c4229377f8784432e4dd5a845bd18d449426f0259efa16cebf28838da8fbd25"
+      "sha256": "3d59a144f1fd41b86758bbac2bbf86039ac7076d51453f544e0e630bea14a9a4"
     },
     {
       "path": "engine/costingTables.js",
@@ -15,13 +15,17 @@ export const MANIFEST = {
     },
     {
       "path": "engine/resolveAuthority.js",
-      "sha256": "c21e3ab088ab8557344bdc5794e125e93df33d938b0c2e922c928126b39441b4"
+      "sha256": "590cfcb6656ff277c48175e60c7f85ce19960792a5d5f0b63c97a611fa8767a3"
     },
     {
       "path": "engine/interestBasis.js",
       "sha256": "d9616bfff710861ffb08b2dfe669897c52c52890b136202ef46f6d13fbe13500"
+    },
+    {
+      "path": "lib/constructionIdentity.js",
+      "sha256": "1d112b55a1a04ca289efec9a81a15fda5ca2a61e6065569b82b37ee47a2602c8"
     }
   ],
-  "digest": "7c2ceac1972460ba370ba423a2da8ddaae869e4361ff1ee9431f0f4a2ddcf09d",
-  "engine_version": "engine/qe1-7c2ceac1972460ba"
+  "digest": "600adcbe1a85be5914e6517fb838d599802028a248d2ca1dbe35e8dcafb95631",
+  "engine_version": "engine/qe1-600adcbe1a85be59"
 };
