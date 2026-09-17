@@ -92,6 +92,8 @@ ROWS = {
          "status": "active", "replacement_sku_id": None, "content_version": 2},
         {"id": 302, "plant_id": 8, "party_id": 201, "plant_item_code": "PUN-SKU-302",
          "status": "active", "replacement_sku_id": None, "content_version": 1},
+        {"id": 303, "plant_id": 7, "party_id": 201, "plant_item_code": None,
+         "status": "withdrawn", "replacement_sku_id": None, "content_version": 3},
     ],
     "sku_versions": [
         {"id": 311, "sku_id": 301, "plant_id": 7, "version_no": 2,
@@ -103,6 +105,17 @@ ROWS = {
          "construction_version_id": 322, "is_price_driving": True,
          "length_mm": 410, "width_mm": 310, "height_mm": 260, "box_type": "RSC",
          "ups": 1, "spec_bs": 9, "spec_bct": 130, "spec_ect": 34,
+         "approved_at": None},
+        # Amendment 04 D-01: unapproved, on an ADOPTED Construction - quotable, labelled.
+        {"id": 313, "sku_id": 301, "plant_id": 7, "version_no": 4,
+         "construction_version_id": 321, "is_price_driving": False,
+         "length_mm": 400, "width_mm": 300, "height_mm": 250, "box_type": "RSC",
+         "ups": 1, "spec_bs": 8, "spec_bct": 120, "spec_ect": 32,
+         "approved_at": None},
+        {"id": 314, "sku_id": 303, "plant_id": 7, "version_no": 1,
+         "construction_version_id": 321, "is_price_driving": True,
+         "length_mm": 300, "width_mm": 200, "height_mm": 100, "box_type": "RSC",
+         "ups": 1, "spec_bs": 8, "spec_bct": 120, "spec_ect": 32,
          "approved_at": None},
     ],
     "constructions": [
@@ -917,8 +930,10 @@ with app.test_client() as client:
 row_options = response.get_json()
 check(response.status_code == 200
       and [sku["id"] for sku in row_options["skus"]] == [301]
-      and [version["id"] for version in row_options["skus"][0]["versions"]] == [311],
-      "U4-ROW-1 row options retain only the Batch Family/plant SKU and its approved adopted Version")
+      and [version["id"] for version in row_options["skus"][0]["versions"]] == [313, 311]
+      and [version["approved"] for version in row_options["skus"][0]["versions"]] == [False, True],
+      "U4-ROW-1 row options retain the Batch Family/plant SKU and its ADOPTED versions, unapproved ones "
+      "included and labelled; a withdrawn SKU is never offered (repointed for Amendment 04 D-01)")
 check(row_options["skus"][0]["customer"]["customer_code"] == "CUST-201"
       and row_options["skus"][0]["external_references"][0]["reference_value"] == "CUST-BOX-301"
       and row_options["skus"][0]["versions"][0]["construction"]["id"] == 331,
@@ -931,7 +946,7 @@ with app.test_client() as client:
         "row_type": "box", "material_code": "SHOULD-NOT-WRITE",
     })
 check(response.status_code == 400 and len(TABLE_WRITES) == writes_before_invalid,
-      "U4-ROW-3 an unapproved/unadopted SKU Version is refused before writing")
+      "U4-ROW-3 a SKU Version on an unadopted Construction is refused before writing")
 
 with app.test_client() as client:
     response = client.post("/batches/71/rows", headers=AUTH, json={

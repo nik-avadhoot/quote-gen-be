@@ -4052,8 +4052,9 @@ def _read_batch_row_options(client, batch_id):
 
     The database remains authoritative for every write.  This read narrows the
     editor to the already-ratified U4 contract: the SKU belongs to the Batch
-    Family and plant; its immutable Version is approved; and its Construction
-    authority is currently adopted at that plant.  No rendered label is later
+    Family and plant and is not withdrawn; its Construction authority is currently
+    adopted at that plant.  A Proposed SKU and an unapproved Version are offered and
+    labelled, as a Prospect is (Amendment 04 D-01).  No rendered label is later
     parsed back into an identity.
     """
     batches = (client.table("batches")
@@ -4081,15 +4082,17 @@ def _read_batch_row_options(client, batch_id):
     skus = (client.table("skus")
             .select("id, plant_id, party_id, plant_item_code, status, replacement_sku_id, content_version")
             .eq("plant_id", batch["plant_id"]).execute()).data or []
-    skus = [sku for sku in skus if sku.get("party_id") in party_by_id]
+    # Amendment 04 D-01: a Proposed SKU is offered, as a Prospect is; only a withdrawn one is not.
+    skus = [sku for sku in skus if sku.get("party_id") in party_by_id and sku.get("status") != "withdrawn"]
     sku_ids = {sku["id"] for sku in skus}
 
     versions = (client.table("sku_versions").select(
         "id, sku_id, plant_id, version_no, construction_version_id, is_price_driving, "
         "length_mm, width_mm, height_mm, box_type, ups, spec_bs, spec_bct, spec_ect, approved_at"
     ).eq("plant_id", batch["plant_id"]).execute()).data or []
-    versions = [version for version in versions
-                if version.get("sku_id") in sku_ids and version.get("approved_at") is not None]
+    # Amendment 04 D-01: an unapproved version is quotable too; it is labelled, never hidden.
+    versions = [{**version, "approved": version.get("approved_at") is not None} for version in versions
+                if version.get("sku_id") in sku_ids]
 
     adoptions = (client.table("plant_construction_adoptions")
                  .select("plant_id, construction_version_id, status")
