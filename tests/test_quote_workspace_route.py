@@ -35,7 +35,7 @@ ROWS = {
                   "pricing_basis_is_deliberate": True, "created_at": "2026-09-11T07:00:00Z",
                   "created_by": 4},
                 {"id": 72, "batch_reference": "NAG/BAT/2026-27/00072", "family_id": 21,
-                  "plant_id": 7, "owner_user_id": 4, "sector_id": 31, "status": "sent",
+                  "plant_id": 7, "owner_user_id": 4, "sector_id": 31, "status": "submitted",
                   "pricing_date": "2026-09-13", "pricing_basis_release_id": 11,
                   "pricing_basis_is_deliberate": False, "created_at": "2026-09-13T07:00:00Z",
                   "created_by": 4}],
@@ -216,9 +216,10 @@ check(snapshot["calculated_by_actor"]["display_name"] == "Maker"
       and current["approved_by_actor"]["display_name"] == "Checker"
       and current["workflow_events"][0]["event_type"] == "returned",
       "U5-BE-7 caller-visible actors and workflow events retain attribution and time order")
-check(all(not action["enabled"] and action["reason"] == "backend_activation_pending"
-          for action in quote["actions"].values()),
-      "U5-BE-8 every governed Quote mutation remains activation-blocked")
+check(all(not action["enabled"] for action in quote["actions"].values())
+      and all(action["reason"] != "backend_activation_pending"
+              for action in quote["actions"].values()),
+      "U5-BE-8 an ineligible Quote reports real state-driven action reasons")
 check(set(quote["actions"]) == {
           "calculate", "send", "submit", "approve", "return", "withdraw",
           "issue", "create_revision", "amend", "reprice",
@@ -282,9 +283,10 @@ check(inbox["rows"][0]["quote_reference"] is None
 check(inbox["rows"][0]["item_count"] == 1
       and inbox["rows"][0]["created_by_actor"]["display_name"] == "Maker",
       "U5-BE-16 inbox summary preserves caller-visible item and Maker evidence")
-check(all(not action["enabled"] and action["reason"] == "backend_activation_pending"
-          for action in inbox["actions"].values()),
-      "U5-BE-17 every inbox mutation remains activation-blocked")
+check(inbox["actions"]["approve"]["enabled"]
+      and inbox["actions"]["return"]["enabled"]
+      and not inbox["actions"]["issue"]["enabled"],
+      "U5-BE-17 the Checker inbox activates only eligible mounted review actions")
 check(CALLS and all(call[0] == "tok-u5" for call in CALLS),
       "U5-BE-18 every inbox and supporting read carries the caller token")
 

@@ -65,6 +65,7 @@ from caller_context import (
     verify_current_password,
 )
 from auth import require_auth, require_group_capability
+from workflow_activation import batch_actions, quote_revision_actions
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -3601,7 +3602,7 @@ def _read_quote_workspace(client, quote_reference=None, revision_id=None, batch_
 
     family["batch"] = one(
         "batch", "batches",
-        "id, batch_reference, family_id, plant_id, owner_user_id, sector_id, status, "
+        "id, batch_reference, family_id, plant_id, owner_user_id, sector_id, status, content_version, "
         "pricing_date, pricing_basis_release_id, pricing_basis_is_deliberate, created_at, created_by",
         family.get("batch_id"))
     if family.get("batch"):
@@ -3612,6 +3613,15 @@ def _read_quote_workspace(client, quote_reference=None, revision_id=None, batch_
             "customer_family", "customer_families",
             "id, group_customer_code, name, status",
             family["batch"].get("family_id"))
+
+    collaborators = []
+    if family.get("batch"):
+        collaborators = optional(
+            "collaborators", client.table("batch_collaborators").select(
+                "id, batch_id, app_user_id, status"
+            ).eq("batch_id", family["batch"]["id"]).eq("status", "active"))
+    is_collaborator = any(
+        row.get("app_user_id") == g.caller.get("id") for row in collaborators)
 
     revisions = optional(
         "revisions", client.table("quote_revisions").select(
@@ -3712,17 +3722,19 @@ def _read_quote_workspace(client, quote_reference=None, revision_id=None, batch_
         revision["customer_outcomes"] = sorted(
             outcomes_by_revision.get(str(revision["id"]), []),
             key=lambda event: (event.get("occurred_at") or "", event.get("id")))
+        revision["actions"] = quote_revision_actions(
+            g.caller, family.get("batch"), revision, is_collaborator)
 
     family["created_by_actor"] = actors.get(str(family.get("created_by")))
     family["revisions"] = revisions
     family["details_partial"] = bool(partial or denied)
     family["partial_sections"] = sorted(set(partial))
     family["denied_sections"] = sorted(set(denied))
-    family["actions"] = {
-        name: {"enabled": False, "reason": "backend_activation_pending"}
-        for name in ("calculate", "send", "submit", "approve", "return", "withdraw",
-                     "issue", "create_revision", "amend", "reprice")
-    }
+    newest = max(revisions, key=lambda row: (
+        row.get("revision_no") is not None, row.get("revision_no") or 0,
+        row.get("created_at") or ""), default=None)
+    family["actions"] = (newest or {}).get("actions") or quote_revision_actions(
+        g.caller, family.get("batch"), None, is_collaborator)
     return family
 
 
@@ -3765,7 +3777,7 @@ def _read_quote_catalogue(client, view):
     batch_ids = list({row["batch_id"] for row in families.values()})
     batches = indexed(
         "batches", "batches",
-        "id, batch_reference, family_id, plant_id, status", batch_ids)
+        "id, batch_reference, family_id, plant_id, owner_user_id, status", batch_ids)
     plant_ids = list({row["plant_id"] for row in batches.values()})
     plants = indexed("plants", "plants", "id, plant_code, name, status", plant_ids)
     customer_family_ids = list({row["family_id"] for row in batches.values()})
@@ -3813,7 +3825,11 @@ def _read_quote_catalogue(client, view):
             "issued_by_actor": actors.get(str(revision.get("issued_by"))),
             "item_count": item_counts.get(str(revision["id"]), 0),
         })
+        row["actions"] = quote_revision_actions(
+            g.caller, {**(batch or {}), "plant": plant}, row)
         rows.append(row)
+
+    action_names = ("approve", "return", "withdraw", "issue", "create_revision")
 
     return {
         "view": view,
@@ -3824,8 +3840,9 @@ def _read_quote_catalogue(client, view):
         "partial_sections": sorted(set(partial)),
         "denied_sections": sorted(set(denied)),
         "actions": {
-            name: {"enabled": False, "reason": "backend_activation_pending"}
-            for name in ("approve", "return", "withdraw", "issue", "create_revision")
+            name: {"enabled": (enabled := any(row["actions"][name]["enabled"] for row in rows)),
+                   "reason": "available" if enabled else "select_eligible_record"}
+            for name in action_names
         },
     }
 
@@ -3912,7 +3929,10 @@ def _read_batch_catalogue(client):
             and row["pricing_basis_release"] is None,
             row["owner"] is None,
         ))
+        row["actions"] = batch_actions(g.caller, row)
         rows.append(row)
+
+    action_names = ("calculate", "send", "submit", "approve", "return", "issue")
 
     return {
         "rows": rows,
@@ -3923,8 +3943,9 @@ def _read_batch_catalogue(client):
         "partial_sections": sorted(set(partial)),
         "denied_sections": sorted(set(denied)),
         "actions": {
-            name: {"enabled": False, "reason": "backend_activation_pending"}
-            for name in ("calculate", "send", "submit", "approve", "return", "issue")
+            name: {"enabled": (enabled := any(row["actions"][name]["enabled"] for row in rows)),
+                   "reason": "available" if enabled else "select_eligible_record"}
+            for name in action_names
         },
     }
 
@@ -5156,6 +5177,92 @@ def send_batch_route(batch_id):
         "mutation": "atomic_send",
         "authority": "caller_token_database_rpc",
     }), 201
+
+
+def _quote_workflow_rpc(name, params, *, scalar=False, status=200):
+    result, err = _rpc_call(
+        get_supabase_for_caller(g.access_token), name, params,
+        error_map={"PT422": "INVALID_INPUT"})
+    if err:
+        return err
+    payload = {"mutation": name, "authority": "caller_token_database_rpc"}
+    if scalar:
+        record_id = _rpc_scalar_id(result)
+        if record_id is None:
+            app.logger.error("%s returned no valid identity", name)
+            return _error("INTERNAL_ERROR")
+        payload["id"] = record_id
+    return jsonify(payload), status
+
+
+@app.route("/quotes/revisions/<int:revision_id>/submit", methods=["POST"])
+@require_auth
+def submit_quote_revision_route(revision_id):
+    data = request.get_json(silent=True) or {}
+    expected = _int_field(data, "expected_content_version")
+    if expected is None or expected < 1:
+        return _invalid_input("expected_content_version must be a positive integer")
+    return _quote_workflow_rpc("submit_quote_revision", {
+        "p_revision": revision_id, "p_expected_content_version": expected})
+
+
+@app.route("/quotes/revisions/<int:revision_id>/return", methods=["POST"])
+@require_auth
+def return_quote_revision_route(revision_id):
+    data = request.get_json(silent=True) or {}
+    note = data.get("note")
+    if not isinstance(note, str) or not note.strip() or len(note.strip()) > 2000:
+        return _invalid_input("note must be 1 to 2000 characters")
+    return _quote_workflow_rpc("return_quote_revision", {
+        "p_revision": revision_id, "p_note": note.strip()})
+
+
+@app.route("/quotes/revisions/<int:revision_id>/approve", methods=["POST"])
+@require_auth
+def approve_quote_revision_route(revision_id):
+    return _quote_workflow_rpc("approve_quote_revision", {"p_revision": revision_id})
+
+
+@app.route("/quotes/revisions/<int:revision_id>/withdraw", methods=["POST"])
+@require_auth
+def withdraw_quote_revision_route(revision_id):
+    data = request.get_json(silent=True) or {}
+    reason = data.get("reason")
+    if not isinstance(reason, str) or not reason.strip() or len(reason.strip()) > 2000:
+        return _invalid_input("reason must be 1 to 2000 characters")
+    return _quote_workflow_rpc("withdraw_quote_revision", {
+        "p_revision": revision_id, "p_reason": reason.strip()})
+
+
+@app.route("/quotes/revisions/<int:revision_id>/issue", methods=["POST"])
+@require_auth
+def issue_quote_revision_route(revision_id):
+    data = request.get_json(silent=True) or {}
+    name = data.get("addressee_name")
+    details = data.get("addressee_details")
+    quote_date = data.get("quote_date")
+    validity = data.get("offer_validity_to")
+    if name is not None and not isinstance(name, str):
+        return _invalid_input("addressee_name must be text or null")
+    if details is not None and not isinstance(details, dict):
+        return _invalid_input("addressee_details must be an object or null")
+    if any(value is not None and not isinstance(value, str)
+           for value in (quote_date, validity)):
+        return _invalid_input("quote_date and offer_validity_to must be ISO dates or null")
+    return _quote_workflow_rpc("issue_quote_revision", {
+        "p_revision": revision_id,
+        "p_addressee_name": name.strip() if isinstance(name, str) else None,
+        "p_addressee_details": details,
+        "p_quote_date": quote_date or None,
+        "p_offer_validity_to": validity or None,
+    })
+
+
+@app.route("/quotes/revisions/<int:revision_id>/create-revision", methods=["POST"])
+@require_auth
+def create_quote_revision_route(revision_id):
+    return _quote_workflow_rpc(
+        "create_quote_revision", {"p_source_revision": revision_id}, scalar=True, status=201)
 
 
 @app.route("/batches/<int:batch_id>/pricing-groups", methods=["POST"])

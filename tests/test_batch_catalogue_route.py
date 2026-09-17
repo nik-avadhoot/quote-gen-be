@@ -169,9 +169,10 @@ check(first["status"] == "submitted" and first["owner"]["display_name"] == "Make
 check(catalogue["display_limit"] == 50 and catalogue["results_limited"] is False
       and catalogue["filter_scope"] == "displayed_newest_first_window",
       "U4-CAT-BE-7 the bounded operational display contract is explicit")
-check(all(not action["enabled"] and action["reason"] == "backend_activation_pending"
-          for action in catalogue["actions"].values()),
-      "U4-CAT-BE-8 Calculate, Send and workflow mutations remain activation-blocked")
+check(catalogue["actions"]["calculate"]["enabled"]
+      and catalogue["actions"]["send"]["enabled"]
+      and not catalogue["actions"]["submit"]["enabled"],
+      "U4-CAT-BE-8 mounted Batch actions activate while Quote actions require a candidate")
 check(CALLS and all(call[0] == "tok-u4-catalogue" for call in CALLS),
       "U4-CAT-BE-9 every primary and supporting read carries the genuine caller token")
 
