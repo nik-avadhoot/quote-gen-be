@@ -11,7 +11,7 @@ MIGRATION = (
     Path(__file__).resolve().parent.parent
     / "supabase"
     / "migrations"
-    / "20260917223112_register_gsm_and_customer_family_sector_suites.sql"
+    / "20260917182138_register_gsm_and_customer_family_sector_suites.sql"
 )
 SQL = MIGRATION.read_text(encoding="utf-8")
 

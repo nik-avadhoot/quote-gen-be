@@ -1,6 +1,8 @@
 -- Wave A: register the two catalogue suites that were created but never added
 -- to tests.run_all(). tests.suite_registration() already makes an omitted suite
 -- fail SR-1; this migration restores the register without retyping its body.
+-- Applied live as migration 20260917182138 under explicit Product Owner
+-- authority on 2026-09-17.
 --
 -- SPLICED, NOT RETYPED. Each insertion uses one stable neighbouring suite as
 -- its anchor and aborts unless that anchor occurs exactly once. This preserves

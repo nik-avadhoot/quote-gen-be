@@ -14,7 +14,7 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 MIGRATIONS = ROOT / "supabase" / "migrations"
-SQL = (MIGRATIONS / "20260915180000_s9_1_fix_family_g_read_helper_execute.sql").read_text(encoding="utf-8")
+SQL = (MIGRATIONS / "20260917182121_s9_1_fix_family_g_read_helper_execute.sql").read_text(encoding="utf-8")
 ORIGINAL = (MIGRATIONS / "20260909105454_s9_1_family_g_quote_schema.sql").read_text(encoding="utf-8")
 BATCH_CORE = (MIGRATIONS / "20260906044153_s6_1_family_f_batch_core.sql").read_text(encoding="utf-8")
 
@@ -84,8 +84,8 @@ check(all(table in SQL for table in (
       "FG-GRANT-13 the structural proof covers all nine Family G tables")
 check("raise exception 'anon must not be able to execute the Family G read helpers'" in SQL,
       "FG-GRANT-14 the structural proof also refuses anon EXECUTE")
-check("prepared, not applied" in LOWER,
-      "FG-GRANT-15 the migration states it is prepared and not applied")
+check("applied live as migration 20260917182121" in LOWER,
+      "FG-GRANT-15 the migration records its live ledger version")
 
 # The splice, simulated against the QG-38 body as recorded in the applied
 # history, must yield a truthful contract: authenticated POSITIVE, anon still

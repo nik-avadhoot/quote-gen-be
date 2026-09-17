@@ -1,8 +1,7 @@
 -- S9(a) correction: the Family G read helpers must be executable by the caller.
 --
--- PREPARED, NOT APPLIED. Authored 2026-09-15 after the S9 localhost
--- qualification run. Apply only under explicit Product Owner authority, after a
--- branch rehearsal (see quote-gen-fe/docs/s9-qualification-seed-and-quote-read-fix-plan.md).
+-- Applied live as migration 20260917182121 under explicit Product Owner
+-- authority on 2026-09-17.
 --
 -- THE DEFECT. Every Family G SELECT policy (s9_1_family_g_quote_schema.sql
 -- lines 374-406) calls app_private.can_read_quote_family / _revision / _item.
