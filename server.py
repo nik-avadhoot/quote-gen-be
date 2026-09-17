@@ -2435,6 +2435,13 @@ def list_skus():
     references, reference_detail = _sku_references(token, sku_ids)
     locations, location_detail = _sku_locations(g.caller, token, sku_ids)
     sets, set_detail = _sku_sets(token, sku_ids)
+    # Amendment 04: whether the governed operations exist here, so the screen can
+    # show its edit controls disabled ("schema activation pending") rather than live.
+    governed_pending = False
+    try:
+        _caller_rows(token, "sku_master_events", "operation", ("limit", 1))
+    except Exception as exc:  # noqa: BLE001 - a probe; only "no such table" changes the answer
+        governed_pending = _sku_schema_pending(exc)
 
     rows = []
     for s in skus:
@@ -2486,7 +2493,7 @@ def list_skus():
         "detail_visibility": {"customer": party_detail, "construction": construction_detail,
                               "references": reference_detail, "locations": location_detail, "sets": set_detail},
         "schema_pending": {"quote_fields": quote_pending, "sku_sets": set_detail == "schema_pending",
-                            "pricing_portfolio": portfolio_pending},
+                            "pricing_portfolio": portfolio_pending, "governed_operations": governed_pending},
         "mode": "governed_read_only",
         "authority": "caller_token_rls_only",
         "mutations": "none",

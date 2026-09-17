@@ -677,7 +677,8 @@ check(row101["sets"][0]["role"] == "box" and by_id[102]["sets"][0]["qty_per_set"
       "SKU-20e catalogue rows carry SKU Set membership with quantity per set")
 check(body["detail_visibility"] == {"customer": "visible", "construction": "visible", "references": "visible",
                                     "locations": "visible", "sets": "visible"}
-      and body["schema_pending"] == {"quote_fields": False, "sku_sets": False, "pricing_portfolio": False},
+      and body["schema_pending"] == {"quote_fields": False, "sku_sets": False, "pricing_portfolio": False,
+                                     "governed_operations": False},
       "SKU-20f catalogue visibility and schema state are reported per section")
 CALLER = MAKER
 r, body = get("/masters/skus?plant=NAG")
@@ -692,7 +693,8 @@ CALLER = FULL
 SCHEMA_PENDING = True
 r, body = get("/masters/skus?plant=NAG")
 row = {x["id"]: x for x in body["skus"]}[101]
-check(r.status_code == 200 and body["schema_pending"] == {"quote_fields": True, "sku_sets": True, "pricing_portfolio": True},
+check(r.status_code == 200 and body["schema_pending"] == {"quote_fields": True, "sku_sets": True, "pricing_portfolio": True,
+                                                        "governed_operations": True},
       "SKU-21 an unactivated migration still serves the catalogue and says what is pending")
 check(row["latest_version"]["quote_fields"] is None and row["latest_version"]["length_mm"] == 300.0
       and row["sets"] is None and body["detail_visibility"]["sets"] == "schema_pending",
