@@ -16,7 +16,7 @@
 -- SKU status it calculated, so a Checker sees a Proposed SKU in the evidence (the Maker/Checker
 -- workflow is where a settled customer's approval is exercised - Amendment 04 D-06).
 --
--- DEPENDS ON 20260916200000 (the 'withdrawn' status). Each change is an exact-anchor replacement of
+-- DEPENDS ON 20260917030403 (the 'withdrawn' status). Each change is an exact-anchor replacement of
 -- the live definition, asserted to match exactly once, the S7R-8b / S7R-12 technique. Grants are
 -- unchanged by CREATE OR REPLACE.
 --
@@ -48,7 +48,7 @@ begin
                   and pg_catalog.pg_get_constraintdef(oid) like '%withdrawn%') then
     raise exception using errcode = 'object_not_in_prerequisite_state',
       message = 'Proposed-SKU quotability needs the withdrawn SKU status.',
-      hint = 'Apply 20260916200000_u2_sku_master_governed_operations first.';
+      hint = 'Apply 20260917030403_u2_sku_master_governed_operations first.';
   end if;
 
   v_def := pg_catalog.pg_get_functiondef('app_private.assert_calculate_eligible(bigint)'::regprocedure);

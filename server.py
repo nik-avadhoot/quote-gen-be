@@ -2660,7 +2660,7 @@ def get_sku(sku_id):
 # closed by the migration. These routes only shape and bound the request first, so
 # a malformed body is INVALID_INPUT before any database call.
 #
-# Until migration 20260916200000 is applied the wrappers do not exist; PostgREST
+# Until migration 20260917030403 is applied the wrappers do not exist; PostgREST
 # answers PGRST202 and the route returns SCHEMA_ACTIVATION_PENDING rather than a
 # generic failure.
 _SKU_OP_ERRORS = {"PT423": "NEW_SKU_REQUIRED", "PGRST202": "SCHEMA_ACTIVATION_PENDING",

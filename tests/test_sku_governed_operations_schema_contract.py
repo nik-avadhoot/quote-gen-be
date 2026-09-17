@@ -2,7 +2,7 @@
 
 Run:  python tests/test_sku_governed_operations_schema_contract.py
 
-The migration is PREPARED, NOT APPLIED. This offline gate proves the authored SQL keeps
+The migration was applied live on 2026-09-17 (recorded version in its file name). This offline gate proves the authored SQL keeps
 the Product Owner's rulings of 2026-09-16 (design packet D1-D12). It cannot prove the
 SQL runs: that is database-runtime verification, owed when the migration is activated
 (its own pgTAP suite, tests.sku_governed_operations, is registered in run_all for that).
@@ -27,7 +27,7 @@ import re
 import sys
 
 ROOT = Path(__file__).resolve().parents[1]
-SQL = (ROOT / "supabase" / "migrations" / "20260916200000_u2_sku_master_governed_operations.sql").read_text(encoding="utf-8")
+SQL = (ROOT / "supabase" / "migrations" / "20260917030403_u2_sku_master_governed_operations.sql").read_text(encoding="utf-8")
 CODE = "\n".join(line.split("--", 1)[0] for line in SQL.splitlines())
 LOWER = CODE.lower()
 NO_LITERALS = re.sub(r"'[^']*'", "''", LOWER)

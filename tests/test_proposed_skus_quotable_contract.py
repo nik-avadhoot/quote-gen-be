@@ -2,12 +2,12 @@
 
 Run:  python tests/test_proposed_skus_quotable_contract.py
 
-Covers two prepared migrations (Amendment 04, 2026-09-16):
+Covers two migrations (Amendment 04, 2026-09-16), applied live on 2026-09-17:
 
-  PQ-1..6  20260916210000_u2_proposed_skus_are_quotable - Calculate and Send admit a Proposed
+  PQ-1..6  20260917030435_u2_proposed_skus_are_quotable - Calculate and Send admit a Proposed
            SKU and an unapproved version exactly as a Prospect is admitted, refuse only a
            WITHDRAWN SKU, and change nothing else (exact-anchor, count-asserted rewrites).
-  PF-1..4  20260916170500_u2_test_fixtures_record_a_pricing_portfolio - every registered fixture
+  PF-1..4  20260917025921_u2_test_fixtures_record_a_pricing_portfolio - every registered fixture
            that inserts a SKU states a portfolio explicitly; no default and no production path.
 """
 from pathlib import Path
@@ -15,8 +15,8 @@ import re
 import sys
 
 ROOT = Path(__file__).resolve().parents[1] / "supabase" / "migrations"
-Q = (ROOT / "20260916210000_u2_proposed_skus_are_quotable.sql").read_text(encoding="utf-8")
-F = (ROOT / "20260916170500_u2_test_fixtures_record_a_pricing_portfolio.sql").read_text(encoding="utf-8")
+Q = (ROOT / "20260917030435_u2_proposed_skus_are_quotable.sql").read_text(encoding="utf-8")
+F = (ROOT / "20260917025921_u2_test_fixtures_record_a_pricing_portfolio.sql").read_text(encoding="utf-8")
 PASSES, FAILURES = 0, []
 
 
@@ -50,7 +50,7 @@ check("not in ('active','discontinued')" in s_old and "s.status = 'withdrawn'" i
 check(Q.count("matched % times, expected 1") == 3 and "was not rewritten as intended" in Q,
       "PQ-4 every rewrite is count-asserted against the live definition and the result is proved")
 check("like '%withdrawn%'" in Q and "object_not_in_prerequisite_state" in code,
-      "PQ-5 it refuses to run before the withdrawn status exists (20260916200000)")
+      "PQ-5 it refuses to run before the withdrawn status exists (20260917030403)")
 check(not re.search(r"\b(quote_revisions|quote_items|quote_families|construction_reference_invalid|pricing_basis|freight)\b",
                     c_new + s_new) and "create table" not in code and "grant " not in code,
       "PQ-6 nothing else in either function, no table and no grant changes; S9 stays narrow")
