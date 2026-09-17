@@ -1,6 +1,6 @@
 -- Database test fixtures state a pricing portfolio for every SKU they insert (CDM-45).
 --
--- Amendment 03 (20260916170000) makes skus.pricing_portfolio NOT NULL with no default, on
+-- Amendment 03 (20260917024903) makes skus.pricing_portfolio NOT NULL with no default, on
 -- purpose: nothing may classify a SKU by itself. Nineteen fixture inserts in nine registered
 -- suites predate it and insert a SKU without one, so tests.run_all would fail on a
 -- not-null violation that says nothing about what each suite proves.
@@ -22,7 +22,7 @@ begin
                   where table_schema = 'public' and table_name = 'skus' and column_name = 'pricing_portfolio') then
     raise exception using errcode = 'object_not_in_prerequisite_state',
       message = 'Fixture portfolios need Amendment 03 storage.',
-      hint = 'Apply 20260916170000_u2_sku_pricing_portfolio first.';
+      hint = 'Apply 20260917024903_u2_sku_pricing_portfolio first.';
   end if;
 
   for r in select p.oid, p.proname from pg_catalog.pg_proc p join pg_catalog.pg_namespace n on n.oid = p.pronamespace

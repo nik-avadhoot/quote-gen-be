@@ -2,7 +2,7 @@
 
 Run:  python tests/test_sku_pricing_portfolio_schema_contract.py
 
-The migration is prepared, not applied. This offline gate proves the authored SQL
+The migration was applied live on 2026-09-17 (recorded version in its file name). This offline gate proves the authored SQL
 keeps the boundaries Canonical Amendment 03 sets (CDM-45). It is not a substitute
 for database-runtime verification once the migration is activated.
 
@@ -25,7 +25,7 @@ import sys
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SQL = (ROOT / "supabase" / "migrations" / "20260916170000_u2_sku_pricing_portfolio.sql").read_text(encoding="utf-8")
+SQL = (ROOT / "supabase" / "migrations" / "20260917024903_u2_sku_pricing_portfolio.sql").read_text(encoding="utf-8")
 # Executable SQL only: the header explains the rules in prose.
 CODE = "\n".join(line.split("--", 1)[0] for line in SQL.splitlines())
 LOWER = CODE.lower()

@@ -29,7 +29,7 @@
 --        its Maker batch_only proposal path are deliberately untouched here.
 --   D6   SKU Sets are slice 2 and are not touched here.
 --
--- DEPENDS ON Amendment 02 (20260916100000) and Amendment 03 (20260916170000); it
+-- DEPENDS ON Amendment 02 (20260917024849) and Amendment 03 (20260917024903); it
 -- refuses to run without them. No row of existing data is changed.
 --
 -- S9: every table written here is Family C. Nothing reads or writes a Family G
@@ -44,13 +44,13 @@ begin
                   where table_schema = 'public' and table_name = 'sku_versions' and column_name = 'item_name') then
     raise exception using errcode = 'object_not_in_prerequisite_state',
       message = 'SKU governed operations need Canonical Amendment 02 storage.',
-      hint = 'Apply 20260916100000_u2_sku_master_quote_fields_and_sets first.';
+      hint = 'Apply 20260917024849_u2_sku_master_quote_fields_and_sets first.';
   end if;
   if not exists (select 1 from information_schema.columns
                   where table_schema = 'public' and table_name = 'skus' and column_name = 'pricing_portfolio') then
     raise exception using errcode = 'object_not_in_prerequisite_state',
       message = 'SKU governed operations need Canonical Amendment 03 storage.',
-      hint = 'Apply 20260916170000_u2_sku_pricing_portfolio first.';
+      hint = 'Apply 20260917024903_u2_sku_pricing_portfolio first.';
   end if;
 end $$;
 
