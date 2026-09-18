@@ -539,7 +539,8 @@ check(qf1["print_technology"] == "Flexo" and qf1["number_of_colours"] == 0 and q
       and qf2["print_technology"] is None and qf2["item_weight_kg"] == 0,
       "SKU-12e CDM-43 quote fields return per version with blank, NA and zero kept apart")
 check(body["schema_pending"] == {"quote_fields": False, "sku_sets": False, "pricing_portfolio": False,
-                                 "governed_operations": False, "location_applicability_operations": False}
+                                 "governed_operations": False, "location_applicability_operations": False,
+                                 "sku_set_operations": False}
       and "unrecorded_specification_fields" not in body,
       "SKU-12e2 with the migration active nothing is reported pending")
 check(body["detail_visibility"] == {"customer": "visible", "construction": "visible",
@@ -693,7 +694,7 @@ check(row101["sets"][0]["role"] == "box" and by_id[102]["sets"][0]["qty_per_set"
 check(body["detail_visibility"] == {"customer": "visible", "construction": "visible", "references": "visible",
                                     "locations": "visible", "sets": "visible"}
       and body["schema_pending"] == {"quote_fields": False, "sku_sets": False, "pricing_portfolio": False,
-                                     "governed_operations": False},
+                                     "governed_operations": False, "sku_set_operations": False},
       "SKU-20f catalogue visibility and schema state are reported per section")
 CALLER = MAKER
 r, body = get("/masters/skus?plant=NAG")
@@ -709,7 +710,7 @@ SCHEMA_PENDING = True
 r, body = get("/masters/skus?plant=NAG")
 row = {x["id"]: x for x in body["skus"]}[101]
 check(r.status_code == 200 and body["schema_pending"] == {"quote_fields": True, "sku_sets": True, "pricing_portfolio": True,
-                                                        "governed_operations": True},
+                                                        "governed_operations": True, "sku_set_operations": True},
       "SKU-21 an unactivated migration still serves the catalogue and says what is pending")
 check(row["latest_version"]["quote_fields"] is None and row["latest_version"]["length_mm"] == 300.0
       and row["sets"] is None and body["detail_visibility"]["sets"] == "schema_pending",
@@ -718,7 +719,8 @@ r, body = get("/masters/skus/101")
 check(r.status_code == 200 and all(v["quote_fields"] is None for v in body["versions"])
       and body["sets"] is None and body["history"] is None
       and body["schema_pending"] == {"quote_fields": True, "sku_sets": True, "pricing_portfolio": True,
-                                     "governed_operations": True, "location_applicability_operations": True},
+                                     "governed_operations": True, "location_applicability_operations": True,
+                                     "sku_set_operations": True},
       "SKU-21b the detail route falls back the same way")
 check("column sku_versions" not in r.get_data(as_text=True),
       "SKU-21c the database error text does not reach the client")
@@ -1031,7 +1033,9 @@ check(write_rules == sorted([
         "/masters/skus/<int:sku_id>/location-applicabilities",
         "/masters/sku-location-applicabilities/<int:applicability_id>/approve",
         "/masters/sku-location-applicabilities/<int:applicability_id>/withdraw",
-        "/masters/sku-location-applicabilities/<int:applicability_id>/reactivate"]),
+        "/masters/sku-location-applicabilities/<int:applicability_id>/reactivate",
+        "/masters/sku-sets", "/masters/sku-sets/<int:set_id>/confirm",
+        "/masters/sku-sets/<int:set_id>/retire"]),
       "SKU-23f every SKU write is a NAMED governed operation; only /pricing-portfolio (and a proposal) sets a "
       "portfolio (repointed for Amendment 04)")
 r, body = get("/masters/skus?plant=NAG")
@@ -1210,6 +1214,42 @@ r, body = post("/masters/sku-location-applicabilities/11/reactivate",
 check(r.status_code == 200 and RPC_CALLS[0]["name"] == "sku_reactivate_master_applicability"
       and RPC_CALLS[0]["params"]["p_reason"] == "restored",
       "SKU-26d reactivation is governed and carries its reason")
+
+members = [{"sku_id": 101, "role": "box", "qty_per_set": 1},
+           {"sku_id": 104, "role": "plate", "qty_per_set": 1.5}]
+r, body = post("/masters/sku-sets", {"box_sku_id": 101, "expected_content_version": 2,
+                                      "set_label": " NAG-IT-NEW ", "members": members})
+check(r.status_code == 201 and body == {"id": 7001} and RPC_CALLS[0]["name"] == "sku_set_propose"
+      and RPC_CALLS[0]["params"] == {"p_box_sku": 101, "p_expected_content_version": 2,
+                                      "p_set_label": "NAG-IT-NEW", "p_members": members},
+      "SKU-27 a Set proposal is one caller-token operation with explicit internal SKU identities")
+r, body = post("/masters/sku-sets", {"box_sku_id": 101, "expected_content_version": 2,
+                                      "set_label": "NAG-IT-BAD", "members": [
+                                          {"sku_id": 101, "role": "plate", "qty_per_set": 1}]})
+check(r.status_code == 400 and body.get("error_code") == "INVALID_INPUT" and not RPC_CALLS,
+      "SKU-27a a proposal without exactly the selected box is refused before the database")
+r, body = post("/masters/sku-sets", {"box_sku_id": 101, "expected_content_version": 2,
+                                      "set_label": "NAG-IT-BAD-QTY", "members": [
+                                          {"sku_id": 101, "role": "box", "qty_per_set": 1.2345}]})
+check(r.status_code == 400 and body.get("error_code") == "INVALID_INPUT" and not RPC_CALLS,
+      "SKU-27a2 quantity precision that storage would round is refused before the database")
+r, body = post("/masters/sku-sets/51/confirm", {"expected_content_version": 2})
+check(r.status_code == 200 and RPC_CALLS[0]["name"] == "sku_set_confirm"
+      and RPC_CALLS[0]["params"] == {"p_set": 51, "p_expected_content_version": 2},
+      "SKU-27b Set confirmation carries the Set token")
+RPC_RAISE = "PT425"
+r, body = post("/masters/sku-sets/51/confirm", {"expected_content_version": 2})
+check(r.status_code == 422 and body.get("error_code") == "SECOND_APPROVER_REQUIRED"
+      and "database said no" not in r.get_data(as_text=True),
+      "SKU-27c settled-Customer separation is a stable, backend-authored response")
+RPC_RAISE = None
+r, body = post("/masters/sku-sets/51/retire", {"expected_content_version": 3, "reason": "  "})
+check(r.status_code == 400 and not RPC_CALLS, "SKU-27d retirement without a reason never reaches the database")
+r, body = post("/masters/sku-sets/51/retire", {"expected_content_version": 3, "reason": " replaced "})
+check(r.status_code == 200 and RPC_CALLS[0]["name"] == "sku_set_retire"
+      and RPC_CALLS[0]["params"] == {"p_set": 51, "p_expected_content_version": 3,
+                                      "p_reason": "replaced"},
+      "SKU-27e retirement is governed and records its reason")
 
 print(f"{PASSES} passed, {len(FAILURES)} failed")
 if FAILURES:

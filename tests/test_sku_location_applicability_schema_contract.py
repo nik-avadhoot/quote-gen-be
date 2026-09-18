@@ -1,10 +1,10 @@
-"""Static contract for Canonical Amendment 05's prepared, unapplied migration."""
+"""Static contract for Canonical Amendment 05's recorded migration."""
 from pathlib import Path
 import re
 import sys
 
 ROOT = Path(__file__).resolve().parents[1]
-SQL = (ROOT / "supabase" / "migrations" / "20260917113000_u2_sku_master_location_applicability.sql").read_text("utf-8")
+SQL = (ROOT / "supabase" / "migrations" / "20260917154004_u2_sku_master_location_applicability.sql").read_text("utf-8")
 LOWER = SQL.lower()
 passes, failures = 0, []
 

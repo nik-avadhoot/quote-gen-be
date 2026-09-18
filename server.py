@@ -1875,24 +1875,36 @@ def _sku_locations(caller, caller_token, sku_ids):
 def _sku_sets(caller_token, sku_ids):
     """Master SKU Sets these SKUs belong to, each with every caller-visible member (CDM-44)."""
     if not sku_ids:
-        return {}, "visible"
+        return {}, "visible", False
     try:
-        mine = _caller_rows(caller_token, "sku_set_members", "id, set_id, sku_id, role, qty_per_set, status",
-                            ("in_", "sku_id", sorted(sku_ids)))
+        operations_pending = False
+        member_columns = "id, set_id, sku_id, role, qty_per_set, status, content_version, confirmed_by, confirmed_at"
+        set_columns = "id, set_label, status, content_version, confirmed_by, confirmed_at"
+        try:
+            mine = _caller_rows(caller_token, "sku_set_members", member_columns,
+                                ("in_", "sku_id", sorted(sku_ids)))
+        except Exception as exc:  # noqa: BLE001 - Amendment 04 slice 2 activation probe
+            if not _sku_schema_pending(exc):
+                raise
+            operations_pending = True
+            member_columns = "id, set_id, sku_id, role, qty_per_set, status, content_version"
+            set_columns = "id, set_label, status, content_version"
+            mine = _caller_rows(caller_token, "sku_set_members", member_columns,
+                                ("in_", "sku_id", sorted(sku_ids)))
         set_ids = sorted({m["set_id"] for m in mine})
         if not set_ids:
-            return {}, "visible"
-        sets = _caller_rows(caller_token, "sku_sets", "id, set_label, status, content_version", ("in_", "id", set_ids))
-        members = _caller_rows(caller_token, "sku_set_members", "id, set_id, sku_id, role, qty_per_set, status",
+            return {}, "visible", operations_pending
+        sets = _caller_rows(caller_token, "sku_sets", set_columns, ("in_", "id", set_ids))
+        members = _caller_rows(caller_token, "sku_set_members", member_columns,
                                ("in_", "set_id", set_ids))
         member_sku_ids = sorted({m["sku_id"] for m in members})
         member_skus = (_caller_rows(caller_token, "skus", "id, plant_item_code, status", ("in_", "id", member_sku_ids))
                        if member_sku_ids else [])
     except Exception as exc:  # noqa: BLE001
         if _sku_schema_pending(exc):
-            return {}, "schema_pending"
+            return {}, "schema_pending", True
         app.logger.warning("SKU Set read failed (degrading): %s", exc)
-        return {}, "unavailable"
+        return {}, "unavailable", False
     set_by_id = {s["id"]: s for s in sets}
     sku_by_id = {s["id"]: s for s in member_skus}
     out = {}
@@ -1904,6 +1916,7 @@ def _sku_sets(caller_token, sku_ids):
                           key=lambda x: (_SKU_SET_ROLE_ORDER.get(x.get("role"), 9), x.get("id") or 0))
         out.setdefault(m["sku_id"], []).append({
             "id": s["id"], "label": s.get("set_label"), "status": s.get("status"),
+            "content_version": s.get("content_version"),
             "role": m.get("role"), "qty_per_set": m.get("qty_per_set"), "member_status": m.get("status"),
             "members": [{
                 "sku_id": x["sku_id"],
@@ -1911,9 +1924,10 @@ def _sku_sets(caller_token, sku_ids):
                 "sku_status": (sku_by_id.get(x["sku_id"]) or {}).get("status"),
                 "sku_visible": x["sku_id"] in sku_by_id,
                 "role": x.get("role"), "qty_per_set": x.get("qty_per_set"), "status": x.get("status"),
+                "content_version": x.get("content_version"),
             } for x in siblings],
         })
-    return out, "visible"
+    return out, "visible", operations_pending
 
 
 def _sku_plant(plant):
@@ -2465,7 +2479,7 @@ def list_skus():
         g.caller, token, {v.get("construction_version_id") for v in latest.values()})
     references, reference_detail = _sku_references(token, sku_ids)
     locations, location_detail = _sku_locations(g.caller, token, sku_ids)
-    sets, set_detail = _sku_sets(token, sku_ids)
+    sets, set_detail, set_operations_pending = _sku_sets(token, sku_ids)
     # Amendment 04: whether the governed operations exist here, so the screen can
     # show its edit controls disabled ("schema activation pending") rather than live.
     governed_pending = False
@@ -2524,7 +2538,8 @@ def list_skus():
         "detail_visibility": {"customer": party_detail, "construction": construction_detail,
                               "references": reference_detail, "locations": location_detail, "sets": set_detail},
         "schema_pending": {"quote_fields": quote_pending, "sku_sets": set_detail == "schema_pending",
-                            "pricing_portfolio": portfolio_pending, "governed_operations": governed_pending},
+                            "pricing_portfolio": portfolio_pending, "governed_operations": governed_pending,
+                            "sku_set_operations": set_operations_pending},
         "mode": "governed_read_only",
         "authority": "caller_token_rls_only",
         "mutations": "none",
@@ -2627,7 +2642,7 @@ def get_sku(sku_id):
                 app.logger.warning("SKU governed Location options read failed (degrading): %s", exc)
 
     party_by_id, family_by_party, party_detail = _sku_party_detail(g.caller, token, {sku["party_id"]})
-    sets, set_detail = _sku_sets(token, [sku_id])
+    sets, set_detail, set_operations_pending = _sku_sets(token, [sku_id])
 
     # Amendment 04 D9: the append-only history of governed operations on this SKU.
     history, history_detail = None, "visible"
@@ -2697,7 +2712,8 @@ def get_sku(sku_id):
                             "pricing_portfolio": portfolio_pending,
                             # The governed operations and their history arrive together (Amendment 04).
                             "governed_operations": history_detail == "schema_pending",
-                            "location_applicability_operations": applicability_pending},
+                            "location_applicability_operations": applicability_pending,
+                            "sku_set_operations": set_operations_pending},
         "mode": "governed_read_only",
         "authority": "caller_token_rls_only",
         "mutations": "none",
@@ -2718,7 +2734,8 @@ def get_sku(sku_id):
 # Until migration 20260917030403 is applied the wrappers do not exist; PostgREST
 # answers PGRST202 and the route returns SCHEMA_ACTIVATION_PENDING rather than a
 # generic failure.
-_SKU_OP_ERRORS = {"PT423": "NEW_SKU_REQUIRED", "PGRST202": "SCHEMA_ACTIVATION_PENDING",
+_SKU_OP_ERRORS = {"PT423": "NEW_SKU_REQUIRED", "PT425": "SECOND_APPROVER_REQUIRED",
+                  "PGRST202": "SCHEMA_ACTIVATION_PENDING",
                   "42883": "SCHEMA_ACTIVATION_PENDING", "23514": "TRANSITION_NOT_ALLOWED",
                   "23505": "TRANSITION_NOT_ALLOWED"}
 _SKU_TEXT_FIELDS = ("box_type", "item_name", "item_short_name", "item_family", "item_group", "print_quality",
@@ -3031,6 +3048,69 @@ def reactivate_sku_location_applicability_route(applicability_id):
     return _sku_simple_op("sku_reactivate_master_applicability", "p_applicability", applicability_id,
                           {"p_reason": reason})
 
+
+@app.route("/masters/sku-sets", methods=["POST"])
+@require_auth
+def propose_sku_set_route():
+    """Propose an entire SKU Set by explicit internal SKU identity (CDM-44)."""
+    data = _sku_op_body()
+    expected, bad = _sku_op_expected(data)
+    if bad:
+        return bad
+    box_sku_id = _int_field(data, "box_sku_id")
+    if box_sku_id is None or box_sku_id < 1:
+        return _invalid_input("box_sku_id is required")
+    label = data.get("set_label")
+    if not isinstance(label, str) or not label.strip() or len(label.strip()) > 200:
+        return _invalid_input("set_label must be 1 to 200 characters")
+    members = data.get("members")
+    if not isinstance(members, list) or not members or len(members) > 100:
+        return _invalid_input("members must contain 1 to 100 entries")
+    clean, seen, boxes = [], set(), 0
+    for member in members:
+        if not isinstance(member, dict):
+            return _invalid_input("each member must be an object")
+        sku_id = member.get("sku_id")
+        role = member.get("role")
+        qty = member.get("qty_per_set")
+        if isinstance(sku_id, bool) or not isinstance(sku_id, int) or sku_id < 1 or sku_id in seen:
+            return _invalid_input("member sku_id values must be unique positive integers")
+        if role not in ("box", "plate", "partition"):
+            return _invalid_input("member role must be box, plate or partition")
+        quantity = Decimal(str(qty)) if not isinstance(qty, bool) and isinstance(qty, (int, float)) else None
+        if quantity is None or not quantity.is_finite() or quantity <= 0 or quantity > Decimal("9999999.999") \
+                or quantity.as_tuple().exponent < -3:
+            return _invalid_input("qty_per_set must be a positive number with at most 3 decimal places")
+        seen.add(sku_id)
+        boxes += role == "box"
+        clean.append({"sku_id": sku_id, "role": role, "qty_per_set": qty})
+    if boxes != 1 or box_sku_id not in seen or not any(
+            m["sku_id"] == box_sku_id and m["role"] == "box" for m in clean):
+        return _invalid_input("members must include exactly the selected box")
+    result, err = _sku_rpc("sku_set_propose", {
+        "p_box_sku": box_sku_id, "p_expected_content_version": expected,
+        "p_set_label": label.strip(), "p_members": clean})
+    if err:
+        return err
+    return jsonify({"id": result.data}), 201
+
+
+@app.route("/masters/sku-sets/<int:set_id>/confirm", methods=["POST"])
+@require_auth
+def confirm_sku_set_route(set_id):
+    """Confirm a proposed Set; settled Customers require a different approver (D-06/D-13)."""
+    return _sku_simple_op("sku_set_confirm", "p_set", set_id)
+
+
+@app.route("/masters/sku-sets/<int:set_id>/retire", methods=["POST"])
+@require_auth
+def retire_sku_set_route(set_id):
+    """Retire a confirmed Set and withdraw its members; history keeps the reason."""
+    reason, bad = _sku_op_reason(_sku_op_body(), required=True)
+    if bad:
+        return bad
+    return _sku_simple_op("sku_set_retire", "p_set", set_id, {"p_reason": reason})
+
 @app.route("/masters/customer-families", methods=["GET"])
 @require_auth
 def list_customer_families():
@@ -3245,6 +3325,7 @@ _ERROR_STATUS = {
     "SCHEMA_ACTIVATION_PENDING": 503,
     # Amendment 04 D2 / CDM-10: the change asked for is a new SKU, not a version.
     "NEW_SKU_REQUIRED": 422,
+    "SECOND_APPROVER_REQUIRED": 422,
     # A genuine serialization failure is transient: the caller may safely retry
     # the SAME request unchanged. Distinct from STALE_VERSION, where retrying
     # unchanged is guaranteed to fail again.
@@ -3273,6 +3354,8 @@ _ERROR_MESSAGE = {
                                  "so it cannot be read or filtered.",
     "NEW_SKU_REQUIRED": "A dimension, Construction, box type or strength change is a new SKU, not a new "
                         "version. Propose it as a new SKU instead.",
+    "SECOND_APPROVER_REQUIRED": "A different manage_sku_master holder must confirm this SKU Set because "
+                                "it contains a settled Customer's SKU.",
     "SERIALIZATION_FAILURE": "The database could not complete that under concurrent load. "
                              "Nothing was changed — please try again.",
     # D2 CORRECTION. This must NOT claim the write did not happen. A client-side

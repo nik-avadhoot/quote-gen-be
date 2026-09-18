@@ -13,6 +13,9 @@ ROOT = Path(__file__).resolve().parents[1]
 MIGRATIONS = ROOT / "supabase" / "migrations"
 SQL = (MIGRATIONS / "20260915084131_gsm_master.sql").read_text(encoding="utf-8")
 GATES = (MIGRATIONS / "20260915084252_gsm_master_catalogue_gates.sql").read_text(encoding="utf-8")
+CORRECTION = (MIGRATIONS / "20260916165004_fix_gsm_and_u4_definer_execute_grants.sql").read_text(
+    encoding="utf-8")
+CORRECTION_NORMALIZED = " ".join(CORRECTION.lower().split())
 
 PASSES, FAILURES = 0, []
 
@@ -50,9 +53,12 @@ check("errcode = 'PT409'" in SQL and "p_expected_content_version" in SQL,
 check("set gsm" not in SQL.lower() and "update public.paper_gsm_values\n     set status" in SQL,
       "GSM-S8 no governed operation renumbers a GSM value")
 check("security invoker" in SQL
-      and "revoke all on function app_private.add_paper_gsm_value(integer) from public, anon, authenticated" in SQL
-      and "revoke all on function app_private.set_paper_gsm_value_status(bigint, text, integer) from public, anon, authenticated" in SQL,
-      "GSM-S9 private definer functions are reachable only through invoker wrappers")
+      and "security definer" in SQL
+      and "grant execute on function app_private.add_paper_gsm_value(integer) to authenticated" in CORRECTION_NORMALIZED
+      and "grant execute on function app_private.set_paper_gsm_value_status(bigint, text, integer) to authenticated" in CORRECTION_NORMALIZED
+      and "revoke all on function app_private.add_paper_gsm_value(integer) from public, anon" in CORRECTION_NORMALIZED
+      and "revoke all on function app_private.set_paper_gsm_value_status(bigint, text, integer) from public, anon" in CORRECTION_NORMALIZED,
+      "GSM-S9 authenticated invoker wrappers can reach private definers; anon cannot")
 check("tests.gsm_master_catalogue()" in GATES
       and "grant execute on function tests.gsm_master_catalogue() to service_role" in GATES,
       "GSM-S10 a runtime catalogue gate exists for activation")
