@@ -31,6 +31,7 @@ import io
 import re
 import secrets
 from concurrent.futures import ThreadPoolExecutor
+from copy import copy
 from datetime import datetime
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
@@ -246,16 +247,54 @@ def export_xlsx():
     ws_def = wb["DEFAULTS"]
 
     # ── Update RATE MASTER ────────────────────────────────────────────────────
-    for row in range(7, 30):
+    # The paper-grade table is A7:G24 (row 24 is its one spare). Rows 25-29 are
+    # the GSM surcharge table that CBB+PP reads by approximate match on the
+    # FIXED range $A$26:$C$29, so grades must never be written into or above it.
+    # Grade lookups are VLOOKUP(code,'RATE MASTER'!$A:$G,7,0): whole-column and
+    # exact, so a grade appended below the sheet's notes is found like any other.
+    # Grades added in the app used to be dropped here, and every layer that used
+    # one exported with a blank material rate.
+    GRADE_ROWS       = range(7, 25)
+    APPENDED_HEADING = 33
+    template_rows = {}
+    for row in GRADE_ROWS:
         code_cell = ws_rm.cell(row, 1)
-        if not code_cell.value:
+        if code_cell.value not in (None, ""):
+            template_rows[str(code_cell.value).strip()] = row
+
+    def write_rate_row(row, app_rate):
+        ws_rm.cell(row, 3).value = num(app_rate.get("price"))
+        ws_rm.cell(row, 5).value = num(app_rate.get("disc"),    1.5)
+        ws_rm.cell(row, 6).value = num(app_rate.get("freight"), 0)
+        # A per-grade SUPPLIER credit % (engine/rateMaster.js) replaces the
+        # sheet-wide $B$4 for this grade only; blank keeps the template formula.
+        credit = app_rate.get("interest")
+        if credit not in (None, "") and num(credit, None) is not None:
+            ws_rm.cell(row, 4).value = f"=C{row}*{num(credit) / 100}"
+        else:
+            ws_rm.cell(row, 4).value = f"=C{row}*$B$4"
+
+    appended = []
+    for app_rate in rates:
+        code = str(app_rate.get("code") or "").strip()
+        if not code:
             continue
-        code     = str(code_cell.value).strip()
-        app_rate = next((r for r in rates if r.get("code") == code), None)
-        if app_rate:
-            ws_rm.cell(row, 3).value = num(app_rate.get("price"))
-            ws_rm.cell(row, 5).value = num(app_rate.get("disc"),    1.5)
-            ws_rm.cell(row, 6).value = num(app_rate.get("freight"), 0)
+        if code in template_rows:
+            write_rate_row(template_rows[code], app_rate)
+        elif code not in appended:
+            appended.append(code)
+            row = APPENDED_HEADING + len(appended)
+            for col in range(1, 9):
+                source = ws_rm.cell(23, col)
+                if source.has_style:
+                    ws_rm.cell(row, col)._style = copy(source._style)
+            ws_rm.cell(row, 1).value = code
+            ws_rm.cell(row, 2).value = app_rate.get("desc") or None
+            write_rate_row(row, app_rate)
+            ws_rm.cell(row, 7).value = f"=C{row}+D{row}-E{row}+F{row}"
+    if appended:
+        ws_rm.cell(APPENDED_HEADING, 1).value = "Grades added in the app (appended at export)"
+        ws_rm.cell(APPENDED_HEADING, 1).font = copy(ws_rm.cell(6, 1).font)
 
     # ── Update DEFAULTS freight matrix ────────────────────────────────────────
     # A4 (ruling): template reserves S14:S18 for custom delivery locations (5 rows).
