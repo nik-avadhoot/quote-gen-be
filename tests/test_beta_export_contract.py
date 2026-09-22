@@ -16,7 +16,11 @@ def check(condition, label):
         print(f"FAIL - {label}")
 
 
-check('beta_export     = data.get("beta") is True' in SOURCE,
+# The request parsing moved into the route's meta dict when the workbook fill was
+# extracted for the governed Quote export (2026-09-22). The claim is unchanged:
+# only an exact JSON boolean asks for the BETA mark, and the fill trusts nothing else.
+check('"beta":          data.get("beta") is True' in SOURCE
+      and 'beta_export     = meta.get("beta") is True' in SOURCE,
       "BR-5-BE-1 only an exact JSON boolean requests beta marking")
 check('ws_cbb["D4"] = f"BETA | {reference_line}" if beta_export else reference_line' in SOURCE,
       "BR-5-BE-2 the returned master template visibly carries BETA in its reference line")

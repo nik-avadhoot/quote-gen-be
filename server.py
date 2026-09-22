@@ -234,12 +234,46 @@ def export_xlsx():
     freight    = data.get("freight", {})
     fname      = data.get("filename", "AvadhootPacks_Quote.xlsx")
     # Fix 9: read meta fields sent by the frontend
-    quote_ref       = data.get("quoteRef",      "")
-    maker_name      = data.get("makerName",     "")
-    quote_date_str  = data.get("quoteDate",     "")
-    effective_from  = data.get("effectiveFrom", "")
-    effective_to    = data.get("effectiveTo",   "")
-    beta_export     = data.get("beta") is True
+    meta = {
+        "quoteRef":      data.get("quoteRef",      ""),
+        "makerName":     data.get("makerName",     ""),
+        "quoteDate":     data.get("quoteDate",     ""),
+        "effectiveFrom": data.get("effectiveFrom", ""),
+        "effectiveTo":   data.get("effectiveTo",   ""),
+        "beta":          data.get("beta") is True,
+        "marginPP":      data.get("marginPP"),
+    }
+    buf = _fill_master_workbook(items, rates, freight, meta)
+    if isinstance(buf, tuple):          # an error response, not a workbook
+        return buf
+    return send_file(
+        buf,
+        download_name=fname,
+        as_attachment=True,
+        mimetype=(
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        ),
+    )
+
+
+def _fill_master_workbook(items, rates, freight, meta):
+    """Fill the master template from ALREADY-ASSEMBLED quote inputs.
+
+    The single place the workbook is written. /export passes the caller's local
+    working items; the governed Quote export passes rows rebuilt from frozen
+    calculation snapshots and a frozen Rate Set. Neither may drift from the
+    other, which is exactly why there is one function and not two.
+
+    Returns a BytesIO, or a Flask (response, status) tuple when the workbook
+    cannot represent the request (the freight-matrix overflow below).
+    """
+    quote_ref       = meta.get("quoteRef")      or ""
+    maker_name      = meta.get("makerName")     or ""
+    quote_date_str  = meta.get("quoteDate")     or ""
+    effective_from  = meta.get("effectiveFrom") or ""
+    effective_to    = meta.get("effectiveTo")   or ""
+    beta_export     = meta.get("beta") is True
+    data            = {"marginPP": meta.get("marginPP")}
 
     wb     = openpyxl.load_workbook(TEMPLATE_PATH)
     ws_cbb = wb["CBB+PP"]
@@ -550,15 +584,7 @@ def export_xlsx():
     buf = io.BytesIO()
     wb.save(buf)
     buf.seek(0)
-
-    return send_file(
-        buf,
-        download_name=fname,
-        as_attachment=True,
-        mimetype=(
-            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        ),
-    )
+    return buf
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -5456,6 +5482,212 @@ def issue_quote_revision_route(revision_id):
 def create_quote_revision_route(revision_id):
     return _quote_workflow_rpc(
         "create_quote_revision", {"p_source_revision": revision_id}, scalar=True, status=201)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# The governed Quote export — the master workbook for an APPROVED Quote
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_PP_ROW_TYPES = ("Plate", "Part-L", "Part-W")
+
+
+def _spec_from_snapshot(snapshot, row):
+    """Rebuild one export row from FROZEN evidence only.
+
+    Every number comes from the snapshot the Calculate produced: `entered` holds
+    what the Maker entered, `resolved` holds the authority-resolved waste,
+    conversion, margin, interest and freight. Current Batch or master values are
+    never consulted, which is the entire reason a Quote is exportable at all.
+    A missing field stays missing so the workbook writes a blank rather than a
+    fabricated zero.
+    """
+    inputs   = snapshot.get("effective_inputs") or {}
+    entered  = inputs.get("entered") or {}
+    resolved = inputs.get("resolved") or {}
+    add_ons  = entered.get("add_ons") or {}
+
+    def value_of(key):
+        node = resolved.get(key)
+        return node.get("value") if isinstance(node, dict) else node
+
+    layers = {}
+    for key in ("TOP", "F1", "L1", "F2", "L2"):
+        layer = (entered.get("layers") or {}).get(key) or {}
+        layers[key] = {"code": layer.get("code") or "", "gsm": layer.get("gsm") or ""}
+
+    row_type = (row or {}).get("row_type") or "Box"
+    is_pp = row_type in _PP_ROW_TYPES
+    waste, conv = value_of("waste"), value_of("conv")
+    spec = {
+        "rowType": row_type,
+        "material_code": (row or {}).get("material_code") or "",
+        "product": entered.get("item_name") or "",
+        "L": entered.get("length_mm"), "W": entered.get("width_mm"), "H": entered.get("height_mm"),
+        "ply": entered.get("ply"), "ups": entered.get("ups"), "boxType": entered.get("box_type"),
+        "layers": layers,
+        "flute_F1": entered.get("flute_f1"), "flute_F2": entered.get("flute_f2"),
+        "board_gsm": entered.get("board_gsm"),
+        "spec_bs": entered.get("spec_bs"), "spec_bct": entered.get("spec_bct"),
+        "spec_ect": entered.get("spec_ect"), "spec_cobb": entered.get("cobb_value"),
+        "setCode": entered.get("set_code"), "qtyPerSet": entered.get("qty_per_set"),
+        "margin": value_of("margin"), "interest": value_of("interest"),
+        # The database resolved ONE waste/conversion arm for this row; the export
+        # header carries Box and PP slots, so the row's own answer goes in its arm.
+        "waste": None if is_pp else waste, "wastePP": waste if is_pp else None,
+        "convRate": None if is_pp else conv, "convRatePP": conv if is_pp else None,
+        "printing": add_ons.get("printing"), "stitching": add_ons.get("stitching"),
+        "coating": add_ons.get("coating"), "handling": add_ons.get("handling"),
+        "moqCharge": add_ons.get("moq_charge"), "packing": add_ons.get("packing"),
+        "other": add_ons.get("other"), "unloading": add_ons.get("unloading"),
+    }
+    return {k: v for k, v in spec.items() if v is not None}
+
+
+def _frozen_rates_and_freight(client, release_id, freight_set_version_id):
+    """The Rate Set and freight lanes as FROZEN at calculation, never today's.
+
+    Re-opening an approved Quote must reproduce the numbers it was approved on.
+    Reading current masters here would silently re-price a year-old Quote the
+    moment a paper rate moved, which is the defect freezing exists to prevent.
+    """
+    rates, freight, missing = [], {}, []
+    release = None
+    if release_id is not None:
+        rows, denied = _optional_caller_rows(client.table("pricing_basis_releases").select(
+            "id, rate_set_version_id, freight_set_version_id").eq("id", release_id).limit(1))
+        release = rows[0] if rows and not denied else None
+    if release is None:
+        missing.append("pricing_basis_release")
+
+    rate_set_version_id = (release or {}).get("rate_set_version_id")
+    if rate_set_version_id is not None:
+        rows, denied = _optional_caller_rows(client.table("rate_entries").select(
+            "grade_code, description, price, discount, freight, interest_pct"
+        ).eq("rate_set_version_id", rate_set_version_id))
+        if denied or not rows:
+            missing.append("rate_entries")
+        for entry in rows:
+            rates.append({
+                "code": entry.get("grade_code"), "desc": entry.get("description"),
+                "price": entry.get("price"), "disc": entry.get("discount"),
+                "freight": entry.get("freight"), "interest": entry.get("interest_pct"),
+            })
+    else:
+        missing.append("rate_set_version")
+
+    set_version = freight_set_version_id or (release or {}).get("freight_set_version_id")
+    if set_version is not None:
+        entries, denied = _optional_caller_rows(client.table("freight_entries").select(
+            "origin_plant_id, destination_location_id, rate").eq("freight_set_version_id", set_version))
+        if denied:
+            missing.append("freight_entries")
+        plant_ids = sorted({e.get("origin_plant_id") for e in entries if e.get("origin_plant_id")})
+        location_ids = sorted({e.get("destination_location_id") for e in entries
+                               if e.get("destination_location_id")})
+        plants, locations = [], []
+        if plant_ids:
+            plants, _ = _optional_caller_rows(
+                client.table("plants").select("id, name").in_("id", plant_ids))
+        if location_ids:
+            locations, _ = _optional_caller_rows(client.table("customer_locations").select(
+                "id, location_name").in_("id", location_ids))
+        plant_name = {row["id"]: row.get("name") for row in plants}
+        location_name = {row["id"]: row.get("location_name") for row in locations}
+        for entry in entries:
+            origin = plant_name.get(entry.get("origin_plant_id"))
+            destination = location_name.get(entry.get("destination_location_id"))
+            # An unnamed lane is dropped rather than keyed by a bare id: the
+            # workbook matrix is looked up BY NAME and a bare id would never match.
+            if origin and destination:
+                freight.setdefault(origin, {})[destination] = entry.get("rate")
+    else:
+        missing.append("freight_set_version")
+    return rates, freight, missing
+
+
+@app.route("/quotes/revisions/<int:revision_id>/export", methods=["GET"])
+@require_auth
+def export_quote_revision_route(revision_id):
+    """Produce the master workbook for one APPROVED, caller-visible Quote revision.
+
+    Product Owner, 2026-09-22: the same workbook as the working export, and the
+    ONLY export that carries a permanent Quote reference. A draft or submitted
+    revision is refused here — it has no reference yet, and a document that looks
+    issued must not exist before approval.
+    """
+    if not os.path.exists(TEMPLATE_PATH):
+        return jsonify({"error": f"Template not found: {TEMPLATE_PATH}"}), 404
+    client = get_supabase_for_caller(g.access_token)
+    try:
+        quote = _read_quote_workspace(client, None, revision_id, None)
+    except Exception as exc:
+        if _is_upstream_timeout(exc):
+            app.logger.error("Quote export read timed out upstream: %s", exc)
+            return _error("UPSTREAM_TIMEOUT")
+        raise
+    if quote is None:
+        return _error("RECORD_NOT_FOUND")
+    revision = next((row for row in (quote.get("revisions") or [])
+                     if str(row.get("id")) == str(revision_id)), None)
+    if revision is None:
+        return _error("RECORD_NOT_FOUND")
+    if revision.get("workflow_status") not in ("approved", "issued"):
+        return _invalid_input(
+            "only an approved or issued Quote revision can be exported; this one is "
+            + str(revision.get("workflow_status")))
+
+    items, snapshots_missing = [], 0
+    batch = quote.get("batch") or {}
+    rows_by_lineage = {}
+    if batch.get("id") is not None:
+        rows, _denied = _optional_caller_rows(client.table("batch_rows").select(
+            "lineage_id, material_code, row_type").eq("batch_id", batch["id"]))
+        rows_by_lineage = {str(row.get("lineage_id")): row for row in rows}
+
+    release_id = freight_set_version_id = None
+    customer_family = batch.get("customer_family") or {}
+    for item in revision.get("items") or []:
+        snapshot = item.get("calculation_snapshot")
+        if not snapshot:
+            snapshots_missing += 1
+            continue
+        release_id = release_id or snapshot.get("pricing_basis_release_id")
+        freight_set_version_id = freight_set_version_id or snapshot.get("freight_set_version_id")
+        spec = _spec_from_snapshot(
+            snapshot, rows_by_lineage.get(str(item.get("batch_row_lineage_id"))))
+        spec.setdefault("client", customer_family.get("name") or "")
+        spec.setdefault("plant", (batch.get("plant") or {}).get("name") or "")
+        items.append({"spec": spec})
+    if snapshots_missing:
+        # Partial evidence cannot become a customer document: a workbook missing
+        # rows would look complete. The caller is told, and nothing is produced.
+        return _invalid_input(
+            f"{snapshots_missing} frozen calculation snapshot(s) are not visible to you; "
+            "the Quote cannot be exported as a partial document")
+    if not items:
+        return _invalid_input("this revision has no caller-visible Quote Items to export")
+
+    rates, freight, missing = _frozen_rates_and_freight(client, release_id, freight_set_version_id)
+    if "rate_entries" in missing or "rate_set_version" in missing:
+        return _invalid_input(
+            "the Rate Set frozen with this Quote is not visible to you, so the workbook "
+            "would carry no paper rates")
+
+    meta = {
+        "quoteRef": quote.get("quote_reference") or "",
+        "makerName": ((revision.get("approved_by_actor") or revision.get("created_by_actor")) or {})
+                     .get("display_name") or "",
+        "quoteDate": revision.get("quote_date") or "",
+        "effectiveTo": revision.get("offer_validity_to") or "",
+        "beta": (request.args.get("beta") or "").lower() == "true",
+    }
+    buf = _fill_master_workbook(items, rates, freight, meta)
+    if isinstance(buf, tuple):
+        return buf
+    reference = (meta["quoteRef"] or f"revision-{revision_id}").replace("/", "-")
+    return send_file(
+        buf, download_name=f"Quote_{reference}.xlsx", as_attachment=True,
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 
 @app.route("/batches/<int:batch_id>/pricing-groups", methods=["POST"])
