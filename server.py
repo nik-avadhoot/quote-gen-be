@@ -247,9 +247,12 @@ def export_xlsx():
     ws_def = wb["DEFAULTS"]
 
     # ── Update RATE MASTER ────────────────────────────────────────────────────
-    # The paper-grade table is A7:G24 (row 24 is its one spare). Rows 25-29 are
-    # the GSM surcharge table that CBB+PP reads by approximate match on the
-    # FIXED range $A$26:$C$29, so grades must never be written into or above it.
+    # The paper-grade table is A7:G24. It was A7:G23 (one spare row) when this
+    # fix landed; the Product Owner has since added a grade by hand on the live
+    # template, filling the block. The GSM surcharge table used to sit at
+    # $A$26:$C$29 but was relocated by that same hand-edit to $K$7:$M$10 (CBB+PP's
+    # VLOOKUP was updated to match) — do not assume A26:C29 holds it; check the
+    # live template before touching rows below the grade block.
     # Grade lookups are VLOOKUP(code,'RATE MASTER'!$A:$G,7,0): whole-column and
     # exact, so a grade appended below the sheet's notes is found like any other.
     # Grades added in the app used to be dropped here, and every layer that used
@@ -263,6 +266,12 @@ def export_xlsx():
             template_rows[str(code_cell.value).strip()] = row
 
     def write_rate_row(row, app_rate):
+        # The code cell must be TEXT. CBB+PP writes every layer grade as text, and
+        # VLOOKUP(...,0) never matches text against a number, so the grade the
+        # Product Owner typed by hand (A12 came through as the number 25) looked
+        # present and still resolved to a blank rate. Rewriting the matched cell
+        # from the app's own code fixes that in the exported file.
+        ws_rm.cell(row, 1).value = str(app_rate.get("code") or "").strip()
         ws_rm.cell(row, 3).value = num(app_rate.get("price"))
         ws_rm.cell(row, 5).value = num(app_rate.get("disc"),    1.5)
         ws_rm.cell(row, 6).value = num(app_rate.get("freight"), 0)
@@ -288,7 +297,6 @@ def export_xlsx():
                 source = ws_rm.cell(23, col)
                 if source.has_style:
                     ws_rm.cell(row, col)._style = copy(source._style)
-            ws_rm.cell(row, 1).value = code
             ws_rm.cell(row, 2).value = app_rate.get("desc") or None
             write_rate_row(row, app_rate)
             ws_rm.cell(row, 7).value = f"=C{row}+D{row}-E{row}+F{row}"
@@ -1634,6 +1642,69 @@ def list_constructions():
         "adoptions_partial": adoptions_partial,
         "mutations": "none",
     })
+
+
+@app.route("/masters/constructions/publish-and-adopt", methods=["POST"])
+@require_auth
+def admin_publish_and_adopt_construction_route():
+    """
+    S4-7: the single-step Admin shortcut. Beta issue log 2026-09-19 item 2 +
+    Product Owner ruling 2026-09-22 - a manage_construction_library holder who
+    also holds adopt_construction_for_plant at the given plant may create,
+    approve, publish and adopt a Construction in one call.
+
+    This route does no authorization itself - it is a thin transport exactly
+    like every other route in this file - and forwards the caller's own token
+    to ONE governed RPC that checks both capabilities before writing anything
+    and runs the whole sequence inside one transaction (S4-7 migration). This
+    is additive: propose_construction/approve_construction_version/
+    publish_construction/adopt_construction_for_plant remain reachable
+    individually for the Maker-proposes/Admin-approves path this does not
+    replace.
+    """
+    data = request.get_json(silent=True) or {}
+    plant_id = _int_field(data, "plant_id")
+    if plant_id is None:
+        return _invalid_input("plant_id is required")
+    name = data.get("name")
+    if not isinstance(name, str) or not name.strip():
+        return _invalid_input("name is required")
+    ply = _int_field(data, "ply")
+    if ply is None or not (1 <= ply <= 11):
+        return _invalid_input("ply must be an integer from 1 to 11")
+
+    params = {"p_plant": plant_id, "p_name": name.strip(), "p_ply": ply}
+    for key in ("flute_f1", "flute_f2", "layer_top_code", "layer_f1_code",
+                "layer_l1_code", "layer_f2_code", "layer_l2_code"):
+        value = data.get(key)
+        if value is not None and not isinstance(value, str):
+            return _invalid_input(f"{key} must be text or blank")
+        params[f"p_{key}"] = value.strip() if isinstance(value, str) and value.strip() else None
+    for key in ("layer_top_gsm", "layer_f1_gsm", "layer_l1_gsm", "layer_f2_gsm",
+                "layer_l2_gsm", "board_gsm"):
+        value, err = _optional_nonnegative_numeric(data, key)
+        if err:
+            return err
+        params[f"p_{key}"] = value
+
+    result, err = _rpc_call(
+        get_supabase_for_caller(g.access_token),
+        "admin_publish_and_adopt_construction", params)
+    if err:
+        return err
+    rows = getattr(result, "data", None) or []
+    row = rows[0] if isinstance(rows, list) and rows else None
+    if not isinstance(row, dict) or row.get("construction_id") is None:
+        app.logger.error("admin_publish_and_adopt_construction returned no valid row")
+        return _error("INTERNAL_ERROR")
+    return jsonify({
+        "construction_id": row.get("construction_id"),
+        "construction_version_id": row.get("construction_version_id"),
+        "construction_code": row.get("construction_code"),
+        "adoption_id": row.get("adoption_id"),
+        "mutation": "admin_publish_and_adopt_construction",
+        "authority": "caller_token_database_rpc",
+    }), 201
 
 
 # ═══════════════════════════════════════════════════════════ U2 SKU Master
