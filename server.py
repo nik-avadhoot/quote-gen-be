@@ -6005,6 +6005,215 @@ def set_batch_pricing_basis_route(batch_id):
     return jsonify({"batch": batch, "mutation": "set_batch_pricing_basis"})
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# ROUTES: /masters/sectors  — U5 governed Sector master.
+#
+# Before U5 no propose/approve path for Sectors existed anywhere: the nineteen
+# live Sectors arrived only through the Wave B seed migration, while the
+# Commercial Policies screen edited an unrelated browser-local list that no
+# other screen read. That is what made a Sector added in Commercial Policies
+# invisible to the Customer Families dropdown.
+#
+# Read gate matches the RLS predicate on `sectors` exactly: read_party_master
+# OR read_construction_library. As with /masters/customer-families, the route
+# checks it explicitly from `g.caller` rather than relying on RLS alone, so a
+# genuine denial is a 403 and never an empty "no sectors exist" list.
+#
+# Every mutation is a thin forwarder to a governed `public.*` invoker wrapper.
+# Authority, the draft -> approved transition and CDM-31 immutability are all
+# decided in the database; nothing here re-implements them.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_SECTOR_READ_CAPS = ("read_party_master", "read_construction_library")
+
+
+def _sector_commercials(data):
+    """Validate the six commercial values one Sector version carries."""
+    waste_cbb, err = _optional_nonnegative_numeric(data, "waste_cbb_pct", "99.999")
+    if err:
+        return None, err
+    waste_pp, err = _optional_nonnegative_numeric(data, "waste_pp_pct", "99.999")
+    if err:
+        return None, err
+    conv_box, err = _optional_nonnegative_numeric(data, "conv_box_rate", "99999999.9999")
+    if err:
+        return None, err
+    conv_pp, err = _optional_nonnegative_numeric(data, "conv_pp_rate", "99999999.9999")
+    if err:
+        return None, err
+
+    # margin_pct is NOT NULL by the Sector Margin ruling: a default target
+    # margin is a property every Sector maintains, so blank is not a state.
+    margin, err = _optional_nonnegative_numeric(data, "margin_pct", "99.999")
+    if err:
+        return None, err
+    if margin is None:
+        return None, _invalid_input("margin_pct is required for every Sector")
+
+    spec_lang_value = data.get("spec_lang")
+    if spec_lang_value is not None and not isinstance(spec_lang_value, str):
+        return None, _invalid_input("spec_lang must be text or blank")
+    spec_lang = (spec_lang_value or "").strip()
+    if len(spec_lang) > 60:
+        return None, _invalid_input("spec_lang must be 60 characters or fewer")
+
+    return {
+        "p_waste_cbb": waste_cbb,
+        "p_waste_pp": waste_pp,
+        "p_conv_box": conv_box,
+        "p_conv_pp": conv_pp,
+        "p_margin": margin,
+        "p_spec_lang": spec_lang or None,
+    }, None
+
+
+@app.route("/masters/sectors", methods=["GET"])
+@require_auth
+def list_sectors():
+    """Sectors with their approved commercial version, read as the caller."""
+    caps = g.caller.get("group_capabilities") or []
+    if not any(cap in caps for cap in _SECTOR_READ_CAPS):
+        return jsonify({
+            "error": "read_party_master or read_construction_library capability is required"
+        }), 403
+
+    client = get_supabase_for_caller(g.access_token)
+    try:
+        sectors = (client.table("sectors")
+                   .select("id, sector_code, name, status").execute()).data or []
+        versions = (client.table("sector_versions").select(
+            "id, sector_id, version_no, waste_cbb_pct, waste_pp_pct, conv_box_rate, "
+            "conv_pp_rate, margin_pct, spec_lang, status, approved_at").execute()).data or []
+    except Exception as exc:
+        if _is_upstream_timeout(exc):
+            app.logger.error("sector master read timed out upstream: %s", exc)
+            return _error("UPSTREAM_TIMEOUT")
+        raise
+
+    by_sector = {}
+    for version in versions:
+        by_sector.setdefault(version["sector_id"], []).append(version)
+
+    rows = []
+    for sector in sectors:
+        mine = sorted(by_sector.get(sector["id"], []),
+                      key=lambda v: v.get("version_no") or 0)
+        approved = next(
+            (v for v in reversed(mine) if v.get("status") == "approved"), None)
+        rows.append({**sector, "version": approved, "versions": mine})
+    rows.sort(key=lambda r: r.get("sector_code") or "")
+
+    return jsonify({"sectors": rows, "mutations": "governed"})
+
+
+@app.route("/masters/sectors", methods=["POST"])
+@require_auth
+def propose_sector():
+    """Propose a Sector and approve its first version in one governed step."""
+    data = request.get_json(force=True) or {}
+    code = (data.get("sector_code") or "").strip().upper()
+    name = (data.get("name") or "").strip()
+    if not code:
+        return _invalid_input("sector_code is required")
+    if len(code) > 40:
+        return _invalid_input("sector_code must be 40 characters or fewer")
+    if not name:
+        return _invalid_input("name is required")
+    if len(name) > 120:
+        return _invalid_input("name must be 120 characters or fewer")
+
+    commercials, err = _sector_commercials(data)
+    if err:
+        return err
+
+    result, err = _rpc_call(
+        get_supabase_for_caller(g.access_token),
+        "propose_sector",
+        {"p_code": code, "p_name": name, **commercials},
+        # A duplicate code is a uniqueness refusal, not a missing record.
+        error_map={"23505": "TRANSITION_NOT_ALLOWED"})
+    if err:
+        return err
+    return jsonify({"id": result.data}), 201
+
+
+@app.route("/masters/sectors/<int:sector_id>/commercials", methods=["POST"])
+@require_auth
+def revise_sector_commercials(sector_id):
+    """
+    Record a new approved version of one Sector's commercial values.
+
+    An approved version is immutable (CDM-31), so this never updates the
+    version the caller read - it supersedes it with a new one. The whole row
+    moves at once; `expected_version_no` is the CAS on what the caller saw.
+    """
+    data = request.get_json(force=True) or {}
+    expected = _int_field(data, "expected_version_no")
+    if expected is None or expected < 1:
+        return _invalid_input("expected_version_no is required")
+
+    commercials, err = _sector_commercials(data)
+    if err:
+        return err
+
+    result, err = _rpc_call(
+        get_supabase_for_caller(g.access_token),
+        "revise_sector_commercials",
+        {"p_sector": sector_id, "p_expected_version_no": expected, **commercials})
+    if err:
+        return err
+    return jsonify({"version_no": result.data})
+
+
+@app.route("/masters/sectors/<int:sector_id>", methods=["PATCH"])
+@require_auth
+def rename_sector(sector_id):
+    """
+    Rename a Sector's display name.
+
+    The CODE is deliberately not editable: Costing resolves a Sector by
+    `spec.sector -> sectors.sector_code`, so changing it would orphan every
+    reference at once. A wrong code is a new Sector plus deactivation of the
+    old one.
+    """
+    data = request.get_json(force=True) or {}
+    name = (data.get("name") or "").strip()
+    if not name:
+        return _invalid_input("name is required")
+    if len(name) > 120:
+        return _invalid_input("name must be 120 characters or fewer")
+
+    _, err = _rpc_call(
+        get_supabase_for_caller(g.access_token),
+        "rename_sector", {"p_sector": sector_id, "p_name": name})
+    if err:
+        return err
+    return jsonify({"ok": True})
+
+
+@app.route("/masters/sectors/<int:sector_id>/status", methods=["POST"])
+@require_auth
+def set_sector_status(sector_id):
+    """
+    Activate or deactivate a Sector.
+
+    No Family D table has a DELETE policy (CDM-31), so there is no delete to
+    offer here. Deactivation is refused by the database while any live
+    Customer Family is still classified by that Sector.
+    """
+    data = request.get_json(force=True) or {}
+    status = (data.get("status") or "").strip()
+    if status not in ("active", "inactive"):
+        return _invalid_input("status must be active or inactive")
+
+    _, err = _rpc_call(
+        get_supabase_for_caller(g.access_token),
+        "set_sector_status", {"p_sector": sector_id, "p_status": status})
+    if err:
+        return err
+    return jsonify({"ok": True})
+
+
 @app.route("/masters/customer-families", methods=["POST"])
 @require_auth
 def propose_customer_family():
