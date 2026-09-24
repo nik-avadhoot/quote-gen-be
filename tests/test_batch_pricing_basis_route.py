@@ -1,4 +1,5 @@
 """U4 durable Batch Pricing Basis read/governed-write route gate."""
+import json
 import os
 import sys
 
@@ -171,6 +172,8 @@ ROWS = {
 }
 CALLS, RPC_CALLS, TABLE_WRITES, DENIED_TABLES, DENIED_ACTIONS = [], [], [], set(), set()
 CALCULATE_INPUTS_ERROR = None
+# S3 readiness: per-row gatherer refusals, {row_id: (sqlstate, message)}.
+CALCULATE_INPUTS_ROW_ERRORS = {}
 CALLER = None
 
 
@@ -285,6 +288,10 @@ class FakeRpc:
         if self.name == "calculate_inputs":
             if CALCULATE_INPUTS_ERROR:
                 raise server.APIError({"code": CALCULATE_INPUTS_ERROR, "message": "not ready",
+                                       "details": None, "hint": None})
+            row_error = CALCULATE_INPUTS_ROW_ERRORS.get(self.params["p_batch_row_id"])
+            if row_error:
+                raise server.APIError({"code": row_error[0], "message": row_error[1],
                                        "details": None, "hint": None})
             return type("Response", (), {"data": {
                 "effective_inputs": {"resolved": {
@@ -1446,6 +1453,111 @@ with app.test_client() as client:
 check(response.status_code == 422 and response.get_json()["error_code"] == "CALCULATION_NOT_READY",
       "U4-EFFECTIVE-7 unresolved governed inputs return a caller-visible not-ready state")
 CALCULATE_INPUTS_ERROR = None
+
+# ── S3 · one authoritative readiness result ─────────────────────────────────
+def readiness():
+    with app.test_client() as client:
+        response = client.get("/batches/71/readiness", headers=AUTH)
+    return response.status_code, response.get_json()
+
+active_ids = sorted(row["id"] for row in ROWS["batch_rows"]
+                    if row["batch_id"] == 71 and row["status"] == "active")
+other_ids = [row_id for row_id in active_ids if row_id != 351]
+ROWS["batch_calculations"][0].update(calculation_fingerprint="calc-fp-current",
+                                     presentation_fingerprint="present-fp-current")
+rpc_before, writes_before = len(RPC_CALLS), len(TABLE_WRITES)
+status, ready = readiness()
+check(status == 200 and len(active_ids) >= 2
+      and sorted(row["row_id"] for row in ready["rows"]) == active_ids
+      and [call for call in RPC_CALLS[rpc_before:]] == [
+          ("tok-u4", "calculate_inputs", {"p_batch_row_id": row_id}) for row_id in active_ids]
+      and len(TABLE_WRITES) == writes_before and ready["mutation"] == "none",
+      "S3-READY-1 readiness evaluates EVERY active row through the caller-token gatherer and writes nothing")
+by_row = {row["row_id"]: row for row in ready["rows"]}
+check(by_row[351]["freshness"] == "fresh" and by_row[351]["content_version"] is not None
+      and all(by_row[row_id]["freshness"] == "not_calculated" for row_id in other_ids)
+      and ready["can_calculate"] is True and ready["can_send"] is False
+      and sorted(item["row_id"] for item in ready["blockers"]
+                 if item["code"] == "not_calculated") == other_ids
+      and all(item["field"] == "calculation" and item["blocks"] == ["send"]
+              for item in ready["blockers"] if item["code"] == "not_calculated"),
+      "S3-READY-2 one fresh row cannot pass a multi-row Batch: each uncalculated row is its own Send blocker")
+
+CALCULATE_INPUTS_ROW_ERRORS[other_ids[0]] = ("PT422", "dimensions_incomplete")
+status, ready = readiness()
+dims = [item for item in ready["blockers"] if item["code"] == "dimensions_incomplete"]
+check(status == 200 and len(dims) == 1 and dims[0]["row_id"] == other_ids[0]
+      and dims[0]["scope"] == "row" and dims[0]["field"] == "dimensions"
+      and dims[0]["blocks"] == ["calculate", "send"] and ready["can_calculate"] is False
+      and next(row for row in ready["rows"] if row["row_id"] == other_ids[0])["status"] == "blocked",
+      "S3-READY-3 a gatherer refusal names its exact row and field and blocks Calculate")
+
+CALCULATE_INPUTS_ROW_ERRORS[other_ids[0]] = ("PT422", "relation secret_table: detail nobody should see")
+status, ready = readiness()
+check(status == 200 and "secret" not in json.dumps(ready)
+      and any(item["code"] == "not_ready" and item["row_id"] == other_ids[0] for item in ready["blockers"]),
+      "S3-READY-4 only allow-listed reason codes leave the server; other database text never does")
+
+CALCULATE_INPUTS_ROW_ERRORS.clear()
+CALCULATE_INPUTS_ROW_ERRORS.update({row_id: ("PT422", "pricing_basis_absent") for row_id in active_ids})
+status, ready = readiness()
+basis = [item for item in ready["blockers"] if item["code"] == "pricing_basis_absent"]
+check(status == 200 and len(basis) == 1 and basis[0]["scope"] == "batch"
+      and basis[0]["field"] == "pricing_basis" and basis[0]["row_id"] is None,
+      "S3-READY-5 a Batch-level refusal is reported once, against the Batch field, not per row")
+CALCULATE_INPUTS_ROW_ERRORS.clear()
+
+held_lock = ROWS["batch_edit_locks"][0]["holder_user_id"]
+ROWS["batch_edit_locks"][0]["holder_user_id"] = 5
+status, ready = readiness()
+check(status == 200 and any(item["code"] == "lock_required" and item["field"] == "lock"
+                            for item in ready["blockers"])
+      and ready["can_calculate"] is False and ready["can_send"] is False,
+      "S3-READY-6 without the Batch edit lock readiness says so instead of offering Calculate")
+ROWS["batch_edit_locks"][0]["holder_user_id"] = held_lock
+
+ROWS["batch_calculations"][0].update(calculation_fingerprint="calc-fp-older",
+                                     presentation_fingerprint="present-fp-current")
+status, ready = readiness()
+check(status == 200 and any(item["code"] == "calculation_stale" and item["row_id"] == 351
+                            and item["field"] == "calculation" and item["blocks"] == ["send"]
+                            for item in ready["blockers"])
+      and ready["can_calculate"] is True and ready["can_send"] is False,
+      "S3-READY-7 a governed edit/fingerprint change makes the exact row visibly stale for Send")
+
+ROWS["batch_calculations"][0].update(calculation_fingerprint="calc-fp-current",
+                                     presentation_fingerprint="present-fp-older")
+status, ready = readiness()
+row_351 = next(row for row in ready["rows"] if row["row_id"] == 351)
+check(status == 200 and row_351["freshness"] == "needs_send_only"
+      and not any(item["row_id"] == 351 and item["code"] == "needs_send_only"
+                  for item in ready["blockers"]),
+      "S3-READY-8 presentation-only divergence remains Send-compatible and is not invented as a blocker")
+
+CALCULATE_INPUTS_ROW_ERRORS[other_ids[0]] = ("42501", "private authorization detail")
+status, ready = readiness()
+denied = [item for item in ready["blockers"] if item["row_id"] == other_ids[0]
+          and item["code"] == "not_permitted"]
+check(status == 200 and len(denied) == 1 and denied[0]["field"] == "calculation"
+      and "private" not in json.dumps(ready) and ready["can_calculate"] is False,
+      "S3-READY-9 a per-row caller-authority refusal is fail-closed, targeted and discloses no database text")
+CALCULATE_INPUTS_ROW_ERRORS.clear()
+ROWS["batch_calculations"][0].update(calculation_fingerprint="calc-fp-current",
+                                     presentation_fingerprint="present-fp-current")
+
+route_statuses = [route["status"] for route in ROWS["delivery_groups"]]
+for route in ROWS["delivery_groups"]:
+    if route["pricing_group_id"] == 81:
+        route["status"] = "removed"
+status, ready = readiness()
+route_blockers = [item for item in ready["blockers"] if item["code"] == "delivery_group_absent"
+                  and item["pricing_group_id"] == 81]
+check(status == 200 and len(route_blockers) == 1
+      and route_blockers[0]["scope"] == "group" and route_blockers[0]["pricing_group_id"] == 81
+      and route_blockers[0]["row_id"] is None and route_blockers[0]["field"] == "delivery_route",
+      "S3-READY-10 one missing route blocker opens the exact Pricing Group instead of duplicating per row")
+for route, route_status in zip(ROWS["delivery_groups"], route_statuses):
+    route["status"] = route_status
 
 rpc_before_invalid = len(RPC_CALLS)
 with app.test_client() as client:

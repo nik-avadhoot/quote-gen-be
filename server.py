@@ -5438,6 +5438,181 @@ def get_batch_row_effective_inputs(batch_id, row_id):
     })
 
 
+# ── S3 · one authoritative readiness result for a governed Batch ─────────────
+# The gatherer's PT422 refusals carry an application-authored reason code
+# (s7r_7, u2_proposed_skus_are_quotable). _rpc_call deliberately never returns
+# database text, so a blocker could not say WHICH field was missing. Only the
+# exact codes below are ever returned - anything else stays "not_ready" - and
+# each names the row, Pricing Group or Batch field the Maker has to fix.
+_READINESS_REASONS = {
+    "calculate_requires_maker": ("batch", "status",
+                                 "This Batch is submitted. Only a Maker revision can be recalculated."),
+    "row_inactive": ("row", "status", "This row is removed and is not calculated."),
+    "pricing_basis_absent": ("batch", "pricing_basis", "Select a Pricing Basis Release for this Batch."),
+    "pricing_basis_invalid": ("batch", "pricing_basis",
+                              "The selected Pricing Basis Release is not approved for this plant and pricing date."),
+    "sku_not_published": ("row", "sku", "This SKU is not quotable in its current state."),
+    "sku_withdrawn": ("row", "sku", "This SKU is withdrawn and cannot be quoted. Choose another SKU Version."),
+    "sku_version_unapproved": ("row", "sku", "This SKU Version is not approved for quotation."),
+    "dimensions_incomplete": ("row", "dimensions",
+                              "The SKU Version has no complete L x W x H. It needs a new SKU Version."),
+    "construction_reference_invalid": ("row", "construction",
+                                       "The Construction is not published and adopted at this plant."),
+    "basis_ship_to_retired": ("group", "freight_basis",
+                              "The freight-basis Ship-to location is retired. Choose another route for freight."),
+    "freight_unresolved": ("group", "freight",
+                           "Freight is unresolved for this Pricing Group and route."),
+    "supplier_credit_ambiguous": ("row", "rates",
+                                  "Supplier credit is ambiguous in the Rate Master for this row's materials."),
+}
+_CALCULATION_BLOCKERS = {
+    "not_calculated": "Not calculated yet. Recalculate before Send.",
+    "calculation_stale": "Inputs changed since the last calculation. Recalculate before Send.",
+    "unknown": "Calculation evidence is not visible to you, so this row cannot be confirmed current.",
+}
+_SENDABLE_FRESHNESS = ("fresh", "needs_send_only")
+
+
+def _calculation_freshness(calculation, binding, denied):
+    if denied:
+        return "unknown"
+    if calculation is None:
+        return "not_calculated"
+    if calculation.get("calculation_fingerprint") != binding.get("calculation_fingerprint"):
+        return "calculation_stale"
+    if calculation.get("presentation_fingerprint") != binding.get("presentation_fingerprint"):
+        return "needs_send_only"
+    return "fresh"
+
+
+def _row_readiness(client, batch_id, row):
+    """Gatherer + persisted calculation for one active row. Never writes."""
+    base = {"row_id": row["id"], "content_version": row.get("content_version"),
+            "pricing_group_id": row.get("pricing_group_id")}
+    try:
+        resolution = client.rpc("calculate_inputs", {"p_batch_row_id": row["id"]}).execute().data or {}
+    except APIError as exc:
+        if exc.code == "PT422":
+            reason = (exc.message or "").strip()
+            known = reason in _READINESS_REASONS
+            return {**base, "status": "blocked", "freshness": None,
+                    "reason": reason if known else "not_ready"}
+        if exc.code == "42501":
+            return {**base, "status": "denied", "freshness": None, "reason": "not_permitted"}
+        app.logger.error("readiness: unmapped gatherer error for Batch row %s: %s", row["id"], exc.code)
+        return {**base, "status": "unknown", "freshness": None, "reason": "unavailable"}
+    binding = resolution.get("binding") or {}
+    calculations, denied = _optional_caller_rows(
+        client.table("batch_calculations").select(
+            "id, batch_row_id, calculation_fingerprint, presentation_fingerprint, computed_at"
+        ).eq("batch_row_id", row["id"]).eq("batch_id", batch_id).limit(1))
+    calculation = calculations[0] if calculations else None
+    return {**base, "status": "ready", "reason": None,
+            "freshness": _calculation_freshness(calculation, binding, denied),
+            "calculation_id": calculation.get("id") if calculation else None,
+            "computed_at": calculation.get("computed_at") if calculation else None}
+
+
+def _batch_readiness(batch, rows):
+    """Blockers for Calculate and Send, each naming its exact target."""
+    blockers = []
+
+    def add(scope, code, field, message, blocks, row=None, group_id=None):
+        blockers.append({"scope": scope, "code": code, "field": field, "message": message,
+                         "blocks": blocks, "row_id": row["row_id"] if row else None,
+                         "pricing_group_id": group_id if group_id is not None
+                         else (row["pricing_group_id"] if row else None)})
+
+    if batch.get("status") != "working":
+        add("batch", "batch_not_working", "status", "This Batch is not in working state.",
+            ["calculate", "send"])
+    if not batch.get("caller_holds_lock"):
+        add("batch", "lock_required", "lock", "Acquire the Batch edit lock to calculate or send.",
+            ["calculate", "send"])
+    if not rows:
+        add("batch", "no_active_rows", "rows", "Add at least one product row.", ["calculate", "send"])
+
+    groups = {str(group["id"]): group for group in batch.get("pricing_groups") or []}
+    batch_level = set()
+    group_level = set()
+    for row in rows:
+        if row["status"] == "blocked":
+            scope, field, message = _READINESS_REASONS.get(
+                row["reason"], ("row", None, "This row is not ready for governed calculation."))
+            if scope == "batch":
+                if row["reason"] in batch_level:
+                    continue
+                batch_level.add(row["reason"])
+                add("batch", row["reason"], field, message, ["calculate", "send"])
+            else:
+                add(scope, row["reason"], field, message, ["calculate", "send"], row=row)
+        elif row["status"] in ("denied", "unknown"):
+            add("row", row["reason"], "calculation",
+                "This row's governed inputs could not be checked for you." if row["status"] == "denied"
+                else "This row's governed inputs could not be checked. Try again.",
+                ["calculate", "send"], row=row)
+        elif row["freshness"] not in _SENDABLE_FRESHNESS:
+            add("row", row["freshness"], "calculation", _CALCULATION_BLOCKERS[row["freshness"]],
+                ["send"], row=row)
+        group = groups.get(str(row.get("pricing_group_id")))
+        if group is None or group.get("status") != "active":
+            add("row", "pricing_group_inactive", "pricing_group",
+                "This row's Pricing Group is removed or unavailable. Reassign the row.", ["send"], row=row)
+        elif not any(route.get("status") == "active" for route in group.get("delivery_groups") or []):
+            key = ("delivery_group_absent", row.get("pricing_group_id"))
+            if key not in group_level:
+                group_level.add(key)
+                add("group", "delivery_group_absent", "delivery_route",
+                    "This Pricing Group has no active delivery route.", ["send"],
+                    group_id=row.get("pricing_group_id"))
+    return blockers
+
+
+@app.route("/batches/<int:batch_id>/readiness", methods=["GET"])
+@require_auth
+def get_batch_readiness(batch_id):
+    """Evaluate every active durable row of one Batch, as the caller, in one read.
+
+    The single readiness answer for the Batch workspace: the existing gatherer
+    per active row (whether governed Calculate can run) plus the persisted
+    calculation's freshness (whether Send can include it). It never calls the
+    calculation writer, and every blocker names its row, group or Batch field.
+    send_batch remains the enforcing check; this only reports ahead of it.
+    """
+    client = get_supabase_for_caller(g.access_token)
+    try:
+        batch = _read_batch_workspace(client, batch_id)
+    except APIError as exc:
+        if exc.code == "42501":
+            return _error("CAPABILITY_REQUIRED")
+        raise
+    except Exception as exc:
+        if _is_upstream_timeout(exc):
+            return _error("UPSTREAM_TIMEOUT")
+        raise
+    if batch is None:
+        return _error("RECORD_NOT_FOUND")
+    batch = _decorate_workspace_for_caller(batch)
+    try:
+        rows = [_row_readiness(client, batch_id, row)
+                for row in batch.get("batch_rows") or [] if row.get("status") == "active"]
+    except Exception as exc:
+        if _is_upstream_timeout(exc):
+            return _error("UPSTREAM_TIMEOUT")
+        raise
+    blockers = _batch_readiness(batch, rows)
+    return jsonify({
+        "batch_id": batch_id,
+        "batch_content_version": batch.get("content_version"),
+        "rows": rows,
+        "blockers": blockers,
+        "can_calculate": bool(rows) and not any("calculate" in item["blocks"] for item in blockers),
+        "can_send": bool(rows) and not blockers,
+        "evaluated_at": datetime.now().astimezone().isoformat(),
+        "mutation": "none",
+    })
+
+
 _CALCULATE_EXECUTOR_ERROR_MAP = {
     "AUTH_REQUIRED": "AUTH_REQUIRED",
     "42501": "CAPABILITY_REQUIRED",
