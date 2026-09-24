@@ -12,6 +12,7 @@ import caller_context as cc  # noqa: E402
 PASSES, FAILURES, CALLS = 0, [], []
 CALLER = None
 RPC_DATA = None
+RPC_ERROR = None
 
 
 def check(condition, label):
@@ -39,6 +40,8 @@ class FakeClient:
 
         class Response:
             def execute(_self):
+                if RPC_ERROR is not None:
+                    raise RPC_ERROR
                 return type("RpcResponse", (), {"data": RPC_DATA})()
 
         return Response()
@@ -110,11 +113,21 @@ check(response.status_code == 200 and CALLS[-1][1] == "withdraw_quote_revision",
 CALLS.clear()
 with app.test_client() as client:
     response = client.post("/quotes/revisions/601/issue", json={
-        "addressee_name": "Buying Team", "addressee_details": {"city": "Nagpur"},
         "quote_date": "2026-09-17", "offer_validity_to": "2026-10-17"}, headers=AUTH)
 check(response.status_code == 200 and CALLS[-1][1] == "issue_quote_revision"
-      and CALLS[-1][2]["p_addressee_details"] == {"city": "Nagpur"},
-      "WD-HTTP-7 Issue forwards the frozen presentation fields")
+      and CALLS[-1][2]["p_addressee_name"] is None
+      and CALLS[-1][2]["p_addressee_details"] is None,
+      "WD-HTTP-7 Issue consumes the recipient already frozen at Send")
+
+RPC_ERROR = server.APIError({"code": "PT422", "message": "recipient_identity_mismatch",
+                             "details": None, "hint": None})
+with app.test_client() as client:
+    response = client.post("/quotes/revisions/601/issue", json={
+        "addressee_name": "Another Customer", "addressee_details": {"party_id": 999999},
+        "quote_date": "2026-09-17", "offer_validity_to": "2026-10-17"}, headers=AUTH)
+check(response.status_code == 400 and response.get_json()["error_code"] == "INVALID_INPUT",
+      "WD-HTTP-7a Issue surfaces the governed refusal when supplied recipient fields do not match")
+RPC_ERROR = None
 
 RPC_DATA = 602
 CALLS.clear()

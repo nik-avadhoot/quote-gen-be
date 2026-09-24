@@ -177,6 +177,13 @@ with app.test_client() as client:
 check(response.status_code == 400,
       "U5-CS-BE-7 Atomic Send requires an exact positive content version")
 
+CALLS.clear()
+with app.test_client() as client:
+    response = client.post("/batches/71/send", json={
+        "expected_content_version": 9, "customer_party_id": 999999}, headers=AUTH)
+check(response.status_code == 400 and not any(call[0] == "rpc" for call in CALLS),
+      "U5-CS-BE-7a a guessed Party identity is refused before Atomic Send")
+
 RPC_OUTCOME = {"data": 8801}
 CALLS.clear()
 with app.test_client() as client:
@@ -187,7 +194,7 @@ check(response.status_code == 201 and payload["revision_id"] == 8801
       "U5-CS-BE-8 Atomic Send returns the immutable draft candidate identity")
 check(("rpc", "tok-calc", "send_batch",
        {"p_batch": 71, "p_expected_content_version": 9}) in CALLS,
-      "U5-CS-BE-9 Atomic Send invokes the existing database authority as the caller")
+      "U5-CS-BE-9 Atomic Send lets the database resolve only the Batch-selected recipient as the caller")
 
 RPC_OUTCOME = server.APIError({"code": "PT422", "message": "calculation_stale",
                                "details": None, "hint": None})

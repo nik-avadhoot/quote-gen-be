@@ -3492,6 +3492,9 @@ _ERROR_MESSAGE = {
                         "version. Propose it as a new SKU instead.",
     "SECOND_APPROVER_REQUIRED": "A different manage_sku_master holder must confirm this SKU Set because "
                                 "it contains a settled Customer's SKU.",
+    # Default for a database check-constraint refusal mapped to INVALID_INPUT;
+    # route-side validation always supplies its own specific message.
+    "INVALID_INPUT": "One of the values is not valid for this record.",
     "SERIALIZATION_FAILURE": "The database could not complete that under concurrent load. "
                              "Nothing was changed — please try again.",
     # D2 CORRECTION. This must NOT claim the write did not happen. A client-side
@@ -5475,6 +5478,9 @@ def calculate_batch_row_route(batch_id, row_id):
 def send_batch_route(batch_id):
     """Atomically create the first immutable, unnumbered draft Quote candidate."""
     data = request.get_json(silent=True) or {}
+    if "customer_party_id" in data:
+        return _invalid_input(
+            "customer_party_id is selected on the governed Batch and cannot be supplied at Send")
     expected = _int_field(data, "expected_content_version")
     if expected is None or expected < 1:
         return _invalid_input("expected_content_version must be a positive integer")
@@ -5738,6 +5744,15 @@ def export_quote_revision_route(revision_id):
             "only an approved or issued Quote revision can be exported; this one is "
             + str(revision.get("workflow_status")))
 
+    recipient_name = revision.get("addressee_name")
+    recipient_details = revision.get("addressee_details") or {}
+    if (not isinstance(recipient_name, str) or not recipient_name.strip()
+            or recipient_details.get("identity_authority") != "batches.customer_party_id"
+            or recipient_details.get("party_id") is None):
+        return _invalid_input(
+            "exact recipient identity is unavailable for this legacy Quote revision; "
+            "it cannot be presented as the selected Customer")
+
     items, snapshots_missing = [], 0
     batch = quote.get("batch") or {}
     rows_by_lineage = {}
@@ -5747,7 +5762,6 @@ def export_quote_revision_route(revision_id):
         rows_by_lineage = {str(row.get("lineage_id")): row for row in rows}
 
     release_id = freight_set_version_id = None
-    customer_family = batch.get("customer_family") or {}
     for item in revision.get("items") or []:
         snapshot = item.get("calculation_snapshot")
         if not snapshot:
@@ -5757,7 +5771,7 @@ def export_quote_revision_route(revision_id):
         freight_set_version_id = freight_set_version_id or snapshot.get("freight_set_version_id")
         spec = _spec_from_snapshot(
             snapshot, rows_by_lineage.get(str(item.get("batch_row_lineage_id"))))
-        spec.setdefault("client", customer_family.get("name") or "")
+        spec.setdefault("client", recipient_name.strip())
         spec.setdefault("plant", (batch.get("plant") or {}).get("name") or "")
         items.append({"spec": spec})
     if snapshots_missing:
