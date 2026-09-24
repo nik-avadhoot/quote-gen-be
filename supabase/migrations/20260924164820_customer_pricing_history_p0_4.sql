@@ -1,7 +1,7 @@
 -- Customer Pricing History, P0.4: Excel/Sheets paste - bound preview and one atomic apply.
 --
--- Successor to 20260923150000_customer_pricing_history_p0_1.sql and
--- 20260923183000_customer_pricing_history_p0_2.sql (must follow both).
+-- Successor to 20260924164751_customer_pricing_history_p0_1.sql and
+-- 20260924164806_customer_pricing_history_p0_2.sql (must follow both).
 -- Authority: quote-gen-fe/docs/customer-pricing-history-phase-0-implementation-plan-2026-09-23.md
 -- §7 and §10 P0.4.
 --

@@ -1,8 +1,8 @@
 -- Customer Pricing History, P0.4.1: Share of Business as an allocated box quantity.
 --
--- Successor to 20260923150000_customer_pricing_history_p0_1.sql,
--- 20260923183000_customer_pricing_history_p0_2.sql and
--- 20260924044157_customer_pricing_history_p0_4.sql (must follow all three).
+-- Successor to 20260924164751_customer_pricing_history_p0_1.sql,
+-- 20260924164806_customer_pricing_history_p0_2.sql and
+-- 20260924164820_customer_pricing_history_p0_4.sql (must follow all three).
 -- Those three are rehearsed and reviewed but unapplied; this correction is kept
 -- separate so their evidence stays valid.
 --
