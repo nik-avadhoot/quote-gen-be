@@ -1341,6 +1341,46 @@ check(response.status_code == 200 and restored_row["status"] == "active"
       and restored_row["content_version"] == removed_row["content_version"] + 1,
       "U4-ROW-6d restore preserves row identity and advances the same CAS token")
 
+with app.test_client() as client:
+    response = client.patch(f"/batches/71/rows/{created_row['id']}", headers=AUTH, json={
+        "expected_content_version": restored_row["content_version"],
+        "pricing_group_id": restored_row["pricing_group_id"], "sku_version_id": 311,
+        "row_type": restored_row["row_type"], "material_code": restored_row["material_code"],
+        "volume": 5000, "sales_moq": 0,
+    })
+quantity_row = next(row for row in response.get_json()["batch"]["batch_rows"]
+                    if row["id"] == created_row["id"])
+check(response.status_code == 200 and quantity_row["volume"] == 5000
+      and quantity_row["sales_moq"] == 0 and quantity_row["waste_override_pct"] == 0
+      and quantity_row["addon_other"] == 12.5 and quantity_row["fluting_bcf"] == 0
+      and quantity_row["content_version"] == restored_row["content_version"] + 1,
+      "U4-ROW-6e S3 volume and MOQ are row-owned inputs: a value and an explicit zero are written, omitted inputs kept")
+
+with app.test_client() as client:
+    response = client.patch(f"/batches/71/rows/{created_row['id']}", headers=AUTH, json={
+        "expected_content_version": quantity_row["content_version"],
+        "pricing_group_id": quantity_row["pricing_group_id"], "sku_version_id": 311,
+        "row_type": quantity_row["row_type"], "material_code": quantity_row["material_code"],
+        "sales_moq": None,
+    })
+cleared_row = next(row for row in response.get_json()["batch"]["batch_rows"]
+                   if row["id"] == created_row["id"])
+check(response.status_code == 200 and cleared_row["sales_moq"] is None and cleared_row["volume"] == 5000,
+      "U4-ROW-6f S3 a blank MOQ clears to blank (not zero) and an omitted volume is preserved")
+
+for bad in (-1, 12.5, "many", True):
+    writes_before_invalid = len(TABLE_WRITES)
+    with app.test_client() as client:
+        response = client.patch(f"/batches/71/rows/{created_row['id']}", headers=AUTH, json={
+            "expected_content_version": cleared_row["content_version"],
+            "pricing_group_id": cleared_row["pricing_group_id"], "sku_version_id": 311,
+            "row_type": cleared_row["row_type"], "material_code": cleared_row["material_code"],
+            "volume": bad,
+        })
+    check(response.status_code == 400 and response.get_json()["error_code"] == "INVALID_INPUT"
+          and len(TABLE_WRITES) == writes_before_invalid,
+          f"U4-ROW-6g S3 volume {bad!r} is refused before writing: whole non-negative numbers only")
+
 DENIED_TABLES.add("batch_rows")
 with app.test_client() as client:
     response = client.post("/batches/71/rows", headers=AUTH, json={

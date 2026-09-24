@@ -3610,6 +3610,16 @@ def _optional_nonnegative_numeric(data, key, max_value=None):
     return float(parsed), None
 
 
+def _optional_nonnegative_integer(data, key):
+    """Blank stays blank, 0 stays 0; a whole non-negative number only (bigint columns)."""
+    value, err = _optional_nonnegative_numeric(data, key)
+    if err or value is None:
+        return value, err
+    if value != int(value):
+        return None, _invalid_input(f"{key} must be blank or a whole non-negative number")
+    return int(value), None
+
+
 def _pricing_group_input(client, batch_id, data, existing):
     """Validate one complete Pricing Group commercial-terms replacement."""
     expected = _int_field(data, "expected_content_version")
@@ -4632,6 +4642,10 @@ _BATCH_ROW_ADDON_FIELDS = (
     "addon_moq_charge", "addon_packing", "addon_other", "addon_unloading",
 )
 _BATCH_ROW_NUMERIC_FIELDS = (*_BATCH_ROW_OVERRIDE_FIELDS, *_BATCH_ROW_ADDON_FIELDS, "fluting_bcf")
+# S3: row-owned quantities. Both are governed calculation inputs (the S7-R
+# effective-input gatherer reads them) and Send snapshots them, but no route
+# wrote them, so every durable row held null. bigint columns: whole numbers only.
+_BATCH_ROW_QUANTITY_FIELDS = ("volume", "sales_moq")
 
 
 def _batch_row_input(client, batch_id, data, existing_sku_id=None, existing_overrides=None):
@@ -4680,6 +4694,13 @@ def _batch_row_input(client, batch_id, data, existing_sku_id=None, existing_over
             return None, err
     if numeric_values["fluting_bcf"] is not None and numeric_values["fluting_bcf"] > 0.30:
         return None, _invalid_input("fluting_bcf must be blank or between 0 and 0.30")
+    for key in _BATCH_ROW_QUANTITY_FIELDS:
+        if key not in data and existing_overrides is not None:
+            numeric_values[key] = existing_overrides.get(key)
+            continue
+        numeric_values[key], err = _optional_nonnegative_integer(data, key)
+        if err:
+            return None, err
     return {
         "pricing_group_id": pricing_group_id,
         "sku_id": sku_id,
@@ -5282,7 +5303,8 @@ def update_batch_row(batch_id, row_id):
                 .select("id, batch_id, sku_id, status, content_version, waste_override_pct, "
                         "margin_override_pct, conv_override_rate, freight_override, "
                         "addon_printing, addon_stitching, addon_coating, addon_handling, "
-                        "addon_moq_charge, addon_packing, addon_other, addon_unloading, fluting_bcf")
+                        "addon_moq_charge, addon_packing, addon_other, addon_unloading, fluting_bcf, "
+                        "volume, sales_moq")
                 .eq("id", row_id).eq("batch_id", batch_id).limit(1).execute()).data or []
     if not existing:
         return _error("RECORD_NOT_FOUND")
@@ -5298,7 +5320,7 @@ def update_batch_row(batch_id, row_id):
         return err
     updates = {key: values[key] for key in (
         "pricing_group_id", "sku_version_id", "row_type", "material_code",
-        *_BATCH_ROW_NUMERIC_FIELDS)}
+        *_BATCH_ROW_NUMERIC_FIELDS, *_BATCH_ROW_QUANTITY_FIELDS)}
     result, err = _caller_table_write(
         "update Batch row",
         lambda: client.table("batch_rows").update(updates)
