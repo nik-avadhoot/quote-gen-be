@@ -6005,7 +6005,9 @@ def export_quote_revision_route(revision_id):
         freight_set_version_id = freight_set_version_id or snapshot.get("freight_set_version_id")
         spec = _spec_from_snapshot(snapshot)
         spec.setdefault("client", recipient_name.strip())
-        spec.setdefault("plant", (batch.get("plant") or {}).get("name") or "")
+        # A current Batch or Plant-master name is not frozen document evidence.
+        # Older snapshots without a frozen producing-plant label stay blank.
+        spec.setdefault("plant", "")
         items.append({"spec": spec})
     if snapshots_missing:
         # Partial evidence cannot become a customer document: a workbook missing

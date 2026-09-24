@@ -150,8 +150,8 @@ if workbook:
     check(cbb["D2"].value == "Indo Rama Synthetics (India) Limited"
           and cbb["D2"].value != QUOTE["batch"]["customer_family"]["name"]
           and cbb["D2"].value != TABLE_ROWS["parties"][0]["display_name"]
-          and cbb["B3"].value == "Nagpur",
-          "QE-3 workbook uses the exact recipient frozen at Send, not current Party or Family master data")
+          and not cbb["B3"].value,
+          "QE-3 workbook uses the exact recipient frozen at Send and never substitutes a current Party, Family or Plant master value")
     check(cbb["C7"].value == "36512" and cbb["B7"].value == "Box",
           "QE-4 the row carries its material code and row type")
     check(cbb["F7"].value == 675 and cbb["G7"].value == 450 and cbb["H7"].value == 282,
