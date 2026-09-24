@@ -1,9 +1,9 @@
 -- ═════ P0.5 QUALIFICATION REHEARSAL TAIL: always ends in RAISE, so the whole batch rolls back ═════
 -- Run as ONE batch immediately after the text of
---   supabase/migrations/20260923150000_customer_pricing_history_p0_1.sql
---   supabase/migrations/20260923183000_customer_pricing_history_p0_2.sql
---   supabase/migrations/20260924044157_customer_pricing_history_p0_4.sql
---   supabase/migrations/20260924100057_customer_pricing_history_p0_4_1_sob_allocated_boxes.sql
+--   supabase/migrations/20260924164751_customer_pricing_history_p0_1.sql
+--   supabase/migrations/20260924164806_customer_pricing_history_p0_2.sql
+--   supabase/migrations/20260924164820_customer_pricing_history_p0_4.sql
+--   supabase/migrations/20260924164835_customer_pricing_history_p0_4_1_sob_allocated_boxes.sql
 -- Pre-activation evidence on the FINAL chain:
 --   A. advisor-equivalent catalogue lints over every Customer Pricing History object
 --      (the hosted advisors cannot see objects that exist only inside a rolled-back batch);

@@ -6982,7 +6982,7 @@ def reset_password(uid):
 # Authority: quote-gen-fe/docs/customer-pricing-history-phase-0-implementation-
 # plan-2026-09-23.md. A direct-edit business record: no Checker step. Storage
 # and every rule that must hold is in migration
-# 20260923150000_customer_pricing_history_p0_1.sql; these routes are thin
+# 20260924164751_customer_pricing_history_p0_1.sql; these routes are thin
 # caller-token forwarders plus input validation that refuses bad shapes BEFORE
 # any RPC.
 #
@@ -7516,7 +7516,7 @@ def correct_customer_pricing_event(event_id):
                       "cph_correct_round")
 
 
-# ─── P0.5: void a negotiation round (migration 20260924153827) ────────────────
+# ─── P0.5: void a negotiation round (migration 20260924164850) ────────────────
 # A voided round is kept exactly as recorded and marked; it never counts as the
 # current position and can no longer be corrected or given a BF override. There
 # is no un-void and no delete - a new round re-states the position.
@@ -7770,7 +7770,7 @@ def start_next_customer_pricing_cycle(cycle_id):
 # ═══════════════════════════════════════════════════════════════════════════════
 # ROUTES: Customer Pricing History P0.4 — Excel/Sheets paste + change history
 #
-# Migration 20260924044157_customer_pricing_history_p0_4.sql. The frontend maps
+# Migration 20260924164820_customer_pricing_history_p0_4.sql. The frontend maps
 # every pasted cell through the active layout's canonical field descriptor and
 # sends typed OPERATIONS naming canonical record ids and the CAS versions it
 # read. This route re-validates each one against the caller's own bounded read

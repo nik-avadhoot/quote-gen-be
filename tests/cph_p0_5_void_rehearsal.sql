@@ -1,10 +1,10 @@
 -- ═════ P0.5 VOID-ROUND REHEARSAL TAIL: always ends in RAISE, so the whole batch rolls back ═════
 -- Run as ONE batch immediately after the text of the complete chain:
---   supabase/migrations/20260923150000_customer_pricing_history_p0_1.sql
---   supabase/migrations/20260923183000_customer_pricing_history_p0_2.sql
---   supabase/migrations/20260924044157_customer_pricing_history_p0_4.sql
---   supabase/migrations/20260924100057_customer_pricing_history_p0_4_1_sob_allocated_boxes.sql
---   supabase/migrations/20260924153827_customer_pricing_history_p0_5_void_round.sql
+--   supabase/migrations/20260924164751_customer_pricing_history_p0_1.sql
+--   supabase/migrations/20260924164806_customer_pricing_history_p0_2.sql
+--   supabase/migrations/20260924164820_customer_pricing_history_p0_4.sql
+--   supabase/migrations/20260924164835_customer_pricing_history_p0_4_1_sob_allocated_boxes.sql
+--   supabase/migrations/20260924164850_customer_pricing_history_p0_5_void_round.sql
 -- Rows are synthetic and rolled back; no real Customer commercial value is read or written.
 create function pg_temp.try(p_role text, p_sub text, p_sql text) returns text
 language plpgsql as $fn$

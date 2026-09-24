@@ -1,6 +1,6 @@
 -- Customer Pricing History, P0.2: commercial mechanisms.
 --
--- Successor to 20260923150000_customer_pricing_history_p0_1.sql (must follow it).
+-- Successor to 20260924164751_customer_pricing_history_p0_1.sql (must follow it).
 -- Authority: quote-gen-fe/docs/customer-pricing-history-phase-0-implementation-plan-2026-09-23.md
 -- §4.4-4.8 and §10 P0.2.
 --

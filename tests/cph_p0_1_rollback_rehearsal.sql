@@ -1,7 +1,7 @@
 
 -- ═════ REHEARSAL TAIL: always ends in RAISE, so the whole batch rolls back ═════
 -- Run as ONE batch immediately after the text of
--- supabase/migrations/20260923150000_customer_pricing_history_p0_1.sql.
+-- supabase/migrations/20260924164751_customer_pricing_history_p0_1.sql.
 -- The final RAISE aborts the batch, so neither the migration nor any row
 -- persists; the result is read from the error message.
 do $rehearse$

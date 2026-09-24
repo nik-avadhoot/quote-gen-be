@@ -1,7 +1,7 @@
 -- Customer Pricing History, P0.5: the governed "Void negotiation round" journey.
 --
--- Successor to 20260923150000 (P0.1), 20260923183000 (P0.2), 20260924044157 (P0.4) and
--- 20260924100057 (P0.4.1); must follow all four. Those are rehearsed but unapplied and are
+-- Successor to 20260924164751 (P0.1), 20260924164806 (P0.2), 20260924164820 (P0.4) and
+-- 20260924164835 (P0.4.1); must follow all four. Those are rehearsed but unapplied and are
 -- left untouched so their evidence stays valid.
 --
 -- WHY. customer_pricing_negotiation_events.status has always allowed 'voided', the read model
