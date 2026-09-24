@@ -30,6 +30,7 @@ import os
 import io
 import re
 import secrets
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from copy import copy
 from datetime import datetime
@@ -3466,6 +3467,12 @@ _ERROR_STATUS = {
     # the SAME request unchanged. Distinct from STALE_VERSION, where retrying
     # unchanged is guaranteed to fail again.
     "SERIALIZATION_FAILURE": 409,
+    # Customer Pricing History: the same Cycle period, Line scope or retried
+    # negotiation round already exists. Retrying unchanged can only fail again.
+    "DUPLICATE_RECORD": 409,
+    # Customer Pricing History P0.2: a Stable Term / BF set version would leave
+    # two active versions applying to the same exact scope on the same day.
+    "OVERLAPPING_VERSION": 409,
     # D2 - a hung upstream call is not an application fault and must not be
     # reported as one. 504 is a stable answer the frontend can act on; the
     # underlying socket/httpx text stays server-side.
@@ -3492,6 +3499,12 @@ _ERROR_MESSAGE = {
                         "version. Propose it as a new SKU instead.",
     "SECOND_APPROVER_REQUIRED": "A different manage_sku_master holder must confirm this SKU Set because "
                                 "it contains a settled Customer's SKU.",
+    "DUPLICATE_RECORD": "That record already exists. Reload to see it before adding it again.",
+    "OVERLAPPING_VERSION": "Another active version already applies to this scope in that period. "
+                           "Close or correct it first, or start the new version after it ends.",
+    # Default for a database check-constraint refusal mapped to INVALID_INPUT;
+    # route-side validation always supplies its own specific message.
+    "INVALID_INPUT": "One of the values is not valid for this record.",
     "SERIALIZATION_FAILURE": "The database could not complete that under concurrent load. "
                              "Nothing was changed — please try again.",
     # D2 CORRECTION. This must NOT claim the write did not happen. A client-side
@@ -6961,6 +6974,1238 @@ def reset_password(uid):
     if generated:
         resp["temp_password"] = password
     return jsonify(resp)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ROUTES: Customer Pricing History (Phase 0, P0.1)
+#
+# Authority: quote-gen-fe/docs/customer-pricing-history-phase-0-implementation-
+# plan-2026-09-23.md. A direct-edit business record: no Checker step. Storage
+# and every rule that must hold is in migration
+# 20260923150000_customer_pricing_history_p0_1.sql; these routes are thin
+# caller-token forwarders plus input validation that refuses bad shapes BEFORE
+# any RPC.
+#
+# - Read and edit both require read_party_master (plan §8.4). The check here is
+#   a fast refusal only; RLS and every app_private.cph_* body re-check it.
+# - Every INR value crosses this boundary as a TWO-DECIMAL STRING, both ways.
+#   Nothing here converts money to float, and a third decimal is refused rather
+#   than silently rounded by numeric(12,2).
+# - Updates carry expected_content_version; a mismatch is STALE_VERSION (409)
+#   and the database changed nothing.
+# ═══════════════════════════════════════════════════════════════════════════════
+_CPH_CAP = "read_party_master"
+_CPH_FREQUENCIES = ("monthly", "bimonthly", "quarterly", "half_yearly", "annual", "ad_hoc")
+_CPH_LABEL_STYLES = ("calendar_year", "financial_year", "custom")
+_CPH_RATE_BASES = ("box_per_piece", "box_per_kg", "kraft_paper_per_kg", "box_per_sqm")
+_CPH_WEIGHT_BASES = ("paper_consumed", "sheet_weight", "box_weight")
+_CPH_TAX = ("excluding_gst", "including_gst")
+# P0.4.1: SOB is a percentage OR a whole-box allocation for the Cycle - never both.
+_CPH_SOB_STATES = ("not_captured", "undefined", "not_applicable", "percentage", "allocated_quantity")
+_CPH_MAX_BOXES = 999_999_999  # ck_cpl_sob_boxes; far inside JS Number.MAX_SAFE_INTEGER
+_CPH_EVENT_TYPES = ("avadhoot_offer", "customer_counter", "final_agreement")
+_CPH_SOURCE_TYPES = ("email", "whatsapp", "call", "meeting", "excel", "other")
+_CPH_CYCLE_STATUSES = ("open", "closed")
+_CPH_MAX_INR = Decimal("9999999999.99")
+_CPH_CYCLE_LIMIT = 200
+_CPH_CHANGE_LIMIT = 50
+
+# SQLSTATEs specific to this record, on top of _RPC_ERROR_MAP.
+_CPH_ERROR_MAP = {
+    "23505": "DUPLICATE_RECORD",  # same period / scope / retried round
+    "23514": "INVALID_INPUT",     # a check constraint (SOB %, GST %, period order...)
+    "23502": "INVALID_INPUT",
+    "22P02": "INVALID_INPUT",
+    "22007": "INVALID_INPUT",
+    "22008": "INVALID_INPUT",
+    "23P01": "OVERLAPPING_VERSION",  # P0.2: overlapping active term / BF set for one scope
+}
+
+
+class _CphInputError(Exception):
+    pass
+
+
+def _cph_denied():
+    caps = g.caller.get("group_capabilities") or []
+    return None if _CPH_CAP in caps else _error("CAPABILITY_REQUIRED")
+
+
+def _cph_money(data, key, *, required=False):
+    """Exact INR: blank -> None, else a 2-decimal string. Zero stays "0.00"."""
+    value = data.get(key)
+    if value is None or (isinstance(value, str) and value.strip() == ""):
+        if required:
+            raise _CphInputError(f"{key} is required")
+        return None
+    if isinstance(value, bool) or isinstance(value, float):
+        # A JSON float has already lost exactness in transit; send a string.
+        raise _CphInputError(f"{key} must be sent as a decimal string or integer")
+    try:
+        parsed = Decimal(str(value).strip())
+    except (InvalidOperation, ValueError):
+        raise _CphInputError(f"{key} must be a number")
+    if not parsed.is_finite() or parsed < 0 or parsed > _CPH_MAX_INR:
+        raise _CphInputError(f"{key} must be between 0.00 and {_CPH_MAX_INR}")
+    if parsed.as_tuple().exponent < -2:
+        raise _CphInputError(f"{key} has more than two decimal places")
+    return str(parsed.quantize(Decimal("0.01")))
+
+
+def _cph_pct(data, key, *, required=False, allow_zero=True):
+    value = _cph_money(data, key, required=required)
+    if value is None:
+        return None
+    if Decimal(value) > 100 or (not allow_zero and Decimal(value) == 0):
+        raise _CphInputError(f"{key} must be {'0.00' if allow_zero else 'above 0.00'} to 100.00")
+    return value
+
+
+_CPH_BOXES_TEXT = re.compile(r"^[0-9]{1,18}$")
+
+
+def _cph_boxes(data, key, *, required=False):
+    """Whole boxes: blank -> None, else an exact decimal STRING. "0" stays "0".
+
+    Accepts a JSON integer or a string of ASCII digits only. Fractions, signs,
+    exponents, separators, booleans and floats are refused - never rounded.
+    """
+    value = data.get(key)
+    if value is None or (isinstance(value, str) and value.strip() == ""):
+        if required:
+            raise _CphInputError(f"{key} is required")
+        return None
+    if isinstance(value, bool) or isinstance(value, float):
+        raise _CphInputError(f"{key} must be a whole number of boxes sent as a string or integer")
+    if isinstance(value, int):
+        parsed = value
+    elif isinstance(value, str) and _CPH_BOXES_TEXT.match(value.strip()):
+        parsed = int(value.strip())
+    else:
+        raise _CphInputError(f"{key} must be a whole number of boxes (0 or more, no decimals)")
+    if parsed < 0 or parsed > _CPH_MAX_BOXES:
+        raise _CphInputError(f"{key} must be between 0 and {_CPH_MAX_BOXES:,} boxes")
+    return str(parsed)
+
+
+def _cph_date(data, key, *, required=False):
+    value = data.get(key)
+    if value is None or value == "":
+        if required:
+            raise _CphInputError(f"{key} is required (YYYY-MM-DD)")
+        return None
+    if not _valid_date_only(value):
+        raise _CphInputError(f"{key} must be a date (YYYY-MM-DD)")
+    return value
+
+
+def _cph_enum(data, key, allowed, *, required=False):
+    value = data.get(key)
+    if value is None or value == "":
+        if required:
+            raise _CphInputError(f"{key} is required")
+        return None
+    if value not in allowed:
+        raise _CphInputError(f"{key} must be one of: {', '.join(allowed)}")
+    return value
+
+
+def _cph_text(data, key, max_len):
+    value = data.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise _CphInputError(f"{key} must be text")
+    value = value.strip()
+    if len(value) > max_len:
+        raise _CphInputError(f"{key} must be {max_len} characters or fewer")
+    return value or None
+
+
+def _cph_id(data, key):
+    value = data.get(key)
+    if value is None or value == "":
+        return None
+    parsed = _int_field(data, key)
+    if parsed is None or parsed < 1:
+        raise _CphInputError(f"{key} must be a record id")
+    return parsed
+
+
+def _cph_expected(data, *, nullable=False):
+    if nullable and data.get("expected_content_version") is None:
+        return None
+    expected = _int_field(data, "expected_content_version")
+    if expected is None or expected < 1:
+        raise _CphInputError("expected_content_version is required")
+    return expected
+
+
+def _cph_rpc(name, params, status=200):
+    result, err = _rpc_call(get_supabase_for_caller(g.access_token), name, params,
+                            error_map=_CPH_ERROR_MAP)
+    if err:
+        return err
+    return jsonify(result.data), status
+
+
+def _cph_route(builder, rpc_name, status=200):
+    """Shared shape: fast capability refusal, validate, forward as the caller."""
+    denied = _cph_denied()
+    if denied:
+        return denied
+    data = request.get_json(silent=True) or {}
+    if not isinstance(data, dict):
+        return _invalid_input("request body must be a JSON object")
+    try:
+        params = builder(data)
+    except _CphInputError as exc:
+        return _invalid_input(str(exc))
+    return _cph_rpc(rpc_name, params, status)
+
+
+def _cph_money_out(row, *keys):
+    """Serialise numeric columns as exact 2-decimal strings; NULL stays null."""
+    for key in keys:
+        value = row.get(key)
+        if value is not None:
+            row[key] = str(Decimal(str(value)).quantize(Decimal("0.01")))
+    return row
+
+
+def _cph_bf_sort_key(code):
+    match = re.match(r"^(\d+)(.*)$", code or "")
+    return (int(match.group(1)), match.group(2)) if match else (10 ** 6, code or "")
+
+
+def _cph_reconciliation(event):
+    """Component sum and recorded-total difference, exact to 2 decimals.
+
+    The recorded total (rate_inr) is never replaced: a rounding gap between the
+    components and the negotiated total is reported, not absorbed.
+    """
+    names = ("component_kraft_inr", "component_conversion_inr", "component_freight_inr")
+    recorded = [name for name in names if event.get(name) is not None]
+    if not recorded:
+        return {"component_total_inr": None, "reconciliation_diff_inr": None, "components_recorded": []}
+    total = sum((Decimal(event[name]) for name in recorded), Decimal("0.00"))
+    diff = None if event.get("rate_inr") is None else Decimal(event["rate_inr"]) - total
+    return {
+        "component_total_inr": str(total.quantize(Decimal("0.01"))),
+        "reconciliation_diff_inr": None if diff is None else str(diff.quantize(Decimal("0.01"))),
+        "components_recorded": [name.replace("component_", "").replace("_inr", "") for name in recorded],
+    }
+
+
+def _cph_bf_schedule(event, rates):
+    """The round's own snapshotted BF schedule: derived = base rate + signed delta."""
+    if not event.get("base_bf_code"):
+        return []
+    base_rate = None if event.get("rate_inr") is None else Decimal(event["rate_inr"])
+    rows = [{"bf_code": event["base_bf_code"], "is_base": True, "delta_inr": None,
+             "derived_rate_inr": event.get("rate_inr"), "override_rate_inr": None,
+             "effective_rate_inr": event.get("rate_inr"), "is_override": False}]
+    for rate in sorted(rates, key=lambda r: _cph_bf_sort_key(r["bf_code"])):
+        delta = Decimal(str(rate["delta_inr"]))
+        derived = None if base_rate is None else str((base_rate + delta).quantize(Decimal("0.01")))
+        override = None if rate.get("override_rate_inr") is None else \
+            str(Decimal(str(rate["override_rate_inr"])).quantize(Decimal("0.01")))
+        rows.append({"bf_code": rate["bf_code"], "is_base": False,
+                     "delta_inr": str(delta.quantize(Decimal("0.01"))),
+                     "derived_rate_inr": derived, "override_rate_inr": override,
+                     "effective_rate_inr": override if override is not None else derived,
+                     "is_override": override is not None})
+    return rows
+
+
+def _read_customer_pricing_history(client, party_id):
+    parties = (client.table("parties")
+               .select("id, customer_code, display_name, lifecycle_state, status")
+               .eq("id", party_id).limit(1).execute()).data or []
+    if not parties:
+        return None
+    mechanisms = (client.table("customer_pricing_mechanisms").select(
+        "id, party_id, review_frequency, period_label_style, rate_basis, weight_basis, "
+        "tax_treatment, notes, content_version, created_at, created_by, updated_at, updated_by"
+    ).eq("party_id", party_id).limit(1).execute()).data or []
+    cycles = (client.table("customer_pricing_cycles").select(
+        "id, party_id, mechanism_id, review_frequency, period_start, period_end, custom_label, "
+        "initiated_on, status, notes, content_version, created_at, created_by, updated_at, updated_by"
+    ).eq("party_id", party_id).order("period_start", desc=True).order("id", desc=True)
+        .limit(_CPH_CYCLE_LIMIT + 1).execute()).data or []
+    truncated = len(cycles) > _CPH_CYCLE_LIMIT
+    cycles = cycles[:_CPH_CYCLE_LIMIT]
+
+    cycle_ids = [c["id"] for c in cycles]
+    lines = []
+    if cycle_ids:
+        lines = (client.table("customer_pricing_lines").select(
+            "id, cycle_id, party_id, customer_location_id, plant_id, sku_id, scope_text, "
+            "sob_state, sob_pct, sob_allocated_boxes, notes, status, content_version, created_at, created_by, "
+            "updated_at, updated_by, term_version_id, bf_delta_set_id, prior_line_id"
+        ).in_("cycle_id", cycle_ids).order("id").execute()).data or []
+    line_ids = [line["id"] for line in lines]
+    events = []
+    if line_ids:
+        events = (client.table("customer_pricing_negotiation_events").select(
+            "id, line_id, event_type, event_date, sequence_no, rate_inr, rate_basis, weight_basis, "
+            "tax_treatment, gst_pct, source_type, source_date, source_ref, notes, status, void_reason, "
+            "content_version, created_at, created_by, updated_at, updated_by, "
+            "component_kraft_inr, component_conversion_inr, component_freight_inr, term_version_id, "
+            "snap_wastage_treatment, snap_wastage_pct, snap_freight_treatment, "
+            "snap_conversion_inr_per_kg, snap_freight_inr_per_kg, bf_delta_set_id, base_bf_code"
+        ).in_("line_id", line_ids).order("event_date").order("sequence_no").execute()).data or []
+    event_ids = [event["id"] for event in events]
+    bf_rates = []
+    if event_ids:
+        bf_rates = (client.table("customer_pricing_event_bf_rates").select(
+            "id, event_id, bf_code, delta_inr, override_rate_inr, content_version, updated_at, updated_by"
+        ).in_("event_id", event_ids).execute()).data or []
+    measures = []
+    if line_ids:
+        measures = (client.table("customer_pricing_line_measures").select(
+            "id, line_id, measure, source, value, status, notes, content_version, updated_at, updated_by"
+        ).in_("line_id", line_ids).order("id").execute()).data or []
+    terms = (client.table("customer_pricing_term_versions").select(
+        "id, party_id, customer_location_id, plant_id, version_no, status, effective_from, effective_to, "
+        "rate_basis, weight_basis, wastage_treatment, wastage_pct, freight_treatment, "
+        "conversion_inr_per_kg, freight_inr_per_kg, source_type, source_date, source_ref, notes, "
+        "content_version, created_at, created_by, updated_at, updated_by"
+    ).eq("party_id", party_id).order("effective_from", desc=True).execute()).data or []
+    bf_sets = (client.table("customer_pricing_bf_delta_sets").select(
+        "id, party_id, customer_location_id, plant_id, version_no, status, effective_from, effective_to, "
+        "base_bf_code, source_type, source_date, source_ref, notes, content_version, created_at, "
+        "created_by, updated_at, updated_by"
+    ).eq("party_id", party_id).order("effective_from", desc=True).execute()).data or []
+    bf_deltas = []
+    if bf_sets:
+        bf_deltas = (client.table("customer_pricing_bf_deltas").select(
+            "id, set_id, bf_code, delta_inr"
+        ).in_("set_id", [s["id"] for s in bf_sets]).execute()).data or []
+
+    locations, _ = _optional_caller_rows(client.table("customer_locations")
+        .select("id, location_code, status").eq("party_id", party_id))
+    plants, _ = _optional_caller_rows(client.table("plants")
+        .select("id, plant_code, name, status"))
+    skus, _ = _optional_caller_rows(client.table("skus")
+        .select("id, plant_id, plant_item_code, status").eq("party_id", party_id))
+    changes, _ = _optional_caller_rows(client.table("customer_pricing_change_events").select(
+        "id, entity_type, entity_id, operation, content_version, actor_app_user_id, occurred_at"
+    ).eq("party_id", party_id).order("occurred_at", desc=True).limit(_CPH_CHANGE_LIMIT))
+
+    # Chronology is decided HERE (date, then the database's stable sequence),
+    # so the frontend summary never depends on transport order.
+    rates_by_event = {}
+    for rate in bf_rates:
+        rates_by_event.setdefault(rate["event_id"], []).append(rate)
+    events_by_line = {}
+    for event in sorted(events, key=lambda e: (e.get("event_date") or "", e.get("sequence_no") or 0)):
+        out = _cph_money_out(dict(event), "rate_inr", "gst_pct", "component_kraft_inr",
+                             "component_conversion_inr", "component_freight_inr", "snap_wastage_pct",
+                             "snap_conversion_inr_per_kg", "snap_freight_inr_per_kg")
+        out.update(_cph_reconciliation(out))
+        out["bf_schedule"] = _cph_bf_schedule(out, rates_by_event.get(event["id"], []))
+        events_by_line.setdefault(event["line_id"], []).append(out)
+    measures_by_line = {}
+    for measure in measures:
+        row = dict(measure)
+        row["value"] = str(Decimal(str(row["value"])).quantize(Decimal("0.0001")))
+        measures_by_line.setdefault(measure["line_id"], []).append(row)
+    lines_by_cycle = {}
+    for line in lines:
+        out = _cph_money_out(dict(line), "sob_pct")
+        if out.get("sob_allocated_boxes") is not None:
+            out["sob_allocated_boxes"] = str(int(out["sob_allocated_boxes"]))
+        out["events"] = events_by_line.get(line["id"], [])
+        out["measures"] = measures_by_line.get(line["id"], [])
+        lines_by_cycle.setdefault(line["cycle_id"], []).append(out)
+    deltas_by_set = {}
+    for delta in bf_deltas:
+        deltas_by_set.setdefault(delta["set_id"], []).append(_cph_money_out(dict(delta), "delta_inr"))
+    bf_sets_out = [{**bf_set, "deltas": sorted(deltas_by_set.get(bf_set["id"], []),
+                                              key=lambda d: _cph_bf_sort_key(d["bf_code"]))}
+                   for bf_set in bf_sets]
+    terms_out = [_cph_money_out(dict(term), "wastage_pct", "conversion_inr_per_kg", "freight_inr_per_kg")
+                 for term in terms]
+    cycles_out = [{**cycle, "lines": lines_by_cycle.get(cycle["id"], [])} for cycle in cycles]
+
+    return {
+        "party": parties[0],
+        "mechanism": mechanisms[0] if mechanisms else None,
+        "cycles": cycles_out,
+        "cycle_limit": _CPH_CYCLE_LIMIT,
+        "cycles_truncated": truncated,
+        "locations": sorted(locations, key=lambda l: l.get("id") or 0),
+        "plants": sorted(plants, key=lambda p: p.get("plant_code") or ""),
+        "recent_changes": changes,
+        "term_versions": terms_out,
+        "bf_delta_sets": bf_sets_out,
+        "skus": sorted(skus, key=lambda k: (k.get("plant_item_code") or "", k.get("id") or 0)),
+        "money_format": "decimal_string_2dp",
+        "measure_format": "decimal_string_4dp",
+    }
+
+
+@app.route("/masters/parties/<int:party_id>/pricing-history", methods=["GET"])
+@require_auth
+def get_customer_pricing_history(party_id):
+    """The whole bounded Customer pricing record, read once as the caller."""
+    denied = _cph_denied()
+    if denied:
+        return denied
+    client = get_supabase_for_caller(g.access_token)
+    try:
+        body = _read_customer_pricing_history(client, party_id)
+    except APIError as exc:
+        if exc.code == "42501":
+            return _error("CAPABILITY_REQUIRED")
+        if exc.code in ("42P01", "PGRST205"):
+            # The P0.1 migration is not applied in this environment.
+            return _error("MASTER_UNAVAILABLE")
+        app.logger.error("pricing history read failed: %s %s", exc.code, exc.message)
+        return _error("INTERNAL_ERROR")
+    except Exception as exc:
+        if _is_upstream_timeout(exc):
+            return _error("UPSTREAM_TIMEOUT")
+        raise
+    if body is None:
+        return _error("RECORD_NOT_FOUND")
+    return jsonify(body)
+
+
+@app.route("/masters/parties/<int:party_id>/pricing-mechanism", methods=["PUT"])
+@require_auth
+def save_customer_pricing_mechanism(party_id):
+    """Create (expected_content_version null) or CAS-update the mechanism."""
+    def build(data):
+        return {
+            "p_party": party_id,
+            "p_expected_version": _cph_expected(data, nullable=True),
+            "p_review_frequency": _cph_enum(data, "review_frequency", _CPH_FREQUENCIES, required=True),
+            "p_period_label_style": _cph_enum(data, "period_label_style", _CPH_LABEL_STYLES),
+            "p_rate_basis": _cph_enum(data, "rate_basis", _CPH_RATE_BASES),
+            "p_weight_basis": _cph_enum(data, "weight_basis", _CPH_WEIGHT_BASES),
+            "p_tax_treatment": _cph_enum(data, "tax_treatment", _CPH_TAX),
+            "p_notes": _cph_text(data, "notes", 2000),
+        }
+    return _cph_route(build, "cph_save_mechanism")
+
+
+def _cph_cycle_fields(data):
+    start = _cph_date(data, "period_start", required=True)
+    end = _cph_date(data, "period_end", required=True)
+    if end < start:
+        raise _CphInputError("period_end must not be before period_start")
+    return {
+        "p_period_start": start,
+        "p_period_end": end,
+        "p_initiated_on": _cph_date(data, "initiated_on", required=True),
+        "p_review_frequency": _cph_enum(data, "review_frequency", _CPH_FREQUENCIES),
+        "p_custom_label": _cph_text(data, "custom_label", 80),
+        "p_notes": _cph_text(data, "notes", 2000),
+    }
+
+
+@app.route("/masters/parties/<int:party_id>/pricing-cycles", methods=["POST"])
+@require_auth
+def create_customer_pricing_cycle(party_id):
+    return _cph_route(lambda data: {"p_party": party_id, **_cph_cycle_fields(data)},
+                      "cph_create_cycle", 201)
+
+
+@app.route("/masters/pricing-cycles/<int:cycle_id>", methods=["PATCH"])
+@require_auth
+def update_customer_pricing_cycle(cycle_id):
+    def build(data):
+        return {"p_cycle": cycle_id, "p_expected_version": _cph_expected(data),
+                **_cph_cycle_fields(data),
+                "p_status": _cph_enum(data, "status", _CPH_CYCLE_STATUSES)}
+    return _cph_route(build, "cph_update_cycle")
+
+
+def _cph_sob_fields(data):
+    """The SOB triple. Only the value the chosen state names may be present."""
+    sob_state = _cph_enum(data, "sob_state", _CPH_SOB_STATES) or "not_captured"
+    sob_pct = _cph_pct(data, "sob_pct", required=(sob_state == "percentage"))
+    boxes = _cph_boxes(data, "sob_allocated_boxes", required=(sob_state == "allocated_quantity"))
+    if sob_state != "percentage" and sob_pct is not None:
+        raise _CphInputError("sob_pct is only recorded when sob_state is percentage")
+    if sob_state != "allocated_quantity" and boxes is not None:
+        raise _CphInputError("sob_allocated_boxes is only recorded when sob_state is allocated_quantity")
+    return sob_state, sob_pct, boxes
+
+
+def _cph_line_fields(data):
+    sob_state, sob_pct, boxes = _cph_sob_fields(data)
+    return {
+        "p_customer_location": _cph_id(data, "customer_location_id"),
+        "p_plant": _cph_id(data, "plant_id"),
+        "p_sku": _cph_id(data, "sku_id"),
+        "p_scope_text": _cph_text(data, "scope_text", 200),
+        "p_sob_state": sob_state,
+        "p_sob_pct": sob_pct,
+        # Exact digits; PostgREST casts the string to the integer parameter.
+        "p_sob_allocated_boxes": boxes,
+        "p_notes": _cph_text(data, "notes", 2000),
+    }
+
+
+@app.route("/masters/pricing-cycles/<int:cycle_id>/lines", methods=["POST"])
+@require_auth
+def create_customer_pricing_line(cycle_id):
+    return _cph_route(lambda data: {"p_cycle": cycle_id, **_cph_line_fields(data)},
+                      "cph_create_line", 201)
+
+
+@app.route("/masters/pricing-lines/<int:line_id>", methods=["PATCH"])
+@require_auth
+def update_customer_pricing_line(line_id):
+    return _cph_route(lambda data: {"p_line": line_id, "p_expected_version": _cph_expected(data),
+                                    **_cph_line_fields(data)},
+                      "cph_update_line")
+
+
+def _cph_event_fields(data):
+    # Blank tax_treatment is NOT "excluding": the database then applies the
+    # Customer mechanism's own treatment (new round) or keeps the round's
+    # current one (correction), and ck_cpe_gst decides whether a GST % is due.
+    tax = _cph_enum(data, "tax_treatment", _CPH_TAX)
+    gst = _cph_pct(data, "gst_pct", required=(tax == "including_gst"), allow_zero=False)
+    if tax == "excluding_gst" and gst is not None:
+        raise _CphInputError("gst_pct is only recorded for including_gst rates")
+    return {
+        "p_event_type": _cph_enum(data, "event_type", _CPH_EVENT_TYPES, required=True),
+        "p_event_date": _cph_date(data, "event_date", required=True),
+        "p_rate_inr": _cph_money(data, "rate_inr", required=True),
+        # P0.2 component breakup; blank = not recorded, 0.00 = a deliberate zero.
+        "p_kraft_inr": _cph_money(data, "kraft_inr"),
+        "p_conversion_inr": _cph_money(data, "conversion_inr"),
+        "p_freight_inr": _cph_money(data, "freight_inr"),
+        "p_tax_treatment": tax,
+        "p_gst_pct": gst,
+        "p_source_type": _cph_enum(data, "source_type", _CPH_SOURCE_TYPES),
+        "p_source_date": _cph_date(data, "source_date"),
+        "p_source_ref": _cph_text(data, "source_ref", 500),
+        "p_notes": _cph_text(data, "notes", 2000),
+    }
+
+
+_CPH_UUID = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+
+
+@app.route("/masters/pricing-lines/<int:line_id>/events", methods=["POST"])
+@require_auth
+def add_customer_pricing_event(line_id):
+    """Record one more round. Never overwrites a prior round."""
+    def build(data):
+        request_id = data.get("client_request_id")
+        if not isinstance(request_id, str) or not _CPH_UUID.match(request_id):
+            raise _CphInputError("client_request_id (a UUID) is required so a retry cannot record twice")
+        return {"p_line": line_id, **_cph_event_fields(data), "p_client_request_id": request_id}
+    # P0.2: cph_add_round = cph_add_event + the component breakup; the database
+    # triggers snapshot the applicable Stable Term and BF schedule on both paths.
+    return _cph_route(build, "cph_add_round", 201)
+
+
+@app.route("/masters/pricing-events/<int:event_id>", methods=["PATCH"])
+@require_auth
+def correct_customer_pricing_event(event_id):
+    """Correct THAT round under CAS; the change log keeps its before/after."""
+    return _cph_route(lambda data: {"p_event": event_id, "p_expected_version": _cph_expected(data),
+                                    **_cph_event_fields(data)},
+                      "cph_correct_round")
+
+
+# ─── P0.5: void a negotiation round (migration 20260924153827) ────────────────
+# A voided round is kept exactly as recorded and marked; it never counts as the
+# current position and can no longer be corrected or given a BF override. There
+# is no un-void and no delete - a new round re-states the position.
+_CPH_VOID_REASON_MIN, _CPH_VOID_REASON_MAX = 3, 500
+_CPH_ERROR_MAP["55000"] = "ROUND_VOIDED"   # the round is voided (void again, correct, BF override)
+_ERROR_STATUS["ROUND_VOIDED"] = 409
+_ERROR_MESSAGE["ROUND_VOIDED"] = ("That round is voided. It stays in the history exactly as recorded and can no "
+                                  "longer be changed - record a new round instead.")
+
+
+@app.route("/masters/pricing-events/<int:event_id>/void", methods=["POST"])
+@require_auth
+def void_customer_pricing_event(event_id):
+    """Void THAT round under CAS. The body names the Customer being viewed, the
+    version read and a reason; an event of any other Customer answers as not found."""
+    denied = _cph_denied()
+    if denied:
+        return denied
+    data = request.get_json(silent=True) or {}
+    if not isinstance(data, dict):
+        return _invalid_input("request body must be a JSON object")
+    try:
+        party_id = _cph_id(data, "party_id")
+        if party_id is None:
+            raise _CphInputError("party_id (the Customer being viewed) is required")
+        expected = _cph_expected(data)
+        reason = data.get("reason")
+        if not isinstance(reason, str) or not (_CPH_VOID_REASON_MIN <= len(reason.strip()) <= _CPH_VOID_REASON_MAX):
+            raise _CphInputError(f"reason is required ({_CPH_VOID_REASON_MIN}-{_CPH_VOID_REASON_MAX} characters)")
+    except _CphInputError as exc:
+        return _invalid_input(str(exc))
+    params = {"p_party": party_id, "p_event": event_id, "p_expected_version": expected,
+              "p_reason": reason.strip()}
+    # A backend deployed before the migration: the function is absent (PGRST202 /
+    # 42883) - say the feature is not activated, not "internal error".
+    result, err = _rpc_call(get_supabase_for_caller(g.access_token), "cph_void_round", params,
+                            error_map={**_CPH_ERROR_MAP, "PGRST202": "MASTER_UNAVAILABLE",
+                                       "42883": "MASTER_UNAVAILABLE"})
+    if err:
+        return err
+    return jsonify(result.data), 200
+
+
+# ─── P0.2: Stable Terms, BF delta sets, references, measures, overrides, next cycle
+_CPH_WASTAGE = ("added_pct", "included_in_weight", "not_applicable", "not_captured")
+_CPH_FREIGHT = ("delivered_included", "ex_factory_separate", "not_captured")
+_CPH_MEASURES = ("paper_consumed_kg", "sheet_weight_kg", "box_weight_kg", "area_sqm")
+_CPH_MEASURE_SOURCES = ("costing_snapshot", "customer_confirmed", "imported", "manual")
+_CPH_TERM_STATUSES = ("active", "withdrawn")
+_CPH_BF_CODE = re.compile(r"^[0-9]{1,3}[A-Z]{0,4}$")
+
+
+def _cph_signed_money(value, label):
+    """A signed exact INR delta as a 2-decimal string. Zero stays "0.00"."""
+    if value is None or (isinstance(value, str) and value.strip() == "") \
+            or isinstance(value, (bool, float)):
+        raise _CphInputError(f"{label} must be a signed decimal string, e.g. \"-1.25\"")
+    try:
+        parsed = Decimal(str(value).strip())
+    except (InvalidOperation, ValueError):
+        raise _CphInputError(f"{label} must be a number")
+    if not parsed.is_finite() or abs(parsed) > _CPH_MAX_INR:
+        raise _CphInputError(f"{label} is out of range")
+    if parsed.as_tuple().exponent < -2:
+        raise _CphInputError(f"{label} has more than two decimal places")
+    return str(parsed.quantize(Decimal("0.01")))
+
+
+def _cph_measure_value(data):
+    value = data.get("value")
+    if value is None or (isinstance(value, str) and value.strip() == ""):
+        return None
+    if isinstance(value, (bool, float)):
+        raise _CphInputError("value must be sent as a decimal string")
+    try:
+        parsed = Decimal(str(value).strip())
+    except (InvalidOperation, ValueError):
+        raise _CphInputError("value must be a number")
+    if not parsed.is_finite() or parsed <= 0 or parsed > Decimal("99999999.9999"):
+        raise _CphInputError("value must be above 0 (leave it blank if it is not known)")
+    if parsed.as_tuple().exponent < -4:
+        raise _CphInputError("weights and area carry at most four decimals")
+    return str(parsed.quantize(Decimal("0.0001")))
+
+
+def _cph_bf_code(value, label):
+    code = (value or "").strip().upper() if isinstance(value, str) else ""
+    if not _CPH_BF_CODE.match(code):
+        raise _CphInputError(f"{label} must be a paper grade code such as 18 or 22GY")
+    return code
+
+
+def _cph_term_fields(data):
+    start = _cph_date(data, "effective_from", required=True)
+    end = _cph_date(data, "effective_to")
+    if end is not None and end < start:
+        raise _CphInputError("effective_to must not be before effective_from")
+    wastage = _cph_enum(data, "wastage_treatment", _CPH_WASTAGE) or "not_captured"
+    wastage_pct = _cph_pct(data, "wastage_pct", required=(wastage == "added_pct"))
+    if wastage != "added_pct" and wastage_pct is not None:
+        raise _CphInputError("wastage_pct is only recorded when wastage is added as a percentage")
+    return {
+        "p_effective_from": start,
+        "p_effective_to": end,
+        "p_rate_basis": _cph_enum(data, "rate_basis", _CPH_RATE_BASES),
+        "p_weight_basis": _cph_enum(data, "weight_basis", _CPH_WEIGHT_BASES),
+        "p_wastage_treatment": wastage,
+        "p_wastage_pct": wastage_pct,
+        "p_freight_treatment": _cph_enum(data, "freight_treatment", _CPH_FREIGHT) or "not_captured",
+        "p_conversion_inr_per_kg": _cph_money(data, "conversion_inr_per_kg"),
+        "p_freight_inr_per_kg": _cph_money(data, "freight_inr_per_kg"),
+        "p_source_type": _cph_enum(data, "source_type", _CPH_SOURCE_TYPES),
+        "p_source_date": _cph_date(data, "source_date"),
+        "p_source_ref": _cph_text(data, "source_ref", 500),
+        "p_notes": _cph_text(data, "notes", 2000),
+    }
+
+
+def _cph_source_fields(data):
+    return {
+        "p_source_type": _cph_enum(data, "source_type", _CPH_SOURCE_TYPES),
+        "p_source_date": _cph_date(data, "source_date"),
+        "p_source_ref": _cph_text(data, "source_ref", 500),
+        "p_notes": _cph_text(data, "notes", 2000),
+    }
+
+
+@app.route("/masters/parties/<int:party_id>/pricing-terms", methods=["POST"])
+@require_auth
+def create_customer_pricing_term(party_id):
+    """A new effective-dated Stable Term version for one exact scope."""
+    def build(data):
+        return {"p_party": party_id,
+                "p_location": _cph_id(data, "customer_location_id"),
+                "p_plant": _cph_id(data, "plant_id"),
+                "p_close_prior": data.get("close_prior") is True,
+                **_cph_term_fields(data)}
+    return _cph_route(build, "cph_create_term_version", 201)
+
+
+@app.route("/masters/pricing-terms/<int:term_id>", methods=["PATCH"])
+@require_auth
+def correct_customer_pricing_term(term_id):
+    """An explicitly audited CAS correction (or withdrawal) of one version."""
+    def build(data):
+        return {"p_term": term_id, "p_expected_version": _cph_expected(data),
+                "p_status": _cph_enum(data, "status", _CPH_TERM_STATUSES),
+                **_cph_term_fields(data)}
+    return _cph_route(build, "cph_correct_term_version")
+
+
+@app.route("/masters/parties/<int:party_id>/pricing-bf-sets", methods=["POST"])
+@require_auth
+def create_customer_pricing_bf_set(party_id):
+    """A new BF delta set version: base BF plus signed deltas, immutable once saved."""
+    def build(data):
+        start = _cph_date(data, "effective_from", required=True)
+        end = _cph_date(data, "effective_to")
+        if end is not None and end < start:
+            raise _CphInputError("effective_to must not be before effective_from")
+        base = _cph_bf_code(data.get("base_bf_code"), "base_bf_code")
+        deltas = data.get("deltas")
+        if not isinstance(deltas, list) or not deltas or len(deltas) > 40:
+            raise _CphInputError("deltas must list between 1 and 40 BF entries")
+        seen, entries = set(), []
+        for index, entry in enumerate(deltas):
+            if not isinstance(entry, dict):
+                raise _CphInputError(f"deltas[{index}] must be an object")
+            code = _cph_bf_code(entry.get("bf_code"), f"deltas[{index}].bf_code")
+            if code == base:
+                raise _CphInputError("the base BF carries no delta")
+            if code in seen:
+                raise _CphInputError(f"BF {code} is listed twice")
+            seen.add(code)
+            entries.append({"bf_code": code,
+                            "delta_inr": _cph_signed_money(entry.get("delta_inr"), f"BF {code} delta")})
+        return {"p_party": party_id,
+                "p_location": _cph_id(data, "customer_location_id"),
+                "p_plant": _cph_id(data, "plant_id"),
+                "p_effective_from": start, "p_effective_to": end,
+                "p_close_prior": data.get("close_prior") is True,
+                "p_base_bf_code": base, "p_deltas": entries,
+                **_cph_source_fields(data)}
+    return _cph_route(build, "cph_create_bf_delta_set", 201)
+
+
+@app.route("/masters/pricing-bf-sets/<int:set_id>", methods=["PATCH"])
+@require_auth
+def correct_customer_pricing_bf_set(set_id):
+    """Header-only CAS correction; a different delta is a new set version."""
+    def build(data):
+        start = _cph_date(data, "effective_from", required=True)
+        end = _cph_date(data, "effective_to")
+        if end is not None and end < start:
+            raise _CphInputError("effective_to must not be before effective_from")
+        return {"p_set": set_id, "p_expected_version": _cph_expected(data),
+                "p_status": _cph_enum(data, "status", _CPH_TERM_STATUSES),
+                "p_effective_from": start, "p_effective_to": end,
+                **_cph_source_fields(data)}
+    return _cph_route(build, "cph_correct_bf_delta_set")
+
+
+@app.route("/masters/pricing-lines/<int:line_id>/references", methods=["PUT"])
+@require_auth
+def set_customer_pricing_line_references(line_id):
+    return _cph_route(lambda data: {"p_line": line_id, "p_expected_version": _cph_expected(data),
+                                    "p_term": _cph_id(data, "term_version_id"),
+                                    "p_bf_set": _cph_id(data, "bf_delta_set_id")},
+                      "cph_set_line_references")
+
+
+@app.route("/masters/pricing-lines/<int:line_id>/measures", methods=["PUT"])
+@require_auth
+def set_customer_pricing_line_measure(line_id):
+    """Record / change / withdraw ONE (measure, source) value beside the others."""
+    def build(data):
+        return {"p_line": line_id,
+                "p_measure": _cph_enum(data, "measure", _CPH_MEASURES, required=True),
+                "p_source": _cph_enum(data, "source", _CPH_MEASURE_SOURCES, required=True),
+                "p_value": _cph_measure_value(data),
+                "p_expected_version": _cph_expected(data, nullable=True),
+                "p_notes": _cph_text(data, "notes", 500)}
+    return _cph_route(build, "cph_set_line_measure")
+
+
+@app.route("/masters/pricing-events/<int:event_id>/bf-overrides", methods=["PUT"])
+@require_auth
+def set_customer_pricing_bf_override(event_id):
+    """Set (or clear with null) one BF-specific override under the round's CAS."""
+    return _cph_route(lambda data: {"p_event": event_id, "p_expected_version": _cph_expected(data),
+                                    "p_bf_code": _cph_bf_code(data.get("bf_code"), "bf_code"),
+                                    "p_override_rate_inr": _cph_money(data, "override_rate_inr")},
+                      "cph_set_bf_override")
+
+
+@app.route("/masters/pricing-cycles/<int:cycle_id>/next", methods=["POST"])
+@require_auth
+def start_next_customer_pricing_cycle(cycle_id):
+    """Start the next Cycle from this one's STRUCTURE; every rate starts blank."""
+    def build(data):
+        start = _cph_date(data, "period_start", required=True)
+        end = _cph_date(data, "period_end", required=True)
+        if end < start:
+            raise _CphInputError("period_end must not be before period_start")
+        return {"p_prior_cycle": cycle_id, "p_period_start": start, "p_period_end": end,
+                "p_initiated_on": _cph_date(data, "initiated_on", required=True),
+                "p_custom_label": _cph_text(data, "custom_label", 80)}
+    return _cph_route(build, "cph_start_next_cycle", 201)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ROUTES: Customer Pricing History P0.4 — Excel/Sheets paste + change history
+#
+# Migration 20260924044157_customer_pricing_history_p0_4.sql. The frontend maps
+# every pasted cell through the active layout's canonical field descriptor and
+# sends typed OPERATIONS naming canonical record ids and the CAS versions it
+# read. This route re-validates each one against the caller's own bounded read
+# (no N+1), refuses anything invalid / stale / unresolved / duplicate with a
+# per-operation issue list, and only then asks the database to store the batch,
+# where it is bound to the caller, the Customer, a sha-256 digest of the exact
+# payload and a 15-minute expiry. Apply names only the preview id + digest and
+# runs the whole batch in ONE transaction through the existing governed
+# definers - all or nothing, audit included. Never one request per cell.
+# ═══════════════════════════════════════════════════════════════════════════════
+_CPH_PASTE_MAX = 200
+_CPH_PASTE_ORDER = ("update_cycle", "update_line", "create_line", "add_round", "set_bf_override")
+_CPH_ERROR_MAP.update({
+    "PT410": "PREVIEW_EXPIRED",
+    "PT412": "PREVIEW_MISMATCH",
+    "PT413": "PASTE_TOO_LARGE",
+})
+_ERROR_STATUS.update({"PREVIEW_EXPIRED": 410, "PREVIEW_MISMATCH": 409, "PASTE_TOO_LARGE": 413,
+                      "PASTE_BLOCKED": 422})
+_ERROR_MESSAGE.update({
+    "PREVIEW_EXPIRED": "This paste preview expired or was already applied. Nothing was changed - "
+                       "prepare the preview again.",
+    "PREVIEW_MISMATCH": "The paste you reviewed is not the one that was prepared. Nothing was changed - "
+                        "prepare the preview again.",
+    "PASTE_TOO_LARGE": f"A paste batch carries 1 to {_CPH_PASTE_MAX} changes. Paste fewer rows at a time.",
+    "PASTE_BLOCKED": "Some pasted changes cannot be applied. Resolve or skip them, then prepare again.",
+})
+_CPH_UUID_DIGEST = re.compile(r"^[0-9a-f]{64}$")
+
+
+class _CphPasteIssue(Exception):
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code, self.message = code, message
+
+
+def _cph_paste_text(value, label, max_len):
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise _CphPasteIssue("INVALID_INPUT", f"{label} must be text")
+    value = value.strip()
+    if len(value) > max_len:
+        raise _CphPasteIssue("INVALID_INPUT", f"{label} must be {max_len} characters or fewer")
+    return value or None
+
+
+def _cph_paste_money(value, label, *, required=False, maximum=_CPH_MAX_INR):
+    try:
+        out = _cph_money({"v": value}, "v", required=required)
+    except _CphInputError as exc:
+        raise _CphPasteIssue("INVALID_INPUT", str(exc).replace("v ", f"{label} ", 1))
+    if out is not None and Decimal(out) > maximum:
+        raise _CphPasteIssue("INVALID_INPUT", f"{label} must not exceed {maximum}")
+    return out
+
+
+def _cph_paste_id(value, label):
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise _CphPasteIssue("INVALID_INPUT", f"{label} must be a record id")
+    return value
+
+
+def _cph_paste_version(op):
+    value = op.get("expected_version")
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise _CphPasteIssue("INVALID_INPUT", "expected_version (the version you read) is required")
+    return value
+
+
+def _cph_scope_key(line):
+    return (line.get("customer_location_id") or 0, line.get("plant_id") or 0, line.get("sku_id") or 0,
+            (line.get("scope_text") or "").strip().lower())
+
+
+def _cph_paste_sob(values, current=None):
+    """SOB is one state + value triple; a value without its state is refused.
+
+    The state is always explicit (the client resolved it from the canonical
+    column or an explicit preview choice) - a bare number is never guessed as
+    % or boxes here. The normalised triple always names BOTH values, so apply
+    can never leave a stale value of the other kind behind.
+    """
+    if "sob_state" not in values:
+        if "sob_pct" in values or "sob_allocated_boxes" in values:
+            raise _CphPasteIssue("INVALID_INPUT", "a SOB value is only sent together with sob_state")
+        return {}
+    state = values.get("sob_state")
+    if state not in _CPH_SOB_STATES:
+        raise _CphPasteIssue("INVALID_INPUT", f"sob_state must be one of: {', '.join(_CPH_SOB_STATES)}")
+    pct = boxes = None
+    if state == "percentage":
+        pct = _cph_paste_money(values.get("sob_pct"), "SOB %", required=True, maximum=Decimal("100.00"))
+    elif values.get("sob_pct") is not None:
+        raise _CphPasteIssue("INVALID_INPUT", "a SOB % is only recorded when SOB is a percentage")
+    if state == "allocated_quantity":
+        try:
+            boxes = _cph_boxes(values, "sob_allocated_boxes", required=True)
+        except _CphInputError as exc:
+            raise _CphPasteIssue("INVALID_INPUT", str(exc).replace("sob_allocated_boxes", "Allocated boxes", 1))
+    elif values.get("sob_allocated_boxes") is not None:
+        raise _CphPasteIssue("INVALID_INPUT", "allocated boxes are only recorded when SOB is an allocated quantity")
+    return {"sob_state": state, "sob_pct": pct, "sob_allocated_boxes": boxes}
+
+
+def _cph_paste_normalise(history, operations):
+    """→ (ordered normalised ops, issues). Every check reads the caller's own snapshot."""
+    cycles = {c["id"]: c for c in history["cycles"]}
+    lines = {l["id"]: l for c in history["cycles"] for l in c["lines"]}
+    events = {e["id"]: e for l in lines.values() for e in l["events"]}
+    location_ids = {loc["id"] for loc in history["locations"]}
+    plant_ids = {p["id"] for p in history["plants"]}
+    skus = {k["id"]: k for k in history["skus"]}
+    bf_sets = {s["id"]: s for s in history["bf_delta_sets"]}
+    mechanism = history.get("mechanism") or {}
+    active_scopes = {}
+    for line in lines.values():
+        if line.get("status", "active") == "active":
+            active_scopes.setdefault(line["cycle_id"], {})[_cph_scope_key(line)] = line["id"]
+
+    normalised, issues, new_keys, targets, new_scopes = [], [], {}, set(), {}
+    # Validate in APPLY order (records before the rounds that name them), so a
+    # round listed before its new line still resolves; issues keep the index
+    # the client sent, so the preview can point at the exact pasted cell.
+    rank = {kind: i for i, kind in enumerate(_CPH_PASTE_ORDER)}
+    walk = sorted(enumerate(operations),
+                  key=lambda item: (rank.get(item[1].get("op"), -1) if isinstance(item[1], dict) else -1, item[0]))
+    for index, op in walk:
+        try:
+            if not isinstance(op, dict) or op.get("op") not in _CPH_PASTE_ORDER:
+                raise _CphPasteIssue("INVALID_INPUT", "unknown paste operation")
+            kind = op["op"]
+            values = op.get("set") if kind in ("update_cycle", "update_line") else op
+            if kind in ("update_cycle", "update_line") and (not isinstance(values, dict) or not values):
+                raise _CphPasteIssue("INVALID_INPUT", "an update must name at least one field")
+
+            if kind == "update_cycle":
+                cycle = cycles.get(_cph_paste_id(op.get("cycle_id"), "cycle_id"))
+                if cycle is None:
+                    raise _CphPasteIssue("RECORD_NOT_FOUND", "that Cycle is not in this Customer's history")
+                version = _cph_paste_version(op)
+                if version != cycle.get("content_version"):
+                    raise _CphPasteIssue("STALE_VERSION", "the Cycle changed since you read it - reload")
+                if set(values) - {"custom_label", "notes"}:
+                    raise _CphPasteIssue("INVALID_INPUT", "only a Cycle's label and notes can be pasted")
+                clean = {}
+                if "custom_label" in values:
+                    clean["custom_label"] = _cph_paste_text(values["custom_label"], "Custom label", 80)
+                if "notes" in values:
+                    clean["notes"] = _cph_paste_text(values["notes"], "Cycle notes", 2000)
+                target = ("c", cycle["id"])
+                out = {"op": kind, "cycle_id": cycle["id"], "expected_version": version, "set": clean}
+
+            elif kind == "update_line":
+                line = lines.get(_cph_paste_id(op.get("line_id"), "line_id"))
+                if line is None or line.get("status", "active") != "active":
+                    raise _CphPasteIssue("RECORD_NOT_FOUND", "that active Line is not in this Customer's history")
+                version = _cph_paste_version(op)
+                if version != line.get("content_version"):
+                    raise _CphPasteIssue("STALE_VERSION", "the Line changed since you read it - reload")
+                if set(values) - {"scope_text", "notes", "sob_state", "sob_pct", "sob_allocated_boxes"}:
+                    raise _CphPasteIssue("INVALID_INPUT",
+                                         "only a Line's item/scope text, notes and SOB can be pasted")
+                clean = _cph_paste_sob(values)
+                if "scope_text" in values:
+                    clean["scope_text"] = _cph_paste_text(values["scope_text"], "Item / scope text", 200)
+                    after = {**line, "scope_text": clean["scope_text"]}
+                    other = active_scopes.get(line["cycle_id"], {}).get(_cph_scope_key(after))
+                    if other not in (None, line["id"]):
+                        raise _CphPasteIssue("DUPLICATE_RECORD",
+                                             "another Line in this Cycle already has exactly that scope")
+                if "notes" in values:
+                    clean["notes"] = _cph_paste_text(values["notes"], "Line notes", 2000)
+                target = ("l", line["id"])
+                out = {"op": kind, "line_id": line["id"], "expected_version": version, "set": clean}
+
+            elif kind == "create_line":
+                key = op.get("key")
+                if not isinstance(key, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,40}", key) or key in new_keys:
+                    raise _CphPasteIssue("INVALID_INPUT", "every new line needs its own short key")
+                cycle = cycles.get(_cph_paste_id(op.get("cycle_id"), "cycle_id"))
+                if cycle is None:
+                    raise _CphPasteIssue("RECORD_NOT_FOUND", "that Cycle is not in this Customer's history")
+                location = _cph_paste_id(op.get("customer_location_id"), "customer_location_id")
+                plant = _cph_paste_id(op.get("plant_id"), "plant_id")
+                sku = _cph_paste_id(op.get("sku_id"), "sku_id")
+                # Exact ids only - resolved client-side by exact code, re-proved here.
+                if location is not None and location not in location_ids:
+                    raise _CphPasteIssue("UNRESOLVED_IDENTITY", "that Location is not one of this Customer's")
+                if plant is not None and plant not in plant_ids:
+                    raise _CphPasteIssue("UNRESOLVED_IDENTITY", "that Producing Plant is not known")
+                if sku is not None and (sku not in skus or (plant is not None and skus[sku].get("plant_id") != plant)):
+                    raise _CphPasteIssue("UNRESOLVED_IDENTITY", "that SKU is not this Customer's (at that Plant)")
+                clean = _cph_paste_sob(op)
+                out = {"op": kind, "key": key, "cycle_id": cycle["id"], "customer_location_id": location,
+                       "plant_id": plant, "sku_id": sku,
+                       "scope_text": _cph_paste_text(op.get("scope_text"), "Item / scope text", 200),
+                       "sob_state": clean.get("sob_state", "not_captured"), "sob_pct": clean.get("sob_pct"),
+                       "sob_allocated_boxes": clean.get("sob_allocated_boxes"),
+                       "notes": _cph_paste_text(op.get("notes"), "Line notes", 2000)}
+                scope = _cph_scope_key(out)
+                if scope in active_scopes.get(cycle["id"], {}) or scope in new_scopes.get(cycle["id"], set()):
+                    raise _CphPasteIssue("DUPLICATE_RECORD", "a Line with exactly that scope already exists in the Cycle")
+                new_scopes.setdefault(cycle["id"], set()).add(scope)
+                new_keys[key] = None
+                target = None
+
+            elif kind == "add_round":
+                line_id, line_key = op.get("line_id"), op.get("line_key")
+                if (line_id is None) == (line_key is None):
+                    raise _CphPasteIssue("INVALID_INPUT", "a round names exactly one existing or new line")
+                line = None
+                if line_id is not None:
+                    line = lines.get(_cph_paste_id(line_id, "line_id"))
+                    if line is None or line.get("status", "active") != "active":
+                        raise _CphPasteIssue("RECORD_NOT_FOUND", "that active Line is not in this Customer's history")
+                elif line_key not in new_keys:
+                    raise _CphPasteIssue("INVALID_INPUT", "a round names a new line that is not in this batch")
+                event_type = op.get("event_type")
+                if event_type not in _CPH_EVENT_TYPES:
+                    raise _CphPasteIssue("INVALID_INPUT", f"event_type must be one of: {', '.join(_CPH_EVENT_TYPES)}")
+                if not _valid_date_only(op.get("event_date")):
+                    raise _CphPasteIssue("INVALID_INPUT", "the round date must be a real date (YYYY-MM-DD)")
+                rate = _cph_paste_money(op.get("rate_inr"), "rate", required=True)
+                tax = op.get("tax_treatment")
+                if tax is not None and tax not in _CPH_TAX:
+                    raise _CphPasteIssue("INVALID_INPUT", "tax_treatment must be excluding_gst or including_gst")
+                effective_tax = tax or mechanism.get("tax_treatment") or "excluding_gst"
+                gst = _cph_paste_money(op.get("gst_pct"), "GST %", required=effective_tax == "including_gst",
+                                       maximum=Decimal("100.00"))
+                if effective_tax == "including_gst" and Decimal(gst) == 0:
+                    raise _CphPasteIssue("INVALID_INPUT", "an including-GST rate needs a GST % above 0")
+                if effective_tax == "excluding_gst" and gst is not None:
+                    raise _CphPasteIssue("INVALID_INPUT", "a GST % is only recorded for including-GST rates")
+                if line is not None and line.get("bf_delta_set_id") in bf_sets:
+                    deltas = [Decimal(d["delta_inr"]) for d in bf_sets[line["bf_delta_set_id"]]["deltas"]]
+                    if deltas and Decimal(rate) + min(deltas) < 0:
+                        raise _CphPasteIssue("INVALID_INPUT", "a BF in this line's schedule would go below 0.00")
+                if line is not None and not op.get("accept_possible_duplicate"):
+                    for event in line["events"]:
+                        if (event.get("status") != "voided" and event["event_type"] == event_type
+                                and event["event_date"] == op["event_date"] and event.get("rate_inr") == rate):
+                            raise _CphPasteIssue("DUPLICATE_RECORD",
+                                                 "the same round (type, date and rate) is already recorded")
+                out = {"op": kind, "line_id": line["id"] if line else None, "line_key": line_key if line is None else None,
+                       "event_type": event_type, "event_date": op["event_date"], "rate_inr": rate,
+                       "tax_treatment": tax, "gst_pct": gst,
+                       "source_ref": _cph_paste_text(op.get("source_ref"), "source reference", 500),
+                       "notes": _cph_paste_text(op.get("notes"), "notes", 2000),
+                       # Server-generated: a retried APPLY is refused as consumed, and a
+                       # re-prepared batch can never collide with an earlier round.
+                       "client_request_id": str(uuid.uuid4())}
+                target = None
+
+            else:  # set_bf_override
+                event = events.get(_cph_paste_id(op.get("event_id"), "event_id"))
+                if event is None:
+                    raise _CphPasteIssue("RECORD_NOT_FOUND", "that round is not in this Customer's history")
+                if event.get("status") == "voided":
+                    raise _CphPasteIssue("ROUND_VOIDED", "that round is voided - its BF schedule can no longer change")
+                version = _cph_paste_version(op)
+                if version != event.get("content_version"):
+                    raise _CphPasteIssue("STALE_VERSION", "the round changed since you read it - reload")
+                code = str(op.get("bf_code") or "").strip().upper()
+                row = next((r for r in event.get("bf_schedule") or [] if r["bf_code"] == code), None)
+                if row is None:
+                    raise _CphPasteIssue("UNRESOLVED_IDENTITY",
+                                         f"BF {code or '?'} is not in this round's snapshotted schedule")
+                if row["is_base"]:
+                    raise _CphPasteIssue("INVALID_INPUT",
+                                         "the base BF is the round's own rate - correct the round instead")
+                override = _cph_paste_money(op.get("override_rate_inr"), "BF override")
+                if override == row.get("override_rate_inr"):
+                    raise _CphPasteIssue("INVALID_INPUT", f"BF {code}: nothing to change")
+                target = ("e", event["id"], code)
+                out = {"op": kind, "event_id": event["id"], "expected_version": version, "bf_code": code,
+                       "override_rate_inr": override}
+
+            if target is not None:
+                if target in targets:
+                    raise _CphPasteIssue("DUPLICATE_RECORD", "this batch changes the same record twice")
+                targets.add(target)
+            normalised.append((_CPH_PASTE_ORDER.index(kind), index, out))
+        except _CphPasteIssue as issue:
+            issues.append({"index": index, "code": issue.code, "message": issue.message})
+    issues.sort(key=lambda i: i["index"])
+    ordered = [out for _, _, out in sorted(normalised, key=lambda item: (item[0], item[1]))]
+    return ordered, issues
+
+
+def _cph_paste_history(party_id):
+    """The caller's own bounded read; (history, error_response)."""
+    client = get_supabase_for_caller(g.access_token)
+    try:
+        history = _read_customer_pricing_history(client, party_id)
+    except APIError as exc:
+        if exc.code == "42501":
+            return None, _error("CAPABILITY_REQUIRED")
+        if exc.code in ("42P01", "PGRST205"):
+            return None, _error("MASTER_UNAVAILABLE")
+        app.logger.error("pricing paste read failed: %s %s", exc.code, exc.message)
+        return None, _error("INTERNAL_ERROR")
+    if history is None:
+        return None, _error("RECORD_NOT_FOUND")
+    return history, None
+
+
+@app.route("/masters/parties/<int:party_id>/pricing-paste/preview", methods=["POST"])
+@require_auth
+def preview_customer_pricing_paste(party_id):
+    denied = _cph_denied()
+    if denied:
+        return denied
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict) or not isinstance(data.get("operations"), list):
+        return _invalid_input("send {\"operations\": [...]}")
+    operations = data["operations"]
+    if not operations or len(operations) > _CPH_PASTE_MAX:
+        return _error("PASTE_TOO_LARGE")
+    history, err = _cph_paste_history(party_id)
+    if err:
+        return err
+    ordered, issues = _cph_paste_normalise(history, operations)
+    if issues:
+        body = {"error_code": "PASTE_BLOCKED", "error": _ERROR_MESSAGE["PASTE_BLOCKED"], "issues": issues}
+        return jsonify(body), _ERROR_STATUS["PASTE_BLOCKED"]
+    result, err = _rpc_call(get_supabase_for_caller(g.access_token), "cph_store_paste_preview",
+                            {"p_party": party_id, "p_payload": ordered}, error_map=_CPH_ERROR_MAP)
+    if err:
+        return err
+    return jsonify({**(result.data or {}), "normalised": ordered}), 200
+
+
+@app.route("/masters/parties/<int:party_id>/pricing-paste/apply", methods=["POST"])
+@require_auth
+def apply_customer_pricing_paste(party_id):
+    def build(data):
+        preview = data.get("preview_id")
+        digest = data.get("digest")
+        if not isinstance(preview, str) or not _CPH_UUID.match(preview):
+            raise _CphInputError("preview_id (from the prepared preview) is required")
+        if not isinstance(digest, str) or not _CPH_UUID_DIGEST.match(digest):
+            raise _CphInputError("digest (from the prepared preview) is required")
+        return {"p_party": party_id, "p_preview": preview, "p_digest": digest}
+    return _cph_route(build, "cph_apply_paste")
+
+
+_CPH_AUDIT_IGNORED = {"id", "created_at", "created_by", "updated_at", "updated_by", "content_version"}
+
+
+def _cph_audit_value(key, value):
+    if value is None or isinstance(value, (bool, str)):
+        return value
+    if isinstance(value, (int, float)):
+        if key == "sob_allocated_boxes":
+            return str(int(value))  # whole boxes, as the exact string the reads use
+        if key == "value":
+            return str(Decimal(str(value)).quantize(Decimal("0.0001")))
+        if key.endswith("_inr") or key.endswith("_pct") or key.endswith("_per_kg"):
+            return str(Decimal(str(value)).quantize(Decimal("0.01")))
+    return value
+
+
+def _cph_change_fields(change):
+    before = change.get("before_state") or {}
+    after = change.get("after_state") or {}
+    fields = []
+    for key in sorted(set(before) | set(after)):
+        if key in _CPH_AUDIT_IGNORED:
+            continue
+        b, a = _cph_audit_value(key, before.get(key)), _cph_audit_value(key, after.get(key))
+        if change.get("operation") == "create":
+            if a is not None:
+                fields.append({"field": key, "before": None, "after": a})
+        elif b != a:
+            fields.append({"field": key, "before": b, "after": a})
+    return fields
+
+
+@app.route("/masters/parties/<int:party_id>/pricing-history/changes", methods=["GET"])
+@require_auth
+def list_customer_pricing_changes(party_id):
+    """One bounded page of the append-only change log, newest first, with diffs."""
+    denied = _cph_denied()
+    if denied:
+        return denied
+    try:
+        limit = int(request.args.get("limit", "50"))
+        before_id = request.args.get("before_id")
+        before_id = int(before_id) if before_id not in (None, "") else None
+    except ValueError:
+        return _invalid_input("limit and before_id must be integers")
+    if limit < 1 or limit > 200 or (before_id is not None and before_id < 1):
+        return _invalid_input("limit must be 1 to 200")
+    client = get_supabase_for_caller(g.access_token)
+    query = client.table("customer_pricing_change_events").select(
+        "id, entity_type, entity_id, operation, content_version, before_state, after_state, "
+        "actor_app_user_id, occurred_at").eq("party_id", party_id)
+    if before_id is not None:
+        query = query.lt("id", before_id)
+    try:
+        rows = query.order("id", desc=True).limit(limit + 1).execute().data or []
+    except APIError as exc:
+        if exc.code == "42501":
+            return _error("CAPABILITY_REQUIRED")
+        if exc.code in ("42P01", "PGRST205"):
+            return _error("MASTER_UNAVAILABLE")
+        app.logger.error("pricing change read failed: %s %s", exc.code, exc.message)
+        return _error("INTERNAL_ERROR")
+    except Exception as exc:
+        if _is_upstream_timeout(exc):
+            return _error("UPSTREAM_TIMEOUT")
+        raise
+    has_more = len(rows) > limit
+    rows = rows[:limit]
+    actor_ids = sorted({r["actor_app_user_id"] for r in rows if r.get("actor_app_user_id") is not None})
+    actors, actors_denied = ([], False)
+    if actor_ids:
+        actors, actors_denied = _optional_caller_rows(
+            client.table("app_users").select("id, display_name").in_("id", actor_ids))
+    names = {a["id"]: a.get("display_name") for a in actors}
+    changes = [{"id": r["id"], "entity_type": r["entity_type"], "entity_id": r["entity_id"],
+                "operation": r["operation"], "content_version": r.get("content_version"),
+                "occurred_at": r["occurred_at"], "actor_app_user_id": r.get("actor_app_user_id"),
+                "actor_name": names.get(r.get("actor_app_user_id")),
+                # The owning record(s), so a Line's timeline can find its rounds' entries.
+                "context": {k: (r.get("after_state") or {}).get(k) for k in ("cycle_id", "line_id", "event_id", "set_id")
+                            if (r.get("after_state") or {}).get(k) is not None},
+                "fields": _cph_change_fields(r)} for r in rows]
+    return jsonify({"changes": changes, "has_more": has_more, "limit": limit,
+                    "next_before_id": changes[-1]["id"] if has_more and changes else None,
+                    # Names the caller may not read are reported as missing, never guessed.
+                    "actor_names_partial": actors_denied or any(c["actor_name"] is None for c in changes)})
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
