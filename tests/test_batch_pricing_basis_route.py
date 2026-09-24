@@ -74,7 +74,7 @@ ROWS = {
     "delivery_groups": [{
         "id": 91, "pricing_group_id": 81, "batch_id": 71, "label": "Nagpur delivery",
         "bill_to_location_id": 101, "ship_to_location_id": 102,
-        "route_notes": None, "status": "active",
+        "destination_text": None, "billing_text": None, "route_notes": None, "status": "active",
     }],
     "customer_locations": [
         {"id": 101, "party_id": 201, "location_code": "BILL-101",
@@ -191,6 +191,14 @@ class FakeQuery:
         self.in_filters.append((column, set(values)))
         return self
 
+    def lt(self, column, value):
+        self.filters.append((f"{column}__lt", value))
+        return self
+
+    def order(self, column, desc=False):
+        self.order_by = (column, desc)
+        return self
+
     def limit(self, maximum):
         self.maximum = maximum
         return self
@@ -238,9 +246,15 @@ class FakeQuery:
 
         matched = list(source)
         for column, value in self.filters:
-            matched = [row for row in matched if str(row.get(column)) == str(value)]
+            if column.endswith("__lt"):
+                matched = [row for row in matched if row.get(column[:-4], 0) < value]
+            else:
+                matched = [row for row in matched if str(row.get(column)) == str(value)]
         for column, values in self.in_filters:
             matched = [row for row in matched if row.get(column) in values]
+        if hasattr(self, "order_by"):
+            column, desc = self.order_by
+            matched.sort(key=lambda row: row.get(column) or 0, reverse=desc)
         if self.action == "update":
             for row in matched:
                 row.update(self.payload)
@@ -310,11 +324,50 @@ class FakeRpc:
             ROWS["batch_profile_versions"].append(profile)
             batch["content_version"] += 1
             return type("Response", (), {"data": profile["id"]})()
-        if self.name == "create_batch":
+        if self.name == "create_minimal_prospect":
+            family_id = self.params.get("p_family_id")
+            if family_id is None:
+                family_id = max(row["id"] for row in ROWS["customer_families"]) + 1
+                ROWS["customer_families"].append({"id": family_id,
+                    "group_customer_code": None, "name": self.params["p_display_name"],
+                    "status": "proposed"})
+                ROWS["customer_family_sectors"].append({"family_id": family_id,
+                    "sector_id": self.params["p_sector"], "created_at": "2026-09-23T09:00:00Z"})
+            party_id = max(row["id"] for row in ROWS["parties"]) + 1
+            ROWS["parties"].append({"id": party_id, "customer_code": None,
+                "display_name": self.params["p_display_name"],
+                "lifecycle_state": "prospect", "status": "proposed"})
+            ROWS["party_family_memberships"].append({"party_id": party_id,
+                "family_id": family_id, "is_current": True})
+            return type("Response", (), {"data": [{"party_id": party_id, "family_id": family_id}]})()
+        if self.name == "create_batch_handoff":
+            party = next((row for row in ROWS["parties"] if row["id"] == self.params["p_party"]
+                          and ((row["lifecycle_state"] == "customer" and row["status"] == "active")
+                               or (row["lifecycle_state"] == "prospect"
+                                   and row["status"] in ("proposed", "active")))), None)
+            member = next((row for row in ROWS["party_family_memberships"]
+                           if row["party_id"] == self.params["p_party"]
+                           and row["family_id"] == self.params["p_family"]
+                           and row["is_current"]), None)
+            family = next((row for row in ROWS["customer_families"]
+                           if row["id"] == self.params["p_family"]
+                           and row["status"] in ("proposed", "active")), None)
+            location = next((row for row in ROWS["customer_locations"]
+                             if row["id"] == self.params["p_ship_to"]
+                             and row["party_id"] == self.params["p_party"]
+                             and row["status"] == "active" and row["ship_to_eligible"]), None)
+            billing = next((row for row in ROWS["customer_locations"]
+                            if row["id"] == self.params["p_bill_to"]
+                            and row["party_id"] == self.params["p_party"]
+                            and row["status"] == "active" and row["bill_to_eligible"]), None)
+            if not party or not member or not family or (self.params["p_ship_to"] and not location) or (self.params["p_bill_to"] and not billing):
+                raise server.APIError({"code": "22023", "message": "invalid customer context",
+                                       "details": None, "hint": None})
             batch_id = max(row["id"] for row in ROWS["batches"]) + 1
             ROWS["batches"].append({
                 "id": batch_id, "batch_reference": f"NAG/BAT/2026-27/{batch_id:05d}",
                 "plant_id": self.params["p_plant"], "family_id": self.params["p_family"],
+                "customer_party_id": self.params["p_party"],
                 "owner_user_id": CALLER["id"], "sector_id": self.params["p_sector"],
                 "status": "working", "content_version": 1, "pricing_date": "2026-09-12",
                 "pricing_basis_release_id": 11, "pricing_basis_is_deliberate": False,
@@ -329,7 +382,7 @@ class FakeRpc:
             ROWS["pricing_groups"].append({
                 "id": 82, "batch_id": batch_id, "label": "Default", "freight_mode": "master",
                 "freight_basis_delivery_group_id": None, "freight_manual_value": None,
-                "payment_terms_days": None, "payment_terms_text": None,
+                "payment_terms_days": self.params["p_payment_terms_days"], "payment_terms_text": None,
                 "interest_override_pct": None, "interest_override_derived_pct": None,
                 "interest_override_reason": None, "interest_override_by": None,
                 "interest_override_at": None,
@@ -338,7 +391,9 @@ class FakeRpc:
             })
             ROWS["delivery_groups"].append({
                 "id": 93, "pricing_group_id": 82, "batch_id": batch_id, "label": "Default",
-                "bill_to_location_id": None, "ship_to_location_id": None,
+                "bill_to_location_id": self.params["p_bill_to"], "ship_to_location_id": self.params["p_ship_to"],
+                "destination_text": self.params["p_destination_text"],
+                "billing_text": self.params["p_billing_text"],
                 "route_notes": None, "status": "active",
             })
             ROWS["batch_profile_versions"].append({
@@ -430,6 +485,16 @@ with app.test_client() as client:
 check(response.status_code == 403 and not CALLS,
       "U4-NEW-2 creation options refuse callers who cannot read Customer identities")
 
+RPC_CALLS.clear()
+with app.test_client() as client:
+    response = client.post("/batches", headers=AUTH, json={
+        "family_id": 21, "plant_id": 7, "sector_id": 31, "customer_party_id": 201,
+        "ship_to_location_id": 102, "bill_to_location_id": 101,
+        "payment_terms_days": 45,
+    })
+check(response.status_code == 403 and not RPC_CALLS,
+      "HANDOFF-AUTH-1 make_quote alone cannot hand guessed Party and Location IDs to the definer")
+
 CALLER["group_capabilities"] = ["read_party_master"]
 CALLS.clear()
 with app.test_client() as client:
@@ -438,6 +503,8 @@ options = response.get_json()
 check(response.status_code == 200
       and [(plant["id"], plant["plant_code"]) for plant in options["plants"]] == [(7, "NAG")]
       and options["families"][0]["members"][0]["customer_code"] == "CUST-201"
+      and [location["id"] for location in options["families"][0]["members"][0]["delivery_locations"]] == [102, 103]
+      and [location["id"] for location in options["families"][0]["members"][0]["billing_locations"]] == [101]
       and options["families"][0]["sector_ids"] == [31, 32]
       and {sector["id"] for sector in options["sectors"]} == {31, 32},
       "U4-NEW-3 creation options expose exact caller-visible Family/member, Maker Plant and Sector identities")
@@ -460,23 +527,241 @@ CALLS.clear()
 with app.test_client() as client:
     response = client.post("/batches", headers=AUTH, json={
         "family_id": 21, "plant_id": 7, "sector_id": 31,
+        "customer_party_id": 201, "ship_to_location_id": 102,
+        "bill_to_location_id": 101, "payment_terms_days": 45,
     })
 created = response.get_json()["batch"]
 created_batch_id = created["id"]
 check(response.status_code == 201
-      and RPC_CALLS[-1] == ("tok-u4", "create_batch", {
-          "p_family": 21, "p_plant": 7, "p_sector": 31,
+      and RPC_CALLS[-1] == ("tok-u4", "create_batch_handoff", {
+          "p_family": 21, "p_plant": 7, "p_sector": 31, "p_party": 201,
+          "p_ship_to": 102, "p_bill_to": 101,
+          "p_destination_text": None, "p_billing_text": None,
+          "p_payment_terms_days": 45,
       }), "U4-NEW-6 new Batch creation uses the exact governed RPC with the caller token")
 check(created["batch_reference"].startswith("NAG/BAT/2026-27/")
       and created["pricing_date"] == "2026-09-12"
       and created["pricing_basis_release_id"] == 11
       and created["pricing_groups"][0]["label"] == "Default"
       and created["pricing_groups"][0]["delivery_groups"][0]["label"] == "Default"
+      and created["customer_party"]["display_name"] == "Fixture Customer"
+      and created["pricing_groups"][0]["payment_terms_days"] == 45
+      and created["pricing_groups"][0]["delivery_groups"][0]["ship_to_location_id"] == 102
+      and created["pricing_groups"][0]["delivery_groups"][0]["bill_to_location_id"] == 101
       and created["current_profile"]["version_no"] == 1
       and created["caller_holds_lock"] is True,
       "U4-NEW-7 creation reads back the permanent reference, Pricing Basis, default groups, profile and initial lock")
 check(CALLS and all(call[0] == "tok-u4" for call in CALLS),
       "U4-NEW-8 the created workspace read-back remains caller-scoped")
+
+with app.test_client() as client:
+    response = client.get(f"/batches/{created_batch_id}/workspace", headers=AUTH)
+reopened = response.get_json()["batch"]
+check(response.status_code == 200 and reopened["customer_party_id"] == 201
+      and reopened["customer_party"]["display_name"] == "Fixture Customer"
+      and reopened["pricing_groups"][0]["payment_terms_days"] == 45
+      and reopened["pricing_groups"][0]["delivery_groups"][0]["ship_to_location_id"] == 102,
+      "HANDOFF-1 single-member Customer, delivery and terms survive workspace reopen")
+
+# The main Maker journey must prove the established-SKU lane independently of
+# the proposed Prospect/SKU lane below.  This is the authenticated in-memory
+# HTTP harness: no trial/main project row is written.
+with app.test_client() as client:
+    response = client.get(f"/batches/{created_batch_id}/row-options", headers=AUTH)
+established_options = response.get_json()
+established_sku = next(sku for sku in established_options["skus"]
+                       if sku["id"] == 301 and sku["status"] == "active")
+established_version = next(version for version in established_sku["versions"]
+                           if version["id"] == 311 and version["approved"] is True)
+check(response.status_code == 200
+      and established_sku["customer"]["id"] == 201
+      and established_version["construction_version_id"] == 321,
+      "S2-ESTABLISHED-1 the exact selected Customer can choose an established SKU and approved Version")
+created_group_id = created["pricing_groups"][0]["id"]
+with app.test_client() as client:
+    established_first = client.post(f"/batches/{created_batch_id}/rows", headers=AUTH,
+        json={"pricing_group_id": created_group_id, "sku_id": established_sku["id"],
+              "sku_version_id": established_version["id"], "row_type": "box",
+              "material_code": "ESTABLISHED-BOX-A"})
+    established_second = client.post(f"/batches/{created_batch_id}/rows", headers=AUTH,
+        json={"pricing_group_id": created_group_id, "sku_id": established_sku["id"],
+              "sku_version_id": established_version["id"], "row_type": "box",
+              "material_code": "ESTABLISHED-BOX-B"})
+with app.test_client() as client:
+    established_reopen = client.get(f"/batches/{created_batch_id}/workspace", headers=AUTH)
+established_rows = [row for row in established_reopen.get_json()["batch"]["batch_rows"]
+                    if row["material_code"].startswith("ESTABLISHED-BOX-")]
+check(established_first.status_code == 201 and established_second.status_code == 201
+      and established_reopen.status_code == 200 and len(established_rows) == 2
+      and all(row["sku_id"] == 301 and row["sku_version_id"] == 311
+              and row["effective_construction"]["version_id"] == 321
+              for row in established_rows),
+      "S2-ESTABLISHED-2 two established-SKU durable rows preserve SKU and Construction linkage on reopen")
+
+ROWS["parties"].append({"id": 202, "customer_code": None, "display_name": "Second Prospect",
+                        "lifecycle_state": "prospect", "status": "active"})
+ROWS["party_family_memberships"].append({"party_id": 202, "family_id": 21, "is_current": True})
+with app.test_client() as client:
+    response = client.get("/batches/create-options", headers=AUTH)
+members = response.get_json()["families"][0]["members"]
+check(response.status_code == 200 and {member["id"] for member in members} == {201, 202},
+      "HANDOFF-2 multi-member Family exposes both exact Customer choices")
+RPC_CALLS.clear()
+with app.test_client() as client:
+    response = client.post("/batches", headers=AUTH, json={
+        "family_id": 21, "plant_id": 7, "sector_id": 31,
+        "ship_to_location_id": 102, "payment_terms_days": 30,
+    })
+check(response.status_code == 400 and not RPC_CALLS,
+      "HANDOFF-3 Family alone cannot silently substitute for a member Customer")
+RPC_CALLS.clear()
+with app.test_client() as client:
+    response = client.post("/batches", headers=AUTH, json={
+        "family_id": 21, "plant_id": 7, "sector_id": 31,
+        "customer_party_id": 202, "payment_terms_days": 60,
+    })
+check(response.status_code == 400 and not RPC_CALLS,
+      "HANDOFF-4 a Customer without a delivery Location must supply a destination")
+with app.test_client() as client:
+    response = client.post("/batches", headers=AUTH, json={
+        "family_id": 21, "plant_id": 7, "sector_id": 31,
+        "customer_party_id": 202, "delivery_destination": "Pune receiving dock, Gate 2",
+        "payment_terms_days": 60,
+    })
+check(response.status_code == 400 and not RPC_CALLS,
+      "HANDOFF-4c a Customer without a Bill-to Location must supply billing detail")
+with app.test_client() as client:
+    response = client.post("/batches", headers=AUTH, json={
+        "family_id": 21, "plant_id": 7, "sector_id": 31,
+        "customer_party_id": 202, "delivery_destination": "Pune receiving dock, Gate 2",
+        "billing_destination": "Pune accounts office",
+    })
+check(response.status_code == 400 and not RPC_CALLS,
+      "HANDOFF-4a calculating payment terms cannot be omitted")
+with app.test_client() as client:
+    response = client.post("/batches", headers=AUTH, json={
+        "family_id": 21, "plant_id": 7, "sector_id": 31,
+        "customer_party_id": 202, "ship_to_location_id": 102,
+        "billing_destination": "Pune accounts office", "payment_terms_days": 60,
+    })
+check(response.status_code == 422 and ROWS["batches"][-1]["customer_party_id"] == 201,
+      "HANDOFF-4b an approved destination from another Customer cannot be substituted")
+with app.test_client() as client:
+    response = client.post("/batches", headers=AUTH, json={
+        "family_id": 21, "plant_id": 7, "sector_id": 31,
+        "customer_party_id": 202, "delivery_destination": "Pune receiving dock, Gate 2",
+        "bill_to_location_id": 101, "payment_terms_days": 60,
+    })
+check(response.status_code == 422 and ROWS["batches"][-1]["customer_party_id"] == 201,
+      "HANDOFF-4d a Bill-to Location from another Customer cannot be substituted")
+with app.test_client() as client:
+    response = client.post("/batches", headers=AUTH, json={
+        "family_id": 21, "plant_id": 7, "sector_id": 31,
+        "customer_party_id": 202, "delivery_destination": "Pune receiving dock, Gate 2",
+        "billing_destination": "Pune accounts office",
+        "payment_terms_days": 60,
+    })
+missing_location_batch = response.get_json()["batch"]
+check(response.status_code == 201
+      and missing_location_batch["customer_party"]["display_name"] == "Second Prospect"
+      and missing_location_batch["pricing_groups"][0]["payment_terms_days"] == 60
+      and missing_location_batch["pricing_groups"][0]["delivery_groups"][0]["destination_text"]
+          == "Pune receiving dock, Gate 2"
+      and missing_location_batch["pricing_groups"][0]["delivery_groups"][0]["billing_text"]
+          == "Pune accounts office"
+      and missing_location_batch["pricing_groups"][0]["delivery_groups"][0]["ship_to_location_id"] is None,
+      "HANDOFF-5 missing Location keeps exact Prospect and quote-specific delivery text separate")
+with app.test_client() as client:
+    response = client.get(f"/batches/{missing_location_batch['id']}/workspace", headers=AUTH)
+reopened_missing = response.get_json()["batch"]
+check(response.status_code == 200
+      and reopened_missing["customer_party_id"] == 202
+      and reopened_missing["pricing_groups"][0]["delivery_groups"][0]["destination_text"]
+          == "Pune receiving dock, Gate 2",
+      "HANDOFF-6 exact multi-member Prospect and missing delivery detail survive reopen")
+
+with app.test_client() as client:
+    response = client.post("/masters/customer-families/prospects", headers=AUTH, json={
+        "display_name": "Canonical New Prospect", "sector_id": 31,
+    })
+created_prospect = response.get_json()
+check(response.status_code == 201
+      and next(row for row in ROWS["parties"] if row["id"] == created_prospect["party_id"])["status"] == "proposed"
+      and next(row for row in ROWS["customer_families"] if row["id"] == created_prospect["family_id"])["status"] == "proposed",
+      "HANDOFF-PROSPECT-1 canonical route creates a proposed Prospect and proposed new Family")
+with app.test_client() as client:
+    response = client.get("/batches/create-options", headers=AUTH)
+proposed_family = next(family for family in response.get_json()["families"]
+                       if family["id"] == created_prospect["family_id"])
+check(response.status_code == 200
+      and [member["id"] for member in proposed_family["members"]] == [created_prospect["party_id"]]
+      and proposed_family["sector_ids"] == [31],
+      "HANDOFF-PROSPECT-2 new proposed Family and exact proposed Prospect are selectable")
+with app.test_client() as client:
+    response = client.post("/batches", headers=AUTH, json={
+        "family_id": created_prospect["family_id"], "plant_id": 7, "sector_id": 31,
+        "customer_party_id": created_prospect["party_id"],
+        "delivery_destination": "Receiving gate, Pune", "billing_destination": "Accounts, Pune",
+        "payment_terms_days": 60,
+    })
+proposed_batch = response.get_json()["batch"]
+check(response.status_code == 201
+      and proposed_batch["customer_party"]["status"] == "proposed"
+      and proposed_batch["family"]["status"] == "proposed"
+      and proposed_batch["pricing_groups"][0]["delivery_groups"][0]["destination_text"] == "Receiving gate, Pune",
+      "HANDOFF-PROSPECT-3 newly proposed Prospect creates a Batch with typed destinations")
+with app.test_client() as client:
+    response = client.get(f"/batches/{proposed_batch['id']}/workspace", headers=AUTH)
+check(response.status_code == 200
+      and response.get_json()["batch"]["customer_party_id"] == created_prospect["party_id"],
+      "HANDOFF-PROSPECT-4 proposed Prospect identity survives reopen")
+
+# A canonical newly created Prospect must also be able to add several durable
+# rows without being silently recast as an active Customer or Family.
+ROWS["skus"].append({"id": 304, "plant_id": 7, "party_id": created_prospect["party_id"],
+                     "plant_item_code": None, "status": "proposed",
+                     "replacement_sku_id": None, "content_version": 1})
+ROWS["sku_versions"].append({"id": 316, "sku_id": 304, "plant_id": 7, "version_no": 1,
+                             "construction_version_id": 321, "is_price_driving": True,
+                             "length_mm": 400, "width_mm": 300, "height_mm": 250,
+                             "box_type": "RSC", "ups": 1, "item_name": "New carton",
+                             "item_short_name": "Carton", "spec_bs": None,
+                             "spec_bct": None, "spec_ect": None, "approved_at": None})
+with app.test_client() as client:
+    response = client.get(f"/batches/{proposed_batch['id']}/row-options", headers=AUTH)
+check(response.status_code == 200
+      and [sku["id"] for sku in response.get_json()["skus"]] == [304]
+      and response.get_json()["skus"][0]["versions"][0]["item_name"] == "New carton"
+      and response.get_json()["skus"][0]["versions"][0]["approved"] is False
+      and response.get_json()["selection_contract"]
+          == "non_withdrawn_sku_version_with_plant_adopted_construction",
+      "S2-PROSPECT-1 proposed Prospect can select its proposed SKU and adopted version")
+proposed_group_id = proposed_batch["pricing_groups"][0]["id"]
+with app.test_client() as client:
+    first = client.post(f"/batches/{proposed_batch['id']}/rows", headers=AUTH,
+                        json={"pricing_group_id": proposed_group_id, "sku_id": 304,
+                              "sku_version_id": 316, "row_type": "box",
+                              "material_code": "PROSPECT-BOX-A"})
+    second = client.post(f"/batches/{proposed_batch['id']}/rows", headers=AUTH,
+                         json={"pricing_group_id": proposed_group_id, "sku_id": 304,
+                               "sku_version_id": 316, "row_type": "box",
+                               "material_code": "PROSPECT-BOX-B"})
+with app.test_client() as client:
+    reopened = client.get(f"/batches/{proposed_batch['id']}/workspace", headers=AUTH)
+check(first.status_code == 201 and second.status_code == 201
+      and reopened.status_code == 200
+      and {row["material_code"] for row in reopened.get_json()["batch"]["batch_rows"]}
+      == {"PROSPECT-BOX-A", "PROSPECT-BOX-B"},
+      "S2-PROSPECT-2 two durable rows for the exact proposed Prospect survive reopen")
+
+ROWS["parties"].append({"id": 299, "customer_code": None, "display_name": "Inactive Prospect",
+                        "lifecycle_state": "prospect", "status": "inactive"})
+ROWS["party_family_memberships"].append({"party_id": 299, "family_id": 21, "is_current": True})
+with app.test_client() as client:
+    response = client.get("/batches/create-options", headers=AUTH)
+check(all(member["id"] != 299 for family in response.get_json()["families"]
+          for member in family["members"]),
+      "HANDOFF-PROSPECT-5 inactive identities stay out of the picker")
 
 with app.test_client() as client:
     response = client.post(f"/batches/{created_batch_id}/lock/heartbeat", headers=AUTH)
@@ -931,9 +1216,11 @@ row_options = response.get_json()
 check(response.status_code == 200
       and [sku["id"] for sku in row_options["skus"]] == [301]
       and [version["id"] for version in row_options["skus"][0]["versions"]] == [313, 311]
-      and [version["approved"] for version in row_options["skus"][0]["versions"]] == [False, True],
+      and [version["approved"] for version in row_options["skus"][0]["versions"]] == [False, True]
+      and row_options["selection_contract"]
+          == "non_withdrawn_sku_version_with_plant_adopted_construction",
       "U4-ROW-1 row options retain the Batch Family/plant SKU and its ADOPTED versions, unapproved ones "
-      "included and labelled; a withdrawn SKU is never offered (repointed for Amendment 04 D-01)")
+      "included and labelled; a withdrawn SKU is never offered and the contract states that rule")
 check(row_options["skus"][0]["customer"]["customer_code"] == "CUST-201"
       and row_options["skus"][0]["external_references"][0]["reference_value"] == "CUST-BOX-301"
       and row_options["skus"][0]["versions"][0]["construction"]["id"] == 331,

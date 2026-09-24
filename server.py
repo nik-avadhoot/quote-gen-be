@@ -4066,7 +4066,11 @@ def _read_quote_catalogue(client, view):
     }
 
 
-def _read_batch_catalogue(client):
+_OPEN_BATCH_STATUSES = ("working", "sent", "submitted", "approved")
+_CLOSED_BATCH_STATUSES = ("issued_locked", "abandoned", "archived")
+
+
+def _read_batch_catalogue(client, *, scope="open", before_id=None):
     """Build the bounded caller-visible U4 Batch operational catalogue.
 
     `batches_select` remains the authority for which rows exist in this result.
@@ -4074,16 +4078,19 @@ def _read_batch_catalogue(client):
     denied or RLS-hidden supporting record is therefore partial catalogue
     evidence, never a reason to substitute a privileged or inferred identity.
 
-    The 51-row read makes the 50-row display boundary observable. Search and
-    filters are deliberately described as applying to that displayed window;
-    cursor pagination becomes mandatory once the boundary is reached in normal
-    use (recorded in the U4 catalogue increment note).
+    Filter lifecycle on the server before limiting, then page by descending
+    durable Batch ID. A full page can always be continued; Quote History is
+    never mixed into this operational list.
     """
-    batches = (client.table("batches").select(
-        "id, batch_reference, family_id, plant_id, owner_user_id, sector_id, status, "
+    statuses = _OPEN_BATCH_STATUSES if scope == "open" else _CLOSED_BATCH_STATUSES
+    query = (client.table("batches").select(
+        "id, batch_reference, family_id, customer_party_id, plant_id, owner_user_id, sector_id, status, "
         "content_version, pricing_date, pricing_basis_release_id, "
         "pricing_basis_is_deliberate, created_at, created_by"
-    ).order("created_at", desc=True).limit(51).execute()).data or []
+    ).in_("status", statuses))
+    if before_id is not None:
+        query = query.lt("id", before_id)
+    batches = (query.order("id", desc=True).limit(51).execute()).data or []
     results_limited = len(batches) > 50
     batches = batches[:50]
 
@@ -4157,6 +4164,10 @@ def _read_batch_catalogue(client):
         "rows": rows,
         "display_limit": 50,
         "results_limited": results_limited,
+        "scope": scope,
+        "open_statuses": list(_OPEN_BATCH_STATUSES),
+        "closed_statuses": list(_CLOSED_BATCH_STATUSES),
+        "next_cursor": batches[-1]["id"] if results_limited else None,
         "filter_scope": "displayed_newest_first_window",
         "details_partial": bool(partial or denied),
         "partial_sections": sorted(set(partial)),
@@ -4172,7 +4183,7 @@ def _read_batch_catalogue(client):
 def _read_batch_workspace(client, batch_id):
     """Assemble the caller-visible, read-only durable Batch workspace."""
     batch_rows = (client.table("batches").select(
-        "id, batch_reference, family_id, plant_id, owner_user_id, sector_id, status, "
+        "id, batch_reference, family_id, customer_party_id, plant_id, owner_user_id, sector_id, status, "
         "price_validity_from, price_validity_to, content_version, created_at, created_by, "
         "pricing_date, pricing_basis_release_id, pricing_basis_is_deliberate"
     ).eq("id", batch_id).limit(1).execute()).data or []
@@ -4197,6 +4208,10 @@ def _read_batch_workspace(client, batch_id):
     batch["family"] = one(
         "customer_family", "customer_families",
         "id, group_customer_code, name, status, content_version", batch["family_id"])
+    batch["customer_party"] = one(
+        "customer_party", "parties",
+        "id, customer_code, display_name, lifecycle_state, status",
+        batch.get("customer_party_id"))
     batch["owner"] = one(
         "owner", "app_users", "id, display_name, status", batch["owner_user_id"])
     batch["sector"] = one(
@@ -4273,7 +4288,7 @@ def _read_batch_workspace(client, batch_id):
     deliveries, deliveries_denied = _optional_caller_rows(
         client.table("delivery_groups").select(
             "id, pricing_group_id, batch_id, label, bill_to_location_id, "
-            "ship_to_location_id, route_notes, status"
+            "ship_to_location_id, destination_text, billing_text, route_notes, status"
         ).eq("batch_id", batch_id))
     if deliveries_denied:
         denied.append("delivery_groups")
@@ -4413,9 +4428,12 @@ def _read_batch_row_options(client, batch_id):
         parties = (client.table("parties")
                    .select("id, customer_code, display_name, lifecycle_state, status")
                    .in_("id", sorted(family_party_ids))
-                   .eq("status", "active").execute()).data or []
+                   .in_("status", ["proposed", "active"]).execute()).data or []
     party_by_id = {party["id"]: party for party in parties
-                   if party.get("id") in family_party_ids}
+                   if party.get("id") in family_party_ids and
+                   ((party.get("lifecycle_state") == "customer" and party.get("status") == "active")
+                    or (party.get("lifecycle_state") == "prospect"
+                        and party.get("status") in ("proposed", "active")))}
 
     skus = (client.table("skus")
             .select("id, plant_id, party_id, plant_item_code, status, replacement_sku_id, content_version")
@@ -4426,7 +4444,8 @@ def _read_batch_row_options(client, batch_id):
 
     versions = (client.table("sku_versions").select(
         "id, sku_id, plant_id, version_no, construction_version_id, is_price_driving, "
-        "length_mm, width_mm, height_mm, box_type, ups, spec_bs, spec_bct, spec_ect, approved_at"
+        "length_mm, width_mm, height_mm, box_type, ups, spec_bs, spec_bct, spec_ect, "
+        "item_name, item_short_name, approved_at"
     ).eq("plant_id", batch["plant_id"]).execute()).data or []
     # Amendment 04 D-01: an unapproved version is quotable too; it is labelled, never hidden.
     versions = [{**version, "approved": version.get("approved_at") is not None} for version in versions
@@ -4470,6 +4489,14 @@ def _read_batch_row_options(client, batch_id):
         if reference.get("sku_id") in sku_ids:
             references_by_sku.setdefault(reference["sku_id"], []).append(reference)
 
+    recent_use = {}
+    if sku_ids:
+        use_rows, _ = _optional_caller_rows(client.table("batch_rows")
+            .select("sku_id, created_at").in_("sku_id", sorted(sku_ids))
+            .eq("status", "active").order("created_at", desc=True).limit(500))
+        for row in use_rows:
+            recent_use.setdefault(row.get("sku_id"), row.get("created_at"))
+
     versions_by_sku = {}
     for version in versions:
         construction_version = construction_version_by_id.get(version["construction_version_id"])
@@ -4497,6 +4524,7 @@ def _read_batch_row_options(client, batch_id):
                 references_by_sku.get(sku["id"], []),
                 key=lambda reference: (reference.get("reference_kind") or "",
                                        reference.get("reference_value") or "")),
+            "last_used_at": recent_use.get(sku["id"]),
             "versions": sku_versions,
         })
     out.sort(key=lambda sku: (
@@ -4504,7 +4532,14 @@ def _read_batch_row_options(client, batch_id):
         sku.get("plant_item_code") or "",
         sku.get("id") or 0,
     ))
-    return {"batch": batch, "skus": out}
+    construction_options = sorted(({
+        "id": version["id"], "construction_id": version.get("construction_id"),
+        "version_no": version.get("version_no"),
+        "construction": construction_by_id.get(version.get("construction_id")),
+    } for version in construction_versions if version["id"] in adopted_version_ids),
+        key=lambda item: ((item["construction"] or {}).get("construction_code") or "",
+                          item.get("version_no") or 0))
+    return {"batch": batch, "skus": out, "construction_options": construction_options}
 
 
 def _decorate_workspace_for_caller(batch):
@@ -4624,7 +4659,7 @@ def _batch_row_input(client, batch_id, data, existing_sku_id=None, existing_over
                     if item["id"] == sku_version_id), None)
     if sku is None or version is None:
         return None, _invalid_input(
-            "The selected SKU Version is not an approved, plant-adopted option for this Batch Family.")
+            "The selected SKU Version is not a non-withdrawn, plant-adopted option for this Batch Family.")
 
     groups = (client.table("pricing_groups").select("id, batch_id, status")
               .eq("id", pricing_group_id).eq("batch_id", batch_id).limit(1).execute()).data or []
@@ -4692,13 +4727,21 @@ def get_batch_create_options():
     client = get_supabase_for_caller(g.access_token)
     families = (client.table("customer_families")
                 .select("id, group_customer_code, name, status")
-                .eq("status", "active").execute()).data or []
+                .in_("status", ["proposed", "active"]).execute()).data or []
     memberships = (client.table("party_family_memberships")
                    .select("party_id, family_id, is_current")
                    .eq("is_current", True).execute()).data or []
     parties = (client.table("parties")
                .select("id, customer_code, display_name, lifecycle_state, status")
-               .eq("status", "active").execute()).data or []
+               .in_("status", ["proposed", "active"]).execute()).data or []
+    parties = [party for party in parties if
+               (party.get("lifecycle_state") == "customer" and party.get("status") == "active")
+               or (party.get("lifecycle_state") == "prospect"
+                   and party.get("status") in ("proposed", "active"))]
+    locations, locations_denied = _optional_caller_rows(
+        client.table("customer_locations").select(
+            "id, party_id, location_code, bill_to_eligible, ship_to_eligible, status"
+        ).eq("status", "active"))
     plants = (client.table("plants")
               .select("id, plant_code, name, status")
               .eq("status", "active").execute()).data or []
@@ -4715,6 +4758,19 @@ def get_batch_create_options():
     plants = [plant for plant in plants if plant.get("plant_code") in maker_codes]
 
     party_by_id = {str(party["id"]): party for party in parties}
+    locations_by_party = {}
+    for location in locations:
+        if str(location.get("party_id")) in party_by_id:
+            locations_by_party.setdefault(str(location["party_id"]), []).append(location)
+    for party in parties:
+        party["delivery_locations"] = sorted(
+            (location for location in locations_by_party.get(str(party["id"]), [])
+             if location.get("ship_to_eligible")),
+            key=lambda location: location.get("location_code") or str(location.get("id")))
+        party["billing_locations"] = sorted(
+            (location for location in locations_by_party.get(str(party["id"]), [])
+             if location.get("bill_to_eligible")),
+            key=lambda location: location.get("location_code") or str(location.get("id")))
     members_by_family = {}
     for membership in memberships:
         party = party_by_id.get(str(membership.get("party_id")))
@@ -4743,6 +4799,7 @@ def get_batch_create_options():
         "sectors": sectors,
         "sectors_denied": sectors_denied,
         "family_sectors_denied": family_sectors_denied,
+        "locations_denied": locations_denied,
         "mutation": "create_batch_rpc_only",
     })
 
@@ -4750,7 +4807,7 @@ def get_batch_create_options():
 @app.route("/batches", methods=["POST"])
 @require_auth
 def create_batch_route():
-    """Create and read back one governed Batch through public.create_batch."""
+    """Create and read back a complete customer handoff in one governed RPC."""
     data = request.get_json(force=True) or {}
     family_id = _int_field(data, "family_id")
     plant_id = _int_field(data, "plant_id")
@@ -4761,18 +4818,54 @@ def create_batch_route():
     sector_id = _int_field(data, "sector_id")
     if sector_id is None or sector_id < 1:
         return _invalid_input("sector_id is required")
+    party_id = _int_field(data, "customer_party_id")
+    if party_id is None or party_id < 1:
+        return _invalid_input("customer_party_id is required")
+    ship_to_id = _int_field(data, "ship_to_location_id")
+    if data.get("ship_to_location_id") not in (None, "") and (ship_to_id is None or ship_to_id < 1):
+        return _invalid_input("ship_to_location_id must be a valid Location")
+    bill_to_id = _int_field(data, "bill_to_location_id")
+    if data.get("bill_to_location_id") not in (None, "") and (bill_to_id is None or bill_to_id < 1):
+        return _invalid_input("bill_to_location_id must be a valid Location")
+    raw_destination = data.get("delivery_destination")
+    if raw_destination is not None and not isinstance(raw_destination, str):
+        return _invalid_input("delivery_destination must be text")
+    destination_text = (raw_destination or "").strip()
+    if not ship_to_id and not destination_text:
+        return _invalid_input("delivery_destination is required when no active Ship-to Location is selected")
+    if len(destination_text) > 500:
+        return _invalid_input("delivery_destination must be 500 characters or fewer")
+    raw_billing = data.get("billing_destination")
+    if raw_billing is not None and not isinstance(raw_billing, str):
+        return _invalid_input("billing_destination must be text")
+    billing_text = (raw_billing or "").strip()
+    if not bill_to_id and not billing_text:
+        return _invalid_input("billing_destination is required when no active Bill-to Location is selected")
+    if len(billing_text) > 500:
+        return _invalid_input("billing_destination must be 500 characters or fewer")
+    payment_days = _int_field(data, "payment_terms_days")
+    if payment_days not in (30, 45, 60, 90):
+        return _invalid_input("payment_terms_days must be 30, 45, 60 or 90")
+    if "read_party_master" not in (g.caller.get("group_capabilities") or []):
+        return _error("CAPABILITY_REQUIRED")
 
     client = get_supabase_for_caller(g.access_token)
-    result, err = _rpc_call(client, "create_batch", {
+    result, err = _rpc_call(client, "create_batch_handoff", {
         "p_family": family_id,
         "p_plant": plant_id,
         "p_sector": sector_id,
+        "p_party": party_id,
+        "p_ship_to": ship_to_id,
+        "p_bill_to": bill_to_id,
+        "p_destination_text": destination_text or None,
+        "p_billing_text": billing_text or None,
+        "p_payment_terms_days": payment_days,
     })
     if err:
         return err
     batch_id = _rpc_scalar_id(result)
     if batch_id is None:
-        app.logger.error("create_batch returned an invalid scalar identity")
+        app.logger.error("create_batch_handoff returned an invalid scalar identity")
         return _error("INTERNAL_ERROR")
     return _workspace_write_response(client, batch_id, "create_batch", status=201)
 
@@ -4885,9 +4978,18 @@ def get_batch_workspace(batch_id):
 @app.route("/batches/catalogue", methods=["GET"])
 @require_auth
 def get_batch_catalogue():
-    """List the bounded caller-visible durable Batch operational window."""
+    """List caller-visible unfinished or terminal Batches, paged server-side."""
+    scope = request.args.get("scope", "open")
+    if scope not in ("open", "closed"):
+        return _invalid_input("scope must be open or closed")
+    before_id = request.args.get("before_id")
+    if before_id is not None:
+        if not before_id.isdigit() or int(before_id) < 1:
+            return _invalid_input("before_id must be a positive Batch ID")
+        before_id = int(before_id)
     try:
-        catalogue = _read_batch_catalogue(get_supabase_for_caller(g.access_token))
+        catalogue = _read_batch_catalogue(get_supabase_for_caller(g.access_token),
+                                          scope=scope, before_id=before_id)
     except APIError as exc:
         if exc.code == "42501":
             return _error("CAPABILITY_REQUIRED")
@@ -4994,7 +5096,7 @@ def get_batch_row_options(batch_id):
         return _error("RECORD_NOT_FOUND")
     return jsonify({
         **options,
-        "selection_contract": "approved_sku_version_with_plant_adopted_construction",
+        "selection_contract": "non_withdrawn_sku_version_with_plant_adopted_construction",
         "mutations": "caller_token_rls_only",
     })
 
