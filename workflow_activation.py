@@ -35,7 +35,8 @@ def quote_revision_actions(caller, batch, revision, is_collaborator=False):
         "approve": _state(checker and revision_status == "submitted" and batch_status == "submitted", unavailable),
         "return": _state(checker and revision_status == "submitted" and batch_status == "submitted", unavailable),
         "withdraw": _state((checker or maker) and revision_status == "approved" and batch_status == "approved", unavailable),
-        "issue": _state(maker and revision_status == "approved" and batch_status == "approved", unavailable),
+        "share": _state(maker and revision_status == "approved" and batch_status == "approved"
+                        and standing not in ("superseded", "voided"), unavailable),
         "create_revision": _state(
             maker and revision_status == "issued" and standing in ("current", "voided")
             and batch_status == "issued_locked", unavailable),
@@ -58,5 +59,5 @@ def batch_actions(caller, batch):
         "submit": _state(False, "open_quote_candidate"),
         "approve": _state(False, "open_quote_candidate"),
         "return": _state(False, "open_quote_candidate"),
-        "issue": _state(False, "open_quote_candidate"),
+        "share": _state(False, "open_quote_candidate"),
     }

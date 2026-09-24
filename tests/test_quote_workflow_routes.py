@@ -112,22 +112,18 @@ check(response.status_code == 200 and CALLS[-1][1] == "withdraw_quote_revision",
 
 CALLS.clear()
 with app.test_client() as client:
-    response = client.post("/quotes/revisions/601/issue", json={
-        "quote_date": "2026-09-17", "offer_validity_to": "2026-10-17"}, headers=AUTH)
-check(response.status_code == 200 and CALLS[-1][1] == "issue_quote_revision"
-      and CALLS[-1][2]["p_addressee_name"] is None
-      and CALLS[-1][2]["p_addressee_details"] is None,
-      "WD-HTTP-7 Issue consumes the recipient already frozen at Send")
+    response = client.post("/quotes/revisions/601/share", json={
+        "channel": "Email", "shared_on": "2026-09-17", "external_reference": "MAIL-22"}, headers=AUTH)
+check(response.status_code == 200 and CALLS[-1][1] == "share_quote_revision"
+      and CALLS[-1][2] == {"p_revision": 601, "p_channel": "Email",
+                            "p_shared_on": "2026-09-17", "p_external_reference": "MAIL-22"},
+      "WD-HTTP-7 Share forwards only manual evidence; recipient and actor stay server-derived")
 
-RPC_ERROR = server.APIError({"code": "PT422", "message": "recipient_identity_mismatch",
-                             "details": None, "hint": None})
 with app.test_client() as client:
-    response = client.post("/quotes/revisions/601/issue", json={
-        "addressee_name": "Another Customer", "addressee_details": {"party_id": 999999},
-        "quote_date": "2026-09-17", "offer_validity_to": "2026-10-17"}, headers=AUTH)
-check(response.status_code == 400 and response.get_json()["error_code"] == "INVALID_INPUT",
-      "WD-HTTP-7a Issue surfaces the governed refusal when supplied recipient fields do not match")
-RPC_ERROR = None
+    response = client.post("/quotes/revisions/601/share", json={
+        "channel": "Guessed recipient", "shared_on": "2026-09-17"}, headers=AUTH)
+check(response.status_code == 400 and not any(call[1] == "share_quote_revision" and call[2].get("p_channel") == "Guessed recipient" for call in CALLS),
+      "WD-HTTP-7a an unsupported channel is refused before any database write")
 
 RPC_DATA = 602
 CALLS.clear()

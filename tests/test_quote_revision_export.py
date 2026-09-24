@@ -35,7 +35,7 @@ SNAPSHOT = {
     "freight_set_version_id": 11,
     "effective_inputs": {
         "entered": {
-            "length_mm": 675, "width_mm": 450, "height_mm": 282, "ply": 5, "ups": 2,
+            "material_code": "36512", "length_mm": 675, "width_mm": 450, "height_mm": 282, "ply": 5, "ups": 2,
             "box_type": "RSC", "flute_f1": "B", "flute_f2": "C", "item_name": "DTY 5PLY 36512",
             "layers": {
                 "TOP": {"code": "35GY", "gsm": 170}, "F1": {"code": "16", "gsm": 120},
@@ -45,6 +45,7 @@ SNAPSHOT = {
             "add_ons": {"printing": 2.5, "stitching": 0, "coating": 0, "handling": 0,
                         "moq_charge": 0, "packing": 0, "other": 0, "unloading": 0},
         },
+        "provenance": {"row_type": "Box"},
         "resolved": {
             "waste": {"value": 5}, "conv": {"value": 7}, "margin": {"value": 8},
             "interest": {"value": 1.0}, "freight": {"value": 1.25},

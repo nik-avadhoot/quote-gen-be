@@ -33,7 +33,7 @@ import secrets
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from copy import copy
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 
@@ -236,13 +236,16 @@ def export_xlsx():
     fname      = data.get("filename", "AvadhootPacks_Quote.xlsx")
     # Fix 9: read meta fields sent by the frontend
     meta = {
-        "quoteRef":      data.get("quoteRef",      ""),
+        # Local/export scratch output is never an official Quote.  In
+        # particular, ignore a stale browser's historical quoteRef payload.
+        "quoteRef":      "",
         "makerName":     data.get("makerName",     ""),
         "quoteDate":     data.get("quoteDate",     ""),
         "effectiveFrom": data.get("effectiveFrom", ""),
         "effectiveTo":   data.get("effectiveTo",   ""),
         "beta":          data.get("beta") is True,
         "marginPP":      data.get("marginPP"),
+        "quickCalculation": True,
     }
     buf = _fill_master_workbook(items, rates, freight, meta)
     if isinstance(buf, tuple):          # an error response, not a workbook
@@ -274,6 +277,7 @@ def _fill_master_workbook(items, rates, freight, meta):
     effective_from  = meta.get("effectiveFrom") or ""
     effective_to    = meta.get("effectiveTo")   or ""
     beta_export     = meta.get("beta") is True
+    quick_calculation = meta.get("quickCalculation") is True
     data            = {"marginPP": meta.get("marginPP")}
 
     wb     = openpyxl.load_workbook(TEMPLATE_PATH)
@@ -406,7 +410,9 @@ def _fill_master_workbook(items, rates, freight, meta):
     except ValueError:
         ws_cbb["B4"] = datetime.now()
     mat_codes = ", ".join(i["spec"].get("material_code", "") for i in items if i["spec"].get("material_code"))
-    reference_line = (f"{quote_ref} | {mat_codes}") if quote_ref else mat_codes
+    reference_line = (f"QUICK CALCULATION — NOT A QUOTE | {mat_codes}"
+                      if quick_calculation else
+                      (f"{quote_ref} | {mat_codes}" if quote_ref else mat_codes))
     ws_cbb["D4"] = f"BETA | {reference_line}" if beta_export else reference_line
 
     # Rate parameters
@@ -3909,6 +3915,10 @@ def _read_quote_workspace(client, quote_reference=None, revision_id=None, batch_
         "customer_outcomes", "customer_outcome_events",
         "id, revision_id, outcome, acceptance_date, acceptance_reference, note, recorded_by, occurred_at",
         "revision_id", revision_ids)
+    share_events = many_for(
+        "share_events", "quote_share_events",
+        "id, revision_id, channel, shared_on, external_reference, shared_by, occurred_at",
+        "revision_id", revision_ids)
 
     snapshots_by_id = {str(row["id"]): row for row in snapshots}
     links_by_item = {}
@@ -3931,6 +3941,7 @@ def _read_quote_workspace(client, quote_reference=None, revision_id=None, batch_
             + [snapshot.get("calculated_by") for snapshot in snapshots]
             + [event.get("actor_user_id") for event in workflow_events]
             + [event.get("recorded_by") for event in outcome_events]
+            + [event.get("shared_by") for event in share_events]
         ) if actor_id is not None
     }
     actors = {}
@@ -3947,6 +3958,10 @@ def _read_quote_workspace(client, quote_reference=None, revision_id=None, batch_
     for event in outcome_events:
         event["recorded_by_actor"] = actors.get(str(event.get("recorded_by")))
         outcomes_by_revision.setdefault(str(event["revision_id"]), []).append(event)
+    shares_by_revision = {}
+    for event in share_events:
+        event["shared_by_actor"] = actors.get(str(event.get("shared_by")))
+        shares_by_revision.setdefault(str(event["revision_id"]), []).append(event)
 
     for revision in revisions:
         revision["created_by_actor"] = actors.get(str(revision.get("created_by")))
@@ -3963,6 +3978,9 @@ def _read_quote_workspace(client, quote_reference=None, revision_id=None, batch_
             key=lambda event: (event.get("occurred_at") or "", event.get("id")))
         revision["customer_outcomes"] = sorted(
             outcomes_by_revision.get(str(revision["id"]), []),
+            key=lambda event: (event.get("occurred_at") or "", event.get("id")))
+        revision["share_events"] = sorted(
+            shares_by_revision.get(str(revision["id"]), []),
             key=lambda event: (event.get("occurred_at") or "", event.get("id")))
         revision["actions"] = quote_revision_actions(
             g.caller, family.get("batch"), revision, is_collaborator)
@@ -4071,7 +4089,7 @@ def _read_quote_catalogue(client, view):
             g.caller, {**(batch or {}), "plant": plant}, row)
         rows.append(row)
 
-    action_names = ("approve", "return", "withdraw", "issue", "create_revision")
+    action_names = ("approve", "return", "withdraw", "share", "create_revision")
 
     return {
         "view": view,
@@ -4181,7 +4199,7 @@ def _read_batch_catalogue(client, *, scope="open", before_id=None):
         row["actions"] = batch_actions(g.caller, row)
         rows.append(row)
 
-    action_names = ("calculate", "send", "submit", "approve", "return", "issue")
+    action_names = ("calculate", "send", "submit", "approve", "return", "share")
 
     return {
         "rows": rows,
@@ -5768,27 +5786,41 @@ def withdraw_quote_revision_route(revision_id):
         "p_revision": revision_id, "p_reason": reason.strip()})
 
 
-@app.route("/quotes/revisions/<int:revision_id>/issue", methods=["POST"])
+_SHARE_CHANNELS = (
+    "Email", "WhatsApp", "Printed/hand-delivered", "Customer portal", "Other",
+)
+
+
+@app.route("/quotes/revisions/<int:revision_id>/share", methods=["POST"])
 @require_auth
-def issue_quote_revision_route(revision_id):
+def share_quote_revision_route(revision_id):
+    """Atomically record manual customer sharing and transition to issued.
+
+    Recipient identity is intentionally absent from this request: the exact
+    Customer/Prospect was frozen at Send and is validated again in the RPC.
+    """
     data = request.get_json(silent=True) or {}
-    name = data.get("addressee_name")
-    details = data.get("addressee_details")
-    quote_date = data.get("quote_date")
-    validity = data.get("offer_validity_to")
-    if name is not None and not isinstance(name, str):
-        return _invalid_input("addressee_name must be text or null")
-    if details is not None and not isinstance(details, dict):
-        return _invalid_input("addressee_details must be an object or null")
-    if any(value is not None and not isinstance(value, str)
-           for value in (quote_date, validity)):
-        return _invalid_input("quote_date and offer_validity_to must be ISO dates or null")
-    return _quote_workflow_rpc("issue_quote_revision", {
+    channel = data.get("channel")
+    shared_on = data.get("shared_on")
+    external_reference = data.get("external_reference")
+    if not isinstance(channel, str) or channel.strip() not in _SHARE_CHANNELS:
+        return _invalid_input("channel must be one of: " + ", ".join(_SHARE_CHANNELS))
+    if not isinstance(shared_on, str):
+        return _invalid_input("shared_on must be an ISO date")
+    try:
+        parsed_date = date.fromisoformat(shared_on)
+    except ValueError:
+        return _invalid_input("shared_on must be an ISO date")
+    if not isinstance(external_reference, (str, type(None))):
+        return _invalid_input("external_reference must be text or blank")
+    reference = external_reference.strip() if isinstance(external_reference, str) else None
+    if reference and len(reference) > 200:
+        return _invalid_input("external_reference must be 200 characters or fewer")
+    return _quote_workflow_rpc("share_quote_revision", {
         "p_revision": revision_id,
-        "p_addressee_name": name.strip() if isinstance(name, str) else None,
-        "p_addressee_details": details,
-        "p_quote_date": quote_date or None,
-        "p_offer_validity_to": validity or None,
+        "p_channel": channel.strip(),
+        "p_shared_on": parsed_date.isoformat(),
+        "p_external_reference": reference or None,
     })
 
 
@@ -5806,7 +5838,7 @@ def create_quote_revision_route(revision_id):
 _PP_ROW_TYPES = ("Plate", "Part-L", "Part-W")
 
 
-def _spec_from_snapshot(snapshot, row):
+def _spec_from_snapshot(snapshot):
     """Rebuild one export row from FROZEN evidence only.
 
     Every number comes from the snapshot the Calculate produced: `entered` holds
@@ -5819,6 +5851,7 @@ def _spec_from_snapshot(snapshot, row):
     inputs   = snapshot.get("effective_inputs") or {}
     entered  = inputs.get("entered") or {}
     resolved = inputs.get("resolved") or {}
+    provenance = inputs.get("provenance") or {}
     add_ons  = entered.get("add_ons") or {}
 
     def value_of(key):
@@ -5830,12 +5863,12 @@ def _spec_from_snapshot(snapshot, row):
         layer = (entered.get("layers") or {}).get(key) or {}
         layers[key] = {"code": layer.get("code") or "", "gsm": layer.get("gsm") or ""}
 
-    row_type = (row or {}).get("row_type") or "Box"
+    row_type = provenance.get("row_type") or "Box"
     is_pp = row_type in _PP_ROW_TYPES
     waste, conv = value_of("waste"), value_of("conv")
     spec = {
         "rowType": row_type,
-        "material_code": (row or {}).get("material_code") or "",
+        "material_code": entered.get("material_code") or "",
         "product": entered.get("item_name") or "",
         "L": entered.get("length_mm"), "W": entered.get("width_mm"), "H": entered.get("height_mm"),
         "ply": entered.get("ply"), "ups": entered.get("ups"), "boxType": entered.get("box_type"),
@@ -5962,12 +5995,6 @@ def export_quote_revision_route(revision_id):
 
     items, snapshots_missing = [], 0
     batch = quote.get("batch") or {}
-    rows_by_lineage = {}
-    if batch.get("id") is not None:
-        rows, _denied = _optional_caller_rows(client.table("batch_rows").select(
-            "lineage_id, material_code, row_type").eq("batch_id", batch["id"]))
-        rows_by_lineage = {str(row.get("lineage_id")): row for row in rows}
-
     release_id = freight_set_version_id = None
     for item in revision.get("items") or []:
         snapshot = item.get("calculation_snapshot")
@@ -5976,8 +6003,7 @@ def export_quote_revision_route(revision_id):
             continue
         release_id = release_id or snapshot.get("pricing_basis_release_id")
         freight_set_version_id = freight_set_version_id or snapshot.get("freight_set_version_id")
-        spec = _spec_from_snapshot(
-            snapshot, rows_by_lineage.get(str(item.get("batch_row_lineage_id"))))
+        spec = _spec_from_snapshot(snapshot)
         spec.setdefault("client", recipient_name.strip())
         spec.setdefault("plant", (batch.get("plant") or {}).get("name") or "")
         items.append({"spec": spec})

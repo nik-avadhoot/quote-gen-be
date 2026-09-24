@@ -222,7 +222,7 @@ check(all(not action["enabled"] for action in quote["actions"].values())
       "U5-BE-8 an ineligible Quote reports real state-driven action reasons")
 check(set(quote["actions"]) == {
           "calculate", "send", "submit", "approve", "return", "withdraw",
-          "issue", "create_revision", "amend", "reprice",
+          "share", "create_revision", "amend", "reprice",
       },
       "U5-BE-8a the read contract names the complete accepted pending workflow")
 check(current["items"][0]["pricing_group_id"] == 81
@@ -285,7 +285,7 @@ check(inbox["rows"][0]["item_count"] == 1
       "U5-BE-16 inbox summary preserves caller-visible item and Maker evidence")
 check(inbox["actions"]["approve"]["enabled"]
       and inbox["actions"]["return"]["enabled"]
-      and not inbox["actions"]["issue"]["enabled"],
+      and not inbox["actions"]["share"]["enabled"],
       "U5-BE-17 the Checker inbox activates only eligible mounted review actions")
 check(CALLS and all(call[0] == "tok-u5" for call in CALLS),
       "U5-BE-18 every inbox and supporting read carries the caller token")
