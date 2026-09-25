@@ -5106,12 +5106,25 @@ def _evidence(value):
     return value if value is not None else "unavailable"
 
 
+# No frozen descriptive product text (item name, material code) is captured
+# anywhere in effective_inputs today - only internal ids (sku_id,
+# sku_version_id). Rather than resolve a name from CURRENT SKU master data
+# (which the SD explicitly forbids for an old Quote), every comparison row
+# says so plainly and keeps the frozen id as secondary evidence.
+_DESCRIPTIVE_IDENTITY_UNAVAILABLE = "descriptive_identity_unavailable_only_frozen_id"
+
+
 def _revision_item_facts(item):
     """Pull the D-5 comparison facts out of one frozen Quote item.
 
     Reads only immutable calculation_snapshot evidence (typed columns plus
     the frozen effective_inputs produced by app_private.build_effective_inputs
-    at calculate time) - never current Batch/SKU/master data.
+    at calculate time) - never current Batch/SKU/master data. Field names are
+    literal about what each frozen value actually is: `final_rate` is the
+    quoted per-piece rate (the genuine D-5 lead fact); `total_cost` is a
+    per-piece cost-before-margin figure, not a customer order line total -
+    this schema captures no genuine frozen ORDER quantity or line total, so
+    none is fabricated here.
     """
     snapshot = (item or {}).get("calculation_snapshot") or {}
     inputs = snapshot.get("effective_inputs") or {}
@@ -5121,9 +5134,10 @@ def _revision_item_facts(item):
         "sku_id": provenance.get("sku_id"),
         "sku_version_id": provenance.get("sku_version_id"),
         "construction_version_id": provenance.get("construction_version_id"),
+        "descriptive_identity": _DESCRIPTIVE_IDENTITY_UNAVAILABLE,
         "rate": snapshot.get("final_rate"),
-        "line_total": snapshot.get("total_cost"),
-        "quantity": entered.get("volume"),
+        "cost_before_margin_per_pc": snapshot.get("total_cost"),
+        "monthly_volume": entered.get("volume"),
         "sales_moq": entered.get("sales_moq"),
         "margin_pct": snapshot.get("effective_margin_pct"),
         "input_disclosure": {
@@ -5131,6 +5145,7 @@ def _revision_item_facts(item):
             "waste_source": snapshot.get("waste_source"),
             "conv_rate": snapshot.get("effective_conv_rate"),
             "conv_source": snapshot.get("conv_source"),
+            "sku_version_id": provenance.get("sku_version_id"),
             "construction_version_id": provenance.get("construction_version_id"),
             "construction_version_origin": provenance.get("construction_version_origin"),
             "length_mm": entered.get("length_mm"),
@@ -5160,28 +5175,88 @@ def _numeric_movement(previous, current):
     return current - previous
 
 
-def _build_revision_comparison(current_revision, prior_revision):
-    """S5 Slice B: one pure, price-first comparison keyed by frozen row lineage.
+def _index_items_by_lineage(revision):
+    return {item.get("batch_row_lineage_id"): item for item in (revision or {}).get("items", [])}
 
-    Matches items by batch_row_lineage_id (never by label). A lineage present
-    on only one side is explicitly classified added/removed, never guessed.
-    Every fact is read from frozen evidence; nothing here can be altered by
-    current Batch, Customer, SKU or master data.
+
+def _index_items_by_sku(revision):
+    index = {}
+    for item in (revision or {}).get("items", []):
+        sku_id = _revision_item_facts(item).get("sku_id")
+        index.setdefault(sku_id, []).append(item)
+    return index
+
+
+def _match_revision_items(current_revision, prior_revision):
+    """Pair frozen items across two revisions with a deterministic rule.
+
+    Same Quote-family chain (an ordinary revision-to-revision comparison,
+    e.g. against source_revision_id): match by the immutable
+    batch_row_lineage_id, which is stable only within one Batch/revision
+    chain.
+
+    Cross-Batch (a Slice A "Last Quote" comparison against a different
+    Family's revision): batch_row_lineage_id values are unrelated between
+    Batches and would misclassify every row as added/removed. Match instead
+    by frozen SKU identity, and ONLY when it produces an unambiguous
+    one-to-one pairing. A SKU id repeated on either side is never guessed at
+    - both occurrences are reported explicitly as added/removed with an
+    "ambiguous_sku_duplicate" match basis, and the SKU id is surfaced so the
+    caller can disclose the limitation.
+
+    Returns (pairs, ambiguous_sku_ids) where each pair is
+    (key, prior_item_or_None, current_item_or_None, match_basis).
     """
-    def index_items(revision):
-        return {item.get("batch_row_lineage_id"): item
-                for item in (revision or {}).get("items", [])}
+    same_chain = (current_revision or {}).get("family_id") is not None and (
+        (current_revision or {}).get("family_id") == (prior_revision or {}).get("family_id"))
 
-    current_items = index_items(current_revision)
-    prior_items = index_items(prior_revision)
-    lineage_ids = sorted(
-        set(current_items) | set(prior_items),
-        key=lambda value: (value is None, value))
+    if same_chain:
+        current_by_key = _index_items_by_lineage(current_revision)
+        prior_by_key = _index_items_by_lineage(prior_revision)
+        keys = sorted(set(current_by_key) | set(prior_by_key), key=lambda value: (value is None, value))
+        return [(key, prior_by_key.get(key), current_by_key.get(key), "lineage") for key in keys], []
+
+    current_by_sku = _index_items_by_sku(current_revision)
+    prior_by_sku = _index_items_by_sku(prior_revision)
+    sku_ids = sorted(set(current_by_sku) | set(prior_by_sku), key=lambda value: (value is None, value))
+    pairs = []
+    ambiguous_sku_ids = []
+    for sku_id in sku_ids:
+        current_list = current_by_sku.get(sku_id, [])
+        prior_list = prior_by_sku.get(sku_id, [])
+        if sku_id is not None and len(current_list) <= 1 and len(prior_list) <= 1:
+            current_item = current_list[0] if current_list else None
+            prior_item = prior_list[0] if prior_list else None
+            key = (current_item or prior_item or {}).get("batch_row_lineage_id")
+            pairs.append((key, prior_item, current_item, "sku_identity"))
+        else:
+            # sku_id is None (identity itself unavailable) or duplicated on a
+            # side: never invent a pairing, report every occurrence as its
+            # own added/removed row instead.
+            if sku_id is not None and (len(current_list) > 1 or len(prior_list) > 1):
+                ambiguous_sku_ids.append(sku_id)
+            for item in prior_list:
+                pairs.append((item.get("batch_row_lineage_id"), item, None, "ambiguous_sku_duplicate"
+                              if sku_id is not None else "sku_identity_unavailable"))
+            for item in current_list:
+                pairs.append((item.get("batch_row_lineage_id"), None, item, "ambiguous_sku_duplicate"
+                              if sku_id is not None else "sku_identity_unavailable"))
+    return pairs, ambiguous_sku_ids
+
+
+def _build_revision_comparison(current_revision, prior_revision):
+    """S5 Slice B: one pure, price-first comparison of frozen evidence.
+
+    Every fact is read from frozen evidence; nothing here can be altered by
+    current Batch, Customer, SKU or master data. This schema has no genuine
+    frozen customer order quantity or line total, so none is fabricated -
+    "Monthly volume" and "Cost before margin / pc" are named for what they
+    actually are, and the quoted rate leads (D-5).
+    """
+    pairs, ambiguous_sku_ids = _match_revision_items(current_revision, prior_revision)
 
     rows = []
-    for lineage_id in lineage_ids:
-        prior_item = prior_items.get(lineage_id)
-        current_item = current_items.get(lineage_id)
+    for key, prior_item, current_item, match_basis in pairs:
         if prior_item is None:
             row_status = "added"
         elif current_item is None:
@@ -5192,21 +5267,21 @@ def _build_revision_comparison(current_revision, prior_revision):
         current_facts = _revision_item_facts(current_item) if current_item else None
         prev_rate = (prior_facts or {}).get("rate")
         curr_rate = (current_facts or {}).get("rate")
-        prev_total = (prior_facts or {}).get("line_total")
-        curr_total = (current_facts or {}).get("line_total")
         rows.append({
-            "batch_row_lineage_id": lineage_id,
+            "batch_row_lineage_id": key,
             "status": row_status,
+            "match_basis": match_basis,
             "sku_id": (current_facts or prior_facts or {}).get("sku_id"),
             "sku_version_id": (current_facts or prior_facts or {}).get("sku_version_id"),
+            "descriptive_identity": (current_facts or prior_facts or {}).get("descriptive_identity"),
             "previous_rate": _evidence(prev_rate),
             "current_rate": _evidence(curr_rate),
             "rate_movement": _numeric_movement(prev_rate, curr_rate),
-            "previous_quantity": _evidence((prior_facts or {}).get("quantity")),
-            "current_quantity": _evidence((current_facts or {}).get("quantity")),
-            "previous_line_total": _evidence(prev_total),
-            "current_line_total": _evidence(curr_total),
-            "total_movement": _numeric_movement(prev_total, curr_total),
+            "previous_monthly_volume": _evidence((prior_facts or {}).get("monthly_volume")),
+            "current_monthly_volume": _evidence((current_facts or {}).get("monthly_volume")),
+            "quote_line_total": "not_applicable_no_frozen_order_quantity",
+            "previous_cost_before_margin_per_pc": _evidence((prior_facts or {}).get("cost_before_margin_per_pc")),
+            "current_cost_before_margin_per_pc": _evidence((current_facts or {}).get("cost_before_margin_per_pc")),
             "previous_margin_pct": _evidence((prior_facts or {}).get("margin_pct")),
             "current_margin_pct": _evidence((current_facts or {}).get("margin_pct")),
             "previous_input_disclosure": (prior_facts or {}).get("input_disclosure"),
@@ -5215,7 +5290,6 @@ def _build_revision_comparison(current_revision, prior_revision):
             "current_authority_disclosure": (current_facts or {}).get("authority_disclosure"),
         })
 
-    mixed_engine = False
     engines = {
         ((row.get("previous_authority_disclosure") or {}).get("engine_version"))
         for row in rows if row.get("previous_authority_disclosure")
@@ -5232,7 +5306,13 @@ def _build_revision_comparison(current_revision, prior_revision):
         "prior_revision_no": prior_revision.get("revision_no"),
         "prior_standing": prior_revision.get("standing"),
         "prior_workflow_status": prior_revision.get("workflow_status"),
+        "same_chain": (current_revision or {}).get("family_id") is not None and (
+            (current_revision or {}).get("family_id") == (prior_revision or {}).get("family_id")),
         "mixed_engine": mixed_engine,
+        "ambiguous_sku_ids": ambiguous_sku_ids,
+        "line_total_note": "This schema records no genuine frozen customer order quantity or "
+                            "quote line total. Quoted rate leads the comparison; monthly volume "
+                            "is a calculation input, not an order quantity.",
         "rows": rows,
         "added_count": sum(1 for row in rows if row["status"] == "added"),
         "removed_count": sum(1 for row in rows if row["status"] == "removed"),

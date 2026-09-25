@@ -23,6 +23,8 @@ def _function_body(text, def_marker):
 
 record_route = _function_body(SERVER, "def record_customer_outcome_route")
 prior_route = _function_body(SERVER, "def get_batch_prior_quote")
+outcome_fn = SQL[SQL.index("create or replace function app_private.record_customer_outcome(")
+                 :SQL.index("create or replace function public.record_customer_outcome(")]
 
 checks = {
     "record_customer_outcome reuses the existing append-only table, no new status column":
@@ -38,13 +40,17 @@ checks = {
     "only an issued revision may receive an outcome": "v_q.workflow_status <> 'issued'" in SQL,
     "acceptance fields are rejected on any non-accepted outcome":
         "acceptance_fields_require_accepted" in SQL,
-    "maker/checker/admin authorization, refused before any write": all(
+    "owner Maker/Checker/Admin authorization, refused before any write": all(
         token in SQL for token in (
             "has_plant_cap(v_batch.plant_id, 'check_quote')",
             "has_group_cap('administer_users')",
             "has_plant_cap(v_batch.plant_id, 'make_quote')",
+            "v_batch.owner_user_id = v_actor",
             "raise exception 'permission denied' using errcode = '42501';",
         )),
+    "DM-105: an active collaborator is NOT independent outcome authority - "
+    "the make_quote branch checks ONLY owner_user_id, never batch_collaborators":
+        "batch_collaborators" not in outcome_fn,
     "record_customer_outcome grants are narrow (revoked from public/anon, app_private unexposed)": all(
         token in SQL for token in (
             "revoke all on function app_private.record_customer_outcome",
@@ -85,17 +91,31 @@ checks = {
             "current_batch.get(\"customer_party_id\") != prior_batch.get(\"customer_party_id\")",
             "current_batch.get(\"plant_id\") != prior_batch.get(\"plant_id\")",
         )),
-    "comparison keys items by frozen batch_row_lineage_id, not label": "index_items" in SERVER
-        and 'item.get("batch_row_lineage_id")' in SERVER,
+    "same-chain comparison keys items by frozen batch_row_lineage_id, not label": all(
+        token in SERVER for token in (
+            "_index_items_by_lineage", "_index_items_by_sku", "_match_revision_items",
+        )),
+    "cross-Batch comparison never guesses a pairing for a duplicated frozen SKU":
+        "ambiguous_sku_duplicate" in SERVER and "ambiguous_sku_ids" in SERVER,
     "comparison never treats a missing frozen fact as zero": "_evidence(" in SERVER
         and 'return value if value is not None else "unavailable"' in SERVER,
     "comparison classifies added/removed rows explicitly": '"added"' in SERVER and '"removed"' in SERVER
         and '"matched"' in SERVER,
-    "record_outcome workflow action is gated to maker/checker/admin on an issued revision": all(
+    "commercial columns are truthfully named, not mislabelled as order Qty/Total": all(
+        token in SERVER for token in (
+            '"monthly_volume"', '"cost_before_margin_per_pc"',
+            "not_applicable_no_frozen_order_quantity",
+        )) and '"line_total"' not in SERVER,
+    "no current-master SKU/product lookup backfills a descriptive identity":
+        "_DESCRIPTIVE_IDENTITY_UNAVAILABLE" in SERVER,
+    "record_outcome workflow action is DM-105 owner-Maker (not participant/collaborator), Checker or Admin": all(
         token in ACTIVATION for token in (
             '"record_outcome": _state(',
-            "(maker or checker or admin) and revision_status == \"issued\"",
+            "(owner_maker or checker or admin) and revision_status == \"issued\"",
+            'caller or {}).get("id") == batch.get("owner_user_id")',
         )),
+    "prior-quote resolver reports the Batch's own current revision id for truthful compare gating":
+        "current_revision_id" in SQL and "v_current_revision_id" in SQL,
 }
 
 failed = [label for label, ok in checks.items() if not ok]

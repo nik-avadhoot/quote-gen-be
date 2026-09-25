@@ -9,10 +9,12 @@
 -- independent: this function never touches quote_revisions.standing or
 -- workflow_status.
 --
--- AUTHORIZATION: the Quote owner Maker, an authorised Checker for the
--- Batch's Plant, or Admin correction authority (administer_users) may
--- record an outcome. Wrong-plant and unauthorised callers are refused
--- before any write. Only a revision that has actually been issued
+-- AUTHORIZATION (DM-105): the Quote OWNER Maker (not any active collaborator
+-- with make_quote - a collaborator may edit rows but does not hold customer-
+-- response authority), an authorised Checker for the Batch's Plant, or Admin
+-- correction authority (administer_users) may record an outcome. Wrong-plant
+-- and unauthorised callers are refused before any write. Only a revision
+-- that has actually been issued
 -- (workflow_status='issued', any standing - superseded/voided revisions
 -- keep their response history recordable, matching "late acceptance may
 -- follow Rejected or Expired" and "superseding must not erase response
@@ -40,12 +42,13 @@ begin
   select b.* into v_batch from public.quote_families qf join public.batches b on b.id = qf.batch_id
    where qf.id = v_q.family_id for update of b;
 
+  -- DM-105: owner Maker only - a collaborator is deliberately excluded even
+  -- with active make_quote, because collaboration on rows is not the same
+  -- authority as speaking for the Quote to the customer.
   v_allowed := app_private.has_plant_cap(v_batch.plant_id, 'check_quote')
     or app_private.has_group_cap('administer_users')
     or (app_private.has_plant_cap(v_batch.plant_id, 'make_quote')
-        and (v_batch.owner_user_id = v_actor or exists(
-          select 1 from public.batch_collaborators bc
-           where bc.batch_id = v_batch.id and bc.app_user_id = v_actor and bc.status = 'active')));
+        and v_batch.owner_user_id = v_actor);
   if v_actor is null or not v_allowed then
     raise exception 'permission denied' using errcode = '42501';
   end if;
@@ -126,13 +129,15 @@ returns table(
   issued_at timestamptz,
   source_kind text,
   latest_outcome text,
-  latest_outcome_at timestamptz
+  latest_outcome_at timestamptz,
+  current_revision_id bigint
 )
 language plpgsql stable security definer set search_path = '' as $fn$
 declare
   v_batch public.batches%rowtype;
   v_own_family_id bigint;
   v_pending app_private.pending_quote_revision_sources%rowtype;
+  v_current_revision_id bigint;
 begin
   if not app_private.can_read_batch(p_batch) then
     raise exception 'permission denied' using errcode = '42501';
@@ -142,11 +147,21 @@ begin
   select id into v_own_family_id from public.quote_families where batch_id = p_batch;
   select * into v_pending from app_private.pending_quote_revision_sources where batch_id = p_batch;
 
+  -- The Batch's OWN current frozen revision, if one exists. Frontend uses
+  -- this (never a guess) to decide whether "Open and compare" can honestly
+  -- offer a comparison, or only "Open prior Quote" is truthful.
+  if v_own_family_id is not null then
+    select qr.id into v_current_revision_id from public.quote_revisions qr
+     where qr.family_id = v_own_family_id and qr.workflow_status = 'issued'
+       and qr.standing = 'current'
+     order by qr.revision_no desc nulls last, qr.id desc limit 1;
+  end if;
+
   if v_pending.source_revision_id is not null then
     return query
       select qr.id, qr.family_id, qf.quote_reference, qr.revision_no, qr.workflow_status,
              qr.standing, qr.quote_date, qr.offer_validity_to, qr.issued_at,
-             'exact_source_revision'::text, oc.outcome, oc.occurred_at
+             'exact_source_revision'::text, oc.outcome, oc.occurred_at, v_current_revision_id
         from public.quote_revisions qr
         join public.quote_families qf on qf.id = qr.family_id
         left join lateral (
@@ -164,7 +179,7 @@ begin
   return query
     select qr.id, qr.family_id, qf.quote_reference, qr.revision_no, qr.workflow_status,
            qr.standing, qr.quote_date, qr.offer_validity_to, qr.issued_at,
-           'last_quote_customer_plant'::text, oc.outcome, oc.occurred_at
+           'last_quote_customer_plant'::text, oc.outcome, oc.occurred_at, v_current_revision_id
       from public.quote_revisions qr
       join public.quote_families qf on qf.id = qr.family_id
       join public.batches b on b.id = qf.batch_id
@@ -184,7 +199,8 @@ create or replace function public.resolve_batch_prior_quote(p_batch bigint)
 returns table(
   revision_id bigint, family_id bigint, quote_reference text, revision_no integer,
   workflow_status text, standing text, quote_date date, offer_validity_to date,
-  issued_at timestamptz, source_kind text, latest_outcome text, latest_outcome_at timestamptz
+  issued_at timestamptz, source_kind text, latest_outcome text, latest_outcome_at timestamptz,
+  current_revision_id bigint
 ) language sql stable set search_path = '' as $$
   select * from app_private.resolve_batch_prior_quote(p_batch)
 $$;
