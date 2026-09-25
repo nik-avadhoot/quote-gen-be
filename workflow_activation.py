@@ -23,6 +23,7 @@ def quote_revision_actions(caller, batch, revision, is_collaborator=False):
     )
     maker = "make_quote" in caps and participant
     checker = "check_quote" in caps
+    admin = "administer_users" in (caller or {}).get("group_capabilities", [])
     revision_status = (revision or {}).get("workflow_status")
     batch_status = (batch or {}).get("status")
     standing = (revision or {}).get("standing")
@@ -40,6 +41,8 @@ def quote_revision_actions(caller, batch, revision, is_collaborator=False):
         "create_revision": _state(
             maker and revision_status == "issued" and standing in ("current", "voided")
             and batch_status == "issued_locked", unavailable),
+        "record_outcome": _state(
+            (maker or checker or admin) and revision_status == "issued", unavailable),
         "amend": _state(False, "not_available_in_limited_beta"),
         "reprice": _state(False, "not_available_in_limited_beta"),
     }

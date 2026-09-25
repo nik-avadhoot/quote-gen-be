@@ -3850,7 +3850,8 @@ def _read_quote_workspace(client, quote_reference=None, revision_id=None, batch_
 
     family["batch"] = one(
         "batch", "batches",
-        "id, batch_reference, family_id, plant_id, owner_user_id, sector_id, status, content_version, "
+        "id, batch_reference, family_id, customer_party_id, plant_id, owner_user_id, sector_id, "
+        "status, content_version, "
         "pricing_date, pricing_basis_release_id, pricing_basis_is_deliberate, created_at, created_by",
         family.get("batch_id"))
     if family.get("batch"):
@@ -5100,6 +5101,253 @@ def get_quote_workspace():
     })
 
 
+def _evidence(value):
+    """A frozen fact, or the literal string 'unavailable' - never a fabricated zero."""
+    return value if value is not None else "unavailable"
+
+
+def _revision_item_facts(item):
+    """Pull the D-5 comparison facts out of one frozen Quote item.
+
+    Reads only immutable calculation_snapshot evidence (typed columns plus
+    the frozen effective_inputs produced by app_private.build_effective_inputs
+    at calculate time) - never current Batch/SKU/master data.
+    """
+    snapshot = (item or {}).get("calculation_snapshot") or {}
+    inputs = snapshot.get("effective_inputs") or {}
+    provenance = inputs.get("provenance") or {}
+    entered = inputs.get("entered") or {}
+    return {
+        "sku_id": provenance.get("sku_id"),
+        "sku_version_id": provenance.get("sku_version_id"),
+        "construction_version_id": provenance.get("construction_version_id"),
+        "rate": snapshot.get("final_rate"),
+        "line_total": snapshot.get("total_cost"),
+        "quantity": entered.get("volume"),
+        "sales_moq": entered.get("sales_moq"),
+        "margin_pct": snapshot.get("effective_margin_pct"),
+        "input_disclosure": {
+            "waste_pct": snapshot.get("effective_waste_pct"),
+            "waste_source": snapshot.get("waste_source"),
+            "conv_rate": snapshot.get("effective_conv_rate"),
+            "conv_source": snapshot.get("conv_source"),
+            "construction_version_id": provenance.get("construction_version_id"),
+            "construction_version_origin": provenance.get("construction_version_origin"),
+            "length_mm": entered.get("length_mm"),
+            "width_mm": entered.get("width_mm"),
+            "height_mm": entered.get("height_mm"),
+            "sales_moq": entered.get("sales_moq"),
+        },
+        "authority_disclosure": {
+            "pricing_basis_release_id": snapshot.get("pricing_basis_release_id"),
+            "calculation_default_version_id": snapshot.get("calculation_default_version_id"),
+            "engine_version": snapshot.get("engine_version"),
+            "rounding_rule_version": snapshot.get("rounding_rule_version"),
+            "interest_pct": snapshot.get("effective_interest_pct"),
+            "interest_source": snapshot.get("interest_source"),
+            "freight_value": snapshot.get("effective_freight"),
+            "freight_source": snapshot.get("freight_source"),
+            "freight_authority": snapshot.get("freight_authority"),
+            "freight_set_version_id": snapshot.get("freight_set_version_id"),
+            "freight_entry_id": snapshot.get("freight_entry_id"),
+        },
+    }
+
+
+def _numeric_movement(previous, current):
+    if not isinstance(previous, (int, float)) or not isinstance(current, (int, float)):
+        return "unavailable"
+    return current - previous
+
+
+def _build_revision_comparison(current_revision, prior_revision):
+    """S5 Slice B: one pure, price-first comparison keyed by frozen row lineage.
+
+    Matches items by batch_row_lineage_id (never by label). A lineage present
+    on only one side is explicitly classified added/removed, never guessed.
+    Every fact is read from frozen evidence; nothing here can be altered by
+    current Batch, Customer, SKU or master data.
+    """
+    def index_items(revision):
+        return {item.get("batch_row_lineage_id"): item
+                for item in (revision or {}).get("items", [])}
+
+    current_items = index_items(current_revision)
+    prior_items = index_items(prior_revision)
+    lineage_ids = sorted(
+        set(current_items) | set(prior_items),
+        key=lambda value: (value is None, value))
+
+    rows = []
+    for lineage_id in lineage_ids:
+        prior_item = prior_items.get(lineage_id)
+        current_item = current_items.get(lineage_id)
+        if prior_item is None:
+            row_status = "added"
+        elif current_item is None:
+            row_status = "removed"
+        else:
+            row_status = "matched"
+        prior_facts = _revision_item_facts(prior_item) if prior_item else None
+        current_facts = _revision_item_facts(current_item) if current_item else None
+        prev_rate = (prior_facts or {}).get("rate")
+        curr_rate = (current_facts or {}).get("rate")
+        prev_total = (prior_facts or {}).get("line_total")
+        curr_total = (current_facts or {}).get("line_total")
+        rows.append({
+            "batch_row_lineage_id": lineage_id,
+            "status": row_status,
+            "sku_id": (current_facts or prior_facts or {}).get("sku_id"),
+            "sku_version_id": (current_facts or prior_facts or {}).get("sku_version_id"),
+            "previous_rate": _evidence(prev_rate),
+            "current_rate": _evidence(curr_rate),
+            "rate_movement": _numeric_movement(prev_rate, curr_rate),
+            "previous_quantity": _evidence((prior_facts or {}).get("quantity")),
+            "current_quantity": _evidence((current_facts or {}).get("quantity")),
+            "previous_line_total": _evidence(prev_total),
+            "current_line_total": _evidence(curr_total),
+            "total_movement": _numeric_movement(prev_total, curr_total),
+            "previous_margin_pct": _evidence((prior_facts or {}).get("margin_pct")),
+            "current_margin_pct": _evidence((current_facts or {}).get("margin_pct")),
+            "previous_input_disclosure": (prior_facts or {}).get("input_disclosure"),
+            "current_input_disclosure": (current_facts or {}).get("input_disclosure"),
+            "previous_authority_disclosure": (prior_facts or {}).get("authority_disclosure"),
+            "current_authority_disclosure": (current_facts or {}).get("authority_disclosure"),
+        })
+
+    mixed_engine = False
+    engines = {
+        ((row.get("previous_authority_disclosure") or {}).get("engine_version"))
+        for row in rows if row.get("previous_authority_disclosure")
+    } | {
+        ((row.get("current_authority_disclosure") or {}).get("engine_version"))
+        for row in rows if row.get("current_authority_disclosure")
+    }
+    engines.discard(None)
+    mixed_engine = len(engines) > 1
+
+    return {
+        "current_revision_id": current_revision.get("id"),
+        "prior_revision_id": prior_revision.get("id"),
+        "prior_revision_no": prior_revision.get("revision_no"),
+        "prior_standing": prior_revision.get("standing"),
+        "prior_workflow_status": prior_revision.get("workflow_status"),
+        "mixed_engine": mixed_engine,
+        "rows": rows,
+        "added_count": sum(1 for row in rows if row["status"] == "added"),
+        "removed_count": sum(1 for row in rows if row["status"] == "removed"),
+    }
+
+
+@app.route("/quotes/batches/<int:batch_id>/prior-quote", methods=["GET"])
+@require_auth
+def get_batch_prior_quote(batch_id):
+    """S5 Slice A: the exact prior Quote for this governed Batch, if any.
+
+    Never a Family-level or cross-plant substitute (see
+    app_private.resolve_batch_prior_quote). Distinguishes no-customer,
+    no-history and access-denied so the workspace can say the truth.
+    """
+    client = get_supabase_for_caller(g.access_token)
+    result, err = _rpc_call(client, "resolve_batch_prior_quote", {"p_batch": batch_id})
+    if err:
+        return err
+    rows = result.data or []
+    if rows:
+        return jsonify({
+            "status": "found",
+            "prior_quote": rows[0],
+            "authority": "caller_token_database_rpc",
+        })
+    try:
+        batch_rows = (client.table("batches").select("id, customer_party_id")
+                      .eq("id", batch_id).limit(1).execute()).data or []
+    except APIError as exc:
+        if exc.code == "42501":
+            batch_rows = []
+        else:
+            raise
+    if not batch_rows:
+        return _error("RECORD_NOT_FOUND")
+    status = "no_customer_selected" if not batch_rows[0].get("customer_party_id") else "no_history"
+    return jsonify({
+        "status": status,
+        "prior_quote": None,
+        "authority": "caller_token_database_rpc",
+    })
+
+
+@app.route("/quotes/revisions/<int:revision_id>/compare", methods=["GET"])
+@require_auth
+def get_quote_revision_compare(revision_id):
+    """S5 Slice B: price-first comparison of a revision against a prior one.
+
+    The prior revision is either this revision's own frozen
+    source_revision_id, or an explicit ?against=<revision_id> that this route
+    verifies, server-side, shares the exact same Customer/Prospect and Plant
+    as the current revision's Batch - never a guessed or Family-level match.
+    """
+    against_raw = (request.args.get("against") or "").strip()
+    against_id = None
+    if against_raw:
+        try:
+            against_id = int(against_raw)
+        except ValueError:
+            return _invalid_input("against must be a positive integer")
+        if against_id <= 0:
+            return _invalid_input("against must be a positive integer")
+
+    client = get_supabase_for_caller(g.access_token)
+    try:
+        current = _read_quote_workspace(client, revision_id=revision_id)
+    except Exception as exc:
+        if _is_upstream_timeout(exc):
+            return _error("UPSTREAM_TIMEOUT")
+        raise
+    if current is None:
+        return _error("RECORD_NOT_FOUND")
+
+    current_revision = next(
+        (row for row in current.get("revisions", []) if row["id"] == revision_id), None)
+    if current_revision is None:
+        return _error("RECORD_NOT_FOUND")
+
+    prior_id = against_id or current_revision.get("source_revision_id")
+    if prior_id is None:
+        return jsonify({
+            "comparison": None,
+            "reason": "no_source_revision",
+            "authority": "caller_token_rls_only",
+        })
+
+    try:
+        prior_family = _read_quote_workspace(client, revision_id=prior_id)
+    except Exception as exc:
+        if _is_upstream_timeout(exc):
+            return _error("UPSTREAM_TIMEOUT")
+        raise
+    if prior_family is None:
+        return _error("RECORD_NOT_FOUND")
+    prior_revision = next(
+        (row for row in prior_family.get("revisions", []) if row["id"] == prior_id), None)
+    if prior_revision is None:
+        return _error("RECORD_NOT_FOUND")
+
+    if against_id:
+        current_batch = (current.get("batch") or {})
+        prior_batch = (prior_family.get("batch") or {})
+        if (not current_batch.get("customer_party_id")
+                or current_batch.get("customer_party_id") != prior_batch.get("customer_party_id")
+                or current_batch.get("plant_id") != prior_batch.get("plant_id")):
+            return _error("RECORD_NOT_FOUND")
+
+    comparison = _build_revision_comparison(current_revision, prior_revision)
+    return jsonify({
+        "comparison": comparison,
+        "authority": "caller_token_rls_only",
+    })
+
+
 @app.route("/quotes/catalogue", methods=["GET"])
 @require_auth
 def get_quote_catalogue():
@@ -5829,6 +6077,60 @@ def share_quote_revision_route(revision_id):
 def create_quote_revision_route(revision_id):
     return _quote_workflow_rpc(
         "create_quote_revision", {"p_source_revision": revision_id}, scalar=True, status=201)
+
+
+_CUSTOMER_OUTCOMES = ("awaiting_response", "accepted", "rejected", "expired")
+
+
+@app.route("/quotes/revisions/<int:revision_id>/outcome", methods=["POST"])
+@require_auth
+def record_customer_outcome_route(revision_id):
+    """S5 Slice C: append a customer-response event to an issued revision.
+
+    Append-only by construction: this route never updates or deletes an
+    earlier event, and it accepts no override of actor or timestamp - both
+    are database-derived inside the RPC.
+    """
+    data = request.get_json(silent=True) or {}
+    outcome = data.get("outcome")
+    if not isinstance(outcome, str) or outcome.strip() not in _CUSTOMER_OUTCOMES:
+        return _invalid_input("outcome must be one of: " + ", ".join(_CUSTOMER_OUTCOMES))
+    outcome = outcome.strip()
+
+    acceptance_date = data.get("acceptance_date")
+    parsed_acceptance_date = None
+    if acceptance_date not in (None, ""):
+        if not isinstance(acceptance_date, str):
+            return _invalid_input("acceptance_date must be an ISO date")
+        try:
+            parsed_acceptance_date = date.fromisoformat(acceptance_date)
+        except ValueError:
+            return _invalid_input("acceptance_date must be an ISO date")
+
+    acceptance_reference = data.get("acceptance_reference")
+    if not isinstance(acceptance_reference, (str, type(None))):
+        return _invalid_input("acceptance_reference must be text or blank")
+    reference = acceptance_reference.strip() if isinstance(acceptance_reference, str) else None
+    if reference and len(reference) > 200:
+        return _invalid_input("acceptance_reference must be 200 characters or fewer")
+
+    note = data.get("note")
+    if not isinstance(note, (str, type(None))):
+        return _invalid_input("note must be text or blank")
+    note_value = note.strip() if isinstance(note, str) else None
+    if note_value and len(note_value) > 2000:
+        return _invalid_input("note must be 2000 characters or fewer")
+
+    if outcome != "accepted" and (parsed_acceptance_date is not None or reference):
+        return _invalid_input("acceptance_date and acceptance_reference apply only to accepted")
+
+    return _quote_workflow_rpc("record_customer_outcome", {
+        "p_revision": revision_id,
+        "p_outcome": outcome,
+        "p_acceptance_date": parsed_acceptance_date.isoformat() if parsed_acceptance_date else None,
+        "p_acceptance_reference": reference or None,
+        "p_note": note_value or None,
+    }, scalar=True, status=201)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

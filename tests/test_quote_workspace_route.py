@@ -216,15 +216,19 @@ check(snapshot["calculated_by_actor"]["display_name"] == "Maker"
       and current["approved_by_actor"]["display_name"] == "Checker"
       and current["workflow_events"][0]["event_type"] == "returned",
       "U5-BE-7 caller-visible actors and workflow events retain attribution and time order")
-check(all(not action["enabled"] for action in quote["actions"].values())
+check(all(not action["enabled"] for key, action in quote["actions"].items()
+          if key != "record_outcome")
       and all(action["reason"] != "backend_activation_pending"
               for action in quote["actions"].values()),
       "U5-BE-8 an ineligible Quote reports real state-driven action reasons")
 check(set(quote["actions"]) == {
           "calculate", "send", "submit", "approve", "return", "withdraw",
-          "share", "create_revision", "amend", "reprice",
+          "share", "create_revision", "amend", "reprice", "record_outcome",
       },
       "U5-BE-8a the read contract names the complete accepted pending workflow")
+check(quote["actions"]["record_outcome"]["enabled"] is True
+      and quote["actions"]["record_outcome"]["reason"] == "available",
+      "U5-BE-8c S5: the owning Maker may record a customer outcome on this issued revision")
 check(current["items"][0]["pricing_group_id"] == 81
       and current["items"][0]["calculation_snapshot_id"] == 801
       and snapshot["freight_set_version_id"] == 31
