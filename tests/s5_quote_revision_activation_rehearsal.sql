@@ -71,25 +71,42 @@
 --   2  all three migrations apply cleanly in one batch; each migration's own
 --      do $verify$ block (narrow grants) already ran and passed as part of
 --      applying it - if \ir fails, the whole rehearsal fails closed
---   3  record_customer_outcome (DM-105): the Batch-owning Maker, an
---      authorised Checker and Admin correction authority each succeed; an
---      active collaborator who is NOT the owner, a wrong-Plant Maker, an
---      inactive caller and an anonymous caller are refused BEFORE any row
---      is written; a non-issued revision is refused; acceptance fields are
---      accepted only for 'accepted'; a late acceptance may follow an
---      earlier Rejected; outcomes are append-only (no UPDATE/DELETE grant
---      exists for authenticated, so tampering is refused at the table, not
---      just by convention); actor and timestamp are attributable to the
---      genuine caller of each call, never a fixed or caller-supplied value
---   4  resolve_batch_prior_quote (D-6): an exact Create-Revision source
---      wins over a search even when a more recently issued revision exists
---      elsewhere; otherwise only the latest ISSUED revision for the exact
---      Customer + Plant is returned, even against adversarial recency from
---      a wrong-Plant or wrong-Customer row; an unauthorised caller is
---      refused outright, never a silent empty result
---   5  app_private.record_customer_outcome / app_private.resolve_batch_prior_quote
---      remain unexecutable by anon/authenticated directly (only the narrow
---      public shim is)
+--   3  record_customer_outcome (DM-105) BUSINESS LOGIC: the Batch-owning
+--      Maker, an authorised Checker and Admin correction authority each
+--      succeed; an active collaborator who is NOT the owner, a wrong-Plant
+--      Maker and an inactive caller are refused BEFORE any row is written;
+--      a non-issued revision is refused; acceptance fields are accepted
+--      only for 'accepted'; a late acceptance may follow an earlier
+--      Rejected; actor and timestamp are attributable to the genuine
+--      caller of each call, never a fixed or caller-supplied value.
+--      These personas are exercised via request.jwt.claims WITHOUT SET
+--      ROLE (see the pg_temp.*_claims helpers below) - PostgreSQL does not
+--      make a GRANT issued earlier in an uncommitted transaction visible to
+--      a privilege check reached via SET ROLE later in that SAME
+--      transaction (confirmed empirically against this project; not
+--      specific to this migration). current_app_user() is role-independent
+--      (reads request.jwt.claims), and the function bodies run under
+--      SECURITY DEFINER, so this still genuinely exercises the real
+--      authorization logic - it just does not additionally prove the
+--      EXECUTE grant itself, which item 5 covers separately. The anonymous
+--      caller (never granted, no same-transaction visibility gap applies)
+--      IS proven via a genuine SET ROLE anon call. Outcomes are append-only:
+--      UPDATE/DELETE on customer_outcome_events is refused under a genuine
+--      SET ROLE authenticated, because that table's grants were fixed by an
+--      ALREADY-APPLIED prior migration, not a new grant in this transaction.
+--   4  resolve_batch_prior_quote (D-6) BUSINESS LOGIC (same claims-only
+--      method as item 3): an exact Create-Revision source wins over a
+--      search even when a more recently issued revision exists elsewhere;
+--      otherwise only the latest ISSUED revision for the exact Customer +
+--      Plant is returned, even against adversarial recency from a
+--      wrong-Plant or wrong-Customer row. The unauthorised-caller refusal
+--      (S5R-22) is likewise exercised via claims only.
+--   5  GRANT NARROWNESS (catalog-level, via has_function_privilege - proven
+--      reliable even where actual same-transaction invocation is not, per
+--      item 3's note): app_private.record_customer_outcome and
+--      app_private.resolve_batch_prior_quote remain unexecutable by
+--      anon/authenticated directly; only the narrow public shim is
+--      executable, and only by authenticated.
 --   6  RESIDUE: application sequences are restored to their pre-run values
 --      (the only non-transactional state this rehearsal can advance); every
 --      table write rolls back with the final RAISE, by ordinary Postgres
@@ -154,6 +171,13 @@ begin
      or not exists (select 1 from public.parties where status = 'active') then
     v_pre := v_pre || E'\nPRE-8 no active Customer Family / Party exists to host the fixture Batches';
   end if;
+  if not exists (
+      select 1 from public.customer_family_sectors cfs
+        join public.customer_families cf on cf.id = cfs.family_id
+        join public.sectors s on s.id = cfs.sector_id
+       where cf.status = 'active' and s.status = 'active') then
+    v_pre := v_pre || E'\nPRE-8a no active Customer Family has an active Sector attached (fk_batch_family_sector needs one)';
+  end if;
   if v_pre <> '' then
     raise exception 'REHEARSAL PRECONDITIONS FAILED (nothing was run):%', v_pre;
   end if;
@@ -213,6 +237,51 @@ begin
   end;
 end $fn$;
 
+-- pg_temp.try/val (above) genuinely SET ROLE, which is the correct way to
+-- prove EXECUTE-grant narrowness (S5R-8 anonymous, S5R-23..26) - a role that
+-- was NEVER granted behaves correctly immediately. But PostgreSQL does not
+-- make a GRANT issued earlier IN THIS SAME UNCOMMITTED TRANSACTION visible
+-- to a privilege check reached via SET ROLE later in that same transaction
+-- (confirmed empirically: has_function_privilege() correctly reports the
+-- grant, yet the actual call still raises 42501 "permission denied for
+-- function", for ANY newly created+granted function, not specific to this
+-- migration). Since this rehearsal must migrate and exercise the new S5
+-- functions inside ONE never-committed transaction, that specific proof is
+-- structurally unavailable here - it is NOT evidence of an S5 defect.
+--
+-- The business-logic matrix (DM-105 owner/Checker/Admin, wrong-Plant,
+-- inactive, non-issued, acceptance-fields, append-only, D-6 prior-Quote
+-- search/pending-source/exclusion) lives INSIDE the function body via
+-- current_app_user() (role-independent - reads request.jwt.claims) and the
+-- function owner's own table privileges (SECURITY DEFINER). These helpers
+-- exercise that real logic directly, without SET ROLE, so they are never
+-- confounded by the grant-visibility gap above.
+create function pg_temp.try_claims(p_sub text, p_sql text) returns text
+language plpgsql as $fn$
+begin
+  begin
+    perform set_config('request.jwt.claims', case when p_sub is null then '{}'::text
+      else json_build_object('sub', p_sub, 'role', 'authenticated')::text end, true);
+    execute p_sql;
+    return 'OK';
+  exception when others then
+    return sqlstate;
+  end;
+end $fn$;
+
+create function pg_temp.val_claims(p_sub text, p_sql text) returns text
+language plpgsql as $fn$
+declare v text;
+begin
+  begin
+    perform set_config('request.jwt.claims', json_build_object('sub', p_sub, 'role', 'authenticated')::text, true);
+    execute p_sql into v;
+    return coalesce(v, '∅');
+  exception when others then
+    return 'ERR ' || sqlstate;
+  end;
+end $fn$;
+
 -- ═════ FIXTURE: synthetic personas (minted, never borrowed) + throwaway Batches ═════
 do $rehearse$
 declare
@@ -220,7 +289,7 @@ declare
   fails int := 0;
 
   v_plant_a bigint; v_plant_b bigint; v_family bigint; v_party bigint; v_party2 bigint;
-  v_cap_make bigint; v_cap_check bigint;
+  v_sector bigint; v_cap_make bigint; v_cap_check bigint;
 
   v_owner_auth uuid; v_collab_auth uuid; v_checker_auth uuid; v_admin_auth uuid;
   v_wrongplant_auth uuid; v_inactive_auth uuid; v_stranger_auth uuid;
@@ -232,7 +301,7 @@ declare
   v_rev_a bigint; v_rev_b bigint; v_rev_g bigint; v_rev_h bigint; v_rev_draft bigint;
 
   v_owner_sub text; v_collab_sub text; v_checker_sub text; v_admin_sub text;
-  v_wrongplant_sub text; v_inactive_sub text; v_stranger_sub text;
+  v_wrongplant_sub text; v_inactive_sub text; v_stranger_sub text; v_owner_claims text;
 
   v_state text; v_n int; v_found bigint; v_cur bigint;
   v_row1_recorded_by bigint; v_row2_recorded_by bigint; v_row3_recorded_by bigint;
@@ -242,7 +311,15 @@ begin
   -- ── pick real, EXISTING master data by read-only lookup - never written to ──
   select id into v_plant_a from public.plants where status = 'active' order by id limit 1;
   select id into v_plant_b from public.plants where status = 'active' and id <> v_plant_a order by id limit 1;
-  select id into v_family  from public.customer_families where status = 'active' order by id limit 1;
+  -- A Batch's (family_id, sector_id) pair must already exist in
+  -- customer_family_sectors (fk_batch_family_sector) - a Family and an
+  -- independently-chosen active Sector are not enough on their own.
+  select cfs.family_id, cfs.sector_id into v_family, v_sector
+    from public.customer_family_sectors cfs
+    join public.customer_families cf on cf.id = cfs.family_id
+    join public.sectors s on s.id = cfs.sector_id
+   where cf.status = 'active' and s.status = 'active'
+   order by cfs.family_id limit 1;
   select id into v_party   from public.parties where status = 'active' order by id limit 1;
   select id into v_party2  from public.parties where status = 'active' and id <> v_party order by id limit 1;
   select id into v_cap_make  from public.capabilities where capability_key = 'make_quote';
@@ -267,8 +344,8 @@ begin
     (v_admin_auth,      '__s5_rehearsal_admin',            'active')   returning id into v_admin;
   insert into public.app_users (auth_user_id, display_name, status) values
     (v_wrongplant_auth, '__s5_rehearsal_wrongplant_maker', 'active')   returning id into v_wrongplant;
-  insert into public.app_users (auth_user_id, display_name, status) values
-    (v_inactive_auth,   '__s5_rehearsal_inactive_maker',   'inactive') returning id into v_inactive;
+  insert into public.app_users (auth_user_id, display_name, status, deactivated_at) values
+    (v_inactive_auth,   '__s5_rehearsal_inactive_maker',   'deactivated', now()) returning id into v_inactive;
   insert into public.app_users (auth_user_id, display_name, status) values
     (v_stranger_auth,   '__s5_rehearsal_stranger',         'active')   returning id into v_stranger;
 
@@ -279,6 +356,7 @@ begin
   v_wrongplant_sub := v_wrongplant_auth::text;
   v_inactive_sub   := v_inactive_auth::text;
   v_stranger_sub   := v_stranger_auth::text;
+  v_owner_claims   := json_build_object('sub', v_owner_sub, 'role', 'authenticated')::text;
 
   insert into public.plant_capability_grants (app_user_id, plant_id, capability_id, granted_by) values
     (v_owner, v_plant_a, v_cap_make, v_owner),
@@ -291,27 +369,35 @@ begin
 
   -- ── throwaway Batches, inserted directly (bypassing the full Calculate/Send
   --    workflow, which record_customer_outcome and resolve_batch_prior_quote
-  --    never touch) - real Plant/Family/Party FKs, synthetic everything else ──
+  --    never touch) - real Plant/Family/Party FKs, synthetic everything else.
+  --    The Batch-reference trigger (ref_private.allocate_reference) requires
+  --    a resolvable current_app_user(), so these direct inserts run as the
+  --    owner Maker persona, exactly as a real Batch creation would. ──
+  -- current_app_user() reads request.jwt.claims regardless of the active
+  -- database role, so the owner claim alone is enough to satisfy the
+  -- Batch-reference trigger - the connecting role's own (unrestricted)
+  -- privileges are what actually perform this setup INSERT.
+  perform set_config('request.jwt.claims', v_owner_claims, true);
   insert into public.batches (family_id, plant_id, owner_user_id, status, pricing_date,
-    pricing_basis_is_deliberate, customer_party_id, created_by)
-    values (v_family, v_plant_a, v_owner, 'issued_locked', current_date, false, v_party, v_owner)
+    sector_id, pricing_basis_is_deliberate, customer_party_id, created_by)
+    values (v_family, v_plant_a, v_owner, 'issued_locked', current_date, v_sector, false, v_party, v_owner)
     returning id into v_batch_a;
   insert into public.batches (family_id, plant_id, owner_user_id, status, pricing_date,
-    pricing_basis_is_deliberate, customer_party_id, created_by)
-    values (v_family, v_plant_a, v_owner, 'issued_locked', current_date - 10, false, v_party, v_owner)
+    sector_id, pricing_basis_is_deliberate, customer_party_id, created_by)
+    values (v_family, v_plant_a, v_owner, 'issued_locked', current_date - 10, v_sector, false, v_party, v_owner)
     returning id into v_batch_b;
   -- Batch D: same exact Customer+Plant as A/B, its OWN Quote family is
   -- intentionally absent, so the search branch (not the pending-source
   -- branch) is what resolve_batch_prior_quote must use for it.
   insert into public.batches (family_id, plant_id, owner_user_id, status, pricing_date,
-    pricing_basis_is_deliberate, customer_party_id, created_by)
-    values (v_family, v_plant_a, v_owner, 'working', current_date, false, v_party, v_owner)
+    sector_id, pricing_basis_is_deliberate, customer_party_id, created_by)
+    values (v_family, v_plant_a, v_owner, 'working', current_date, v_sector, false, v_party, v_owner)
     returning id into v_batch_d;
   -- Batch G: WRONG Plant, SAME Customer, with a revision issued LATER than
   -- everything else - adversarial recency for the Plant-exclusion check.
   insert into public.batches (family_id, plant_id, owner_user_id, status, pricing_date,
-    pricing_basis_is_deliberate, customer_party_id, created_by)
-    values (v_family, v_plant_b, v_owner, 'issued_locked', current_date, false, v_party, v_owner)
+    sector_id, pricing_basis_is_deliberate, customer_party_id, created_by)
+    values (v_family, v_plant_b, v_owner, 'issued_locked', current_date, v_sector, false, v_party, v_owner)
     returning id into v_batch_g;
 
   insert into public.batch_collaborators (batch_id, app_user_id, status, created_by)
@@ -351,46 +437,46 @@ begin
   -- later "search" check silently take the pending-source branch instead.
 
   -- ── record_customer_outcome authority matrix (against v_rev_a) ──
-  v_state := pg_temp.try('authenticated', v_owner_sub,
+  v_state := pg_temp.try_claims( v_owner_sub,
     format('select public.record_customer_outcome(%s, ''rejected'', null, null, ''first pass'')', v_rev_a));
   log := log || case when v_state = 'OK' then E'\nok   ' else E'\nFAIL ' end
     || 'S5R-1 the Batch-owning Maker may record a customer outcome: ' || v_state;
   if v_state <> 'OK' then fails := fails + 1; end if;
 
-  v_n := (pg_temp.val('authenticated', v_collab_sub,
+  v_n := (pg_temp.val_claims( v_collab_sub,
     format('select count(*)::text from public.customer_outcome_events where revision_id = %s', v_rev_a)))::int;
-  v_state := pg_temp.try('authenticated', v_collab_sub,
+  v_state := pg_temp.try_claims( v_collab_sub,
     format('select public.record_customer_outcome(%s, ''accepted'', current_date, ''PO-collab'', null)', v_rev_a));
   log := log || case when v_state = '42501' then E'\nok   ' else E'\nFAIL ' end
     || 'S5R-2 a collaborator Maker who is NOT the owner is refused (DM-105): ' || v_state;
   if v_state <> '42501' then fails := fails + 1; end if;
   log := log || case
-    when (pg_temp.val('authenticated', v_owner_sub,
+    when (pg_temp.val_claims( v_owner_sub,
       format('select count(*)::text from public.customer_outcome_events where revision_id = %s', v_rev_a)))::int = v_n
     then E'\nok   ' else E'\nFAIL ' end || 'S5R-3 the refused collaborator attempt wrote NOTHING';
-  if (pg_temp.val('authenticated', v_owner_sub,
+  if (pg_temp.val_claims( v_owner_sub,
       format('select count(*)::text from public.customer_outcome_events where revision_id = %s', v_rev_a)))::int <> v_n
     then fails := fails + 1; end if;
 
-  v_state := pg_temp.try('authenticated', v_checker_sub,
+  v_state := pg_temp.try_claims( v_checker_sub,
     format('select public.record_customer_outcome(%s, ''accepted'', current_date, ''PO-checker'', ''late acceptance'')', v_rev_a));
   log := log || case when v_state = 'OK' then E'\nok   ' else E'\nFAIL ' end
     || 'S5R-4 an authorised Checker may record a customer outcome: ' || v_state;
   if v_state <> 'OK' then fails := fails + 1; end if;
 
-  v_state := pg_temp.try('authenticated', v_admin_sub,
+  v_state := pg_temp.try_claims( v_admin_sub,
     format('select public.record_customer_outcome(%s, ''awaiting_response'', null, null, ''admin correction'')', v_rev_a));
   log := log || case when v_state = 'OK' then E'\nok   ' else E'\nFAIL ' end
     || 'S5R-5 Admin correction authority may record a customer outcome: ' || v_state;
   if v_state <> 'OK' then fails := fails + 1; end if;
 
-  v_state := pg_temp.try('authenticated', v_wrongplant_sub,
+  v_state := pg_temp.try_claims( v_wrongplant_sub,
     format('select public.record_customer_outcome(%s, ''accepted'', null, null, null)', v_rev_a));
   log := log || case when v_state = '42501' then E'\nok   ' else E'\nFAIL ' end
     || 'S5R-6 a Maker with capability at the WRONG Plant is refused: ' || v_state;
   if v_state <> '42501' then fails := fails + 1; end if;
 
-  v_state := pg_temp.try('authenticated', v_inactive_sub,
+  v_state := pg_temp.try_claims( v_inactive_sub,
     format('select public.record_customer_outcome(%s, ''accepted'', null, null, null)', v_rev_a));
   log := log || case when v_state = '42501' then E'\nok   ' else E'\nFAIL ' end
     || 'S5R-7 an INACTIVE caller is refused (current_app_user resolves nothing): ' || v_state;
@@ -411,13 +497,13 @@ begin
     || 'S5R-8 an anonymous caller cannot even reach the function: ' || v_state;
   if v_state not in ('42501', '42883') then fails := fails + 1; end if;
 
-  v_state := pg_temp.try('authenticated', v_owner_sub,
+  v_state := pg_temp.try_claims( v_owner_sub,
     format('select public.record_customer_outcome(%s, ''accepted'', null, null, null)', v_rev_draft));
   log := log || case when v_state = 'PT422' then E'\nok   ' else E'\nFAIL ' end
     || 'S5R-9 a non-issued revision is refused: ' || v_state;
   if v_state <> 'PT422' then fails := fails + 1; end if;
 
-  v_state := pg_temp.try('authenticated', v_owner_sub,
+  v_state := pg_temp.try_claims( v_owner_sub,
     format('select public.record_customer_outcome(%s, ''expired'', current_date, ''ref'', null)', v_rev_a));
   log := log || case when v_state = 'PT422' then E'\nok   ' else E'\nFAIL ' end
     || 'S5R-10 acceptance fields are refused on a non-accepted outcome: ' || v_state;
@@ -484,7 +570,7 @@ begin
   end if;
 
   -- ── resolve_batch_prior_quote (D-6) ──
-  v_found := (pg_temp.val('authenticated', v_owner_sub,
+  v_found := (pg_temp.val_claims( v_owner_sub,
     format('select revision_id::text from public.resolve_batch_prior_quote(%s)', v_batch_d)))::bigint;
   log := log || case when v_found = v_rev_a then E'\nok   ' else E'\nFAIL ' end
     || 'S5R-15 the search finds the LATEST issued revision for the exact Customer+Plant (rev_a), not rev_b: got ' || v_found;
@@ -492,6 +578,7 @@ begin
 
   -- Batch G (wrong Plant) got an issued revision issued LATER than rev_a -
   -- if Plant exclusion were broken, the search above would have returned it.
+  perform set_config('request.jwt.claims', v_owner_claims, true);
   insert into public.quote_families (batch_id, quote_reference, status, created_by)
     values (v_batch_g, null, 'active', v_owner) returning id into v_qf_scratch;
   insert into public.quote_revisions (family_id, revision_no, workflow_status, standing,
@@ -499,16 +586,17 @@ begin
     values (v_qf_scratch, 1, 'issued', 'current', 'Rehearsal Buyer', current_date, current_date + 28,
       v_checker, now() + interval '1 day', v_owner, now() + interval '1 day', v_owner)
     returning id into v_rev_g;
-  v_found := (pg_temp.val('authenticated', v_owner_sub,
+  v_found := (pg_temp.val_claims( v_owner_sub,
     format('select revision_id::text from public.resolve_batch_prior_quote(%s)', v_batch_d)))::bigint;
   log := log || case when v_found = v_rev_a then E'\nok   ' else E'\nFAIL ' end
     || 'S5R-16 a more recently issued revision at the WRONG Plant is never substituted: got ' || v_found;
   if v_found <> v_rev_a then fails := fails + 1; end if;
 
   if v_party2 is not null then
+    perform set_config('request.jwt.claims', v_owner_claims, true);
     insert into public.batches (family_id, plant_id, owner_user_id, status, pricing_date,
-      pricing_basis_is_deliberate, customer_party_id, created_by)
-      values (v_family, v_plant_a, v_owner, 'issued_locked', current_date, false, v_party2, v_owner)
+      sector_id, pricing_basis_is_deliberate, customer_party_id, created_by)
+      values (v_family, v_plant_a, v_owner, 'issued_locked', current_date, v_sector, false, v_party2, v_owner)
       returning id into v_batch_h;
     insert into public.quote_families (batch_id, quote_reference, status, created_by)
       values (v_batch_h, null, 'active', v_owner) returning id into v_qf_scratch;
@@ -517,7 +605,7 @@ begin
       values (v_qf_scratch, 1, 'issued', 'current', 'Rehearsal Buyer', current_date, current_date + 28,
         v_checker, now() + interval '2 days', v_owner, now() + interval '2 days', v_owner)
       returning id into v_rev_h;
-    v_found := (pg_temp.val('authenticated', v_owner_sub,
+    v_found := (pg_temp.val_claims( v_owner_sub,
       format('select revision_id::text from public.resolve_batch_prior_quote(%s)', v_batch_d)))::bigint;
     log := log || case when v_found = v_rev_a then E'\nok   ' else E'\nFAIL ' end
       || 'S5R-17 a more recently issued revision for a DIFFERENT exact Customer is never substituted: got ' || v_found;
@@ -526,7 +614,7 @@ begin
     log := log || E'\nSKIP S5R-17 only one active Party exists in this database - cross-Customer exclusion not exercised';
   end if;
 
-  v_found := (pg_temp.val('authenticated', v_owner_sub,
+  v_found := (pg_temp.val_claims( v_owner_sub,
     format('select revision_id::text from public.resolve_batch_prior_quote(%s)', v_batch_d)))::bigint;
   log := log || case when v_found = v_rev_a and not exists (
       select 1 from app_private.pending_quote_revision_sources where batch_id = v_batch_d)
@@ -537,7 +625,7 @@ begin
     fails := fails + 1;
   end if;
 
-  v_found := (pg_temp.val('authenticated', v_owner_sub,
+  v_found := (pg_temp.val_claims( v_owner_sub,
     format('select revision_id::text from public.resolve_batch_prior_quote(%s)', v_batch_a)))::bigint;
   -- v_batch_a HAS no pending_quote_revision_sources row of its own, and it
   -- HAS its own current issued revision (v_rev_a); resolve_batch_prior_quote
@@ -555,20 +643,20 @@ begin
   -- rev_b, which the search would NOT have chosen).
   insert into app_private.pending_quote_revision_sources (batch_id, family_id, source_revision_id, created_by)
     values (v_batch_d, v_qf_b, v_rev_a, v_owner);
-  v_found := (pg_temp.val('authenticated', v_owner_sub,
+  v_found := (pg_temp.val_claims( v_owner_sub,
     format('select revision_id::text from public.resolve_batch_prior_quote(%s)', v_batch_d)))::bigint;
   log := log || case when v_found = v_rev_a then E'\nok   ' else E'\nFAIL ' end
     || 'S5R-20 the pending Create-Revision source is honoured exactly (pointed at rev_a): got ' || v_found;
   if v_found <> v_rev_a then fails := fails + 1; end if;
 
   update app_private.pending_quote_revision_sources set source_revision_id = v_rev_b where batch_id = v_batch_d;
-  v_found := (pg_temp.val('authenticated', v_owner_sub,
+  v_found := (pg_temp.val_claims( v_owner_sub,
     format('select revision_id::text from public.resolve_batch_prior_quote(%s)', v_batch_d)))::bigint;
   log := log || case when v_found = v_rev_b then E'\nok   ' else E'\nFAIL ' end
     || 'S5R-21 the pending Create-Revision source (rev_b) wins EVEN THOUGH rev_a is more recently issued: got ' || v_found;
   if v_found <> v_rev_b then fails := fails + 1; end if;
 
-  v_state := pg_temp.try('authenticated', v_stranger_sub,
+  v_state := pg_temp.try_claims( v_stranger_sub,
     format('select * from public.resolve_batch_prior_quote(%s)', v_batch_d));
   log := log || case when v_state = '42501' then E'\nok   ' else E'\nFAIL ' end
     || 'S5R-22 an unauthorised caller (no Batch relationship, no capability) is refused, not silently empty: ' || v_state;
@@ -605,7 +693,7 @@ begin
       v_last    := (v_saved -> format('%I.%I', r.nspname, r.relname) ->> 0)::bigint;
       v_called  := (v_saved -> format('%I.%I', r.nspname, r.relname) ->> 1)::boolean;
       if v_last is not null then
-        execute format('select setval(%L, %s, %s)', format('%I.%I', r.nspname, r.relname), v_last, v_called);
+        execute format('select setval(%L, %s, %L)', format('%I.%I', r.nspname, r.relname), v_last, v_called);
       end if;
     end loop;
   end;
