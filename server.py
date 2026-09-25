@@ -33,7 +33,7 @@ import secrets
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from copy import copy
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 
@@ -236,13 +236,16 @@ def export_xlsx():
     fname      = data.get("filename", "AvadhootPacks_Quote.xlsx")
     # Fix 9: read meta fields sent by the frontend
     meta = {
-        "quoteRef":      data.get("quoteRef",      ""),
+        # Local/export scratch output is never an official Quote.  In
+        # particular, ignore a stale browser's historical quoteRef payload.
+        "quoteRef":      "",
         "makerName":     data.get("makerName",     ""),
         "quoteDate":     data.get("quoteDate",     ""),
         "effectiveFrom": data.get("effectiveFrom", ""),
         "effectiveTo":   data.get("effectiveTo",   ""),
         "beta":          data.get("beta") is True,
         "marginPP":      data.get("marginPP"),
+        "quickCalculation": True,
     }
     buf = _fill_master_workbook(items, rates, freight, meta)
     if isinstance(buf, tuple):          # an error response, not a workbook
@@ -274,6 +277,7 @@ def _fill_master_workbook(items, rates, freight, meta):
     effective_from  = meta.get("effectiveFrom") or ""
     effective_to    = meta.get("effectiveTo")   or ""
     beta_export     = meta.get("beta") is True
+    quick_calculation = meta.get("quickCalculation") is True
     data            = {"marginPP": meta.get("marginPP")}
 
     wb     = openpyxl.load_workbook(TEMPLATE_PATH)
@@ -406,7 +410,9 @@ def _fill_master_workbook(items, rates, freight, meta):
     except ValueError:
         ws_cbb["B4"] = datetime.now()
     mat_codes = ", ".join(i["spec"].get("material_code", "") for i in items if i["spec"].get("material_code"))
-    reference_line = (f"{quote_ref} | {mat_codes}") if quote_ref else mat_codes
+    reference_line = (f"QUICK CALCULATION — NOT A QUOTE | {mat_codes}"
+                      if quick_calculation else
+                      (f"{quote_ref} | {mat_codes}" if quote_ref else mat_codes))
     ws_cbb["D4"] = f"BETA | {reference_line}" if beta_export else reference_line
 
     # Rate parameters
@@ -3620,6 +3626,16 @@ def _optional_nonnegative_numeric(data, key, max_value=None):
     return float(parsed), None
 
 
+def _optional_nonnegative_integer(data, key):
+    """Blank stays blank, 0 stays 0; a whole non-negative number only (bigint columns)."""
+    value, err = _optional_nonnegative_numeric(data, key)
+    if err or value is None:
+        return value, err
+    if value != int(value):
+        return None, _invalid_input(f"{key} must be blank or a whole non-negative number")
+    return int(value), None
+
+
 def _pricing_group_input(client, batch_id, data, existing):
     """Validate one complete Pricing Group commercial-terms replacement."""
     expected = _int_field(data, "expected_content_version")
@@ -3834,7 +3850,8 @@ def _read_quote_workspace(client, quote_reference=None, revision_id=None, batch_
 
     family["batch"] = one(
         "batch", "batches",
-        "id, batch_reference, family_id, plant_id, owner_user_id, sector_id, status, content_version, "
+        "id, batch_reference, family_id, customer_party_id, plant_id, owner_user_id, sector_id, "
+        "status, content_version, "
         "pricing_date, pricing_basis_release_id, pricing_basis_is_deliberate, created_at, created_by",
         family.get("batch_id"))
     if family.get("batch"):
@@ -3899,6 +3916,10 @@ def _read_quote_workspace(client, quote_reference=None, revision_id=None, batch_
         "customer_outcomes", "customer_outcome_events",
         "id, revision_id, outcome, acceptance_date, acceptance_reference, note, recorded_by, occurred_at",
         "revision_id", revision_ids)
+    share_events = many_for(
+        "share_events", "quote_share_events",
+        "id, revision_id, channel, shared_on, external_reference, shared_by, occurred_at",
+        "revision_id", revision_ids)
 
     snapshots_by_id = {str(row["id"]): row for row in snapshots}
     links_by_item = {}
@@ -3921,6 +3942,7 @@ def _read_quote_workspace(client, quote_reference=None, revision_id=None, batch_
             + [snapshot.get("calculated_by") for snapshot in snapshots]
             + [event.get("actor_user_id") for event in workflow_events]
             + [event.get("recorded_by") for event in outcome_events]
+            + [event.get("shared_by") for event in share_events]
         ) if actor_id is not None
     }
     actors = {}
@@ -3937,6 +3959,10 @@ def _read_quote_workspace(client, quote_reference=None, revision_id=None, batch_
     for event in outcome_events:
         event["recorded_by_actor"] = actors.get(str(event.get("recorded_by")))
         outcomes_by_revision.setdefault(str(event["revision_id"]), []).append(event)
+    shares_by_revision = {}
+    for event in share_events:
+        event["shared_by_actor"] = actors.get(str(event.get("shared_by")))
+        shares_by_revision.setdefault(str(event["revision_id"]), []).append(event)
 
     for revision in revisions:
         revision["created_by_actor"] = actors.get(str(revision.get("created_by")))
@@ -3953,6 +3979,9 @@ def _read_quote_workspace(client, quote_reference=None, revision_id=None, batch_
             key=lambda event: (event.get("occurred_at") or "", event.get("id")))
         revision["customer_outcomes"] = sorted(
             outcomes_by_revision.get(str(revision["id"]), []),
+            key=lambda event: (event.get("occurred_at") or "", event.get("id")))
+        revision["share_events"] = sorted(
+            shares_by_revision.get(str(revision["id"]), []),
             key=lambda event: (event.get("occurred_at") or "", event.get("id")))
         revision["actions"] = quote_revision_actions(
             g.caller, family.get("batch"), revision, is_collaborator)
@@ -4061,7 +4090,7 @@ def _read_quote_catalogue(client, view):
             g.caller, {**(batch or {}), "plant": plant}, row)
         rows.append(row)
 
-    action_names = ("approve", "return", "withdraw", "issue", "create_revision")
+    action_names = ("approve", "return", "withdraw", "share", "create_revision")
 
     return {
         "view": view,
@@ -4079,7 +4108,11 @@ def _read_quote_catalogue(client, view):
     }
 
 
-def _read_batch_catalogue(client):
+_OPEN_BATCH_STATUSES = ("working", "sent", "submitted", "approved")
+_CLOSED_BATCH_STATUSES = ("issued_locked", "abandoned", "archived")
+
+
+def _read_batch_catalogue(client, *, scope="open", before_id=None):
     """Build the bounded caller-visible U4 Batch operational catalogue.
 
     `batches_select` remains the authority for which rows exist in this result.
@@ -4087,16 +4120,19 @@ def _read_batch_catalogue(client):
     denied or RLS-hidden supporting record is therefore partial catalogue
     evidence, never a reason to substitute a privileged or inferred identity.
 
-    The 51-row read makes the 50-row display boundary observable. Search and
-    filters are deliberately described as applying to that displayed window;
-    cursor pagination becomes mandatory once the boundary is reached in normal
-    use (recorded in the U4 catalogue increment note).
+    Filter lifecycle on the server before limiting, then page by descending
+    durable Batch ID. A full page can always be continued; Quote History is
+    never mixed into this operational list.
     """
-    batches = (client.table("batches").select(
-        "id, batch_reference, family_id, plant_id, owner_user_id, sector_id, status, "
+    statuses = _OPEN_BATCH_STATUSES if scope == "open" else _CLOSED_BATCH_STATUSES
+    query = (client.table("batches").select(
+        "id, batch_reference, family_id, customer_party_id, plant_id, owner_user_id, sector_id, status, "
         "content_version, pricing_date, pricing_basis_release_id, "
         "pricing_basis_is_deliberate, created_at, created_by"
-    ).order("created_at", desc=True).limit(51).execute()).data or []
+    ).in_("status", statuses))
+    if before_id is not None:
+        query = query.lt("id", before_id)
+    batches = (query.order("id", desc=True).limit(51).execute()).data or []
     results_limited = len(batches) > 50
     batches = batches[:50]
 
@@ -4164,12 +4200,16 @@ def _read_batch_catalogue(client):
         row["actions"] = batch_actions(g.caller, row)
         rows.append(row)
 
-    action_names = ("calculate", "send", "submit", "approve", "return", "issue")
+    action_names = ("calculate", "send", "submit", "approve", "return", "share")
 
     return {
         "rows": rows,
         "display_limit": 50,
         "results_limited": results_limited,
+        "scope": scope,
+        "open_statuses": list(_OPEN_BATCH_STATUSES),
+        "closed_statuses": list(_CLOSED_BATCH_STATUSES),
+        "next_cursor": batches[-1]["id"] if results_limited else None,
         "filter_scope": "displayed_newest_first_window",
         "details_partial": bool(partial or denied),
         "partial_sections": sorted(set(partial)),
@@ -4185,7 +4225,7 @@ def _read_batch_catalogue(client):
 def _read_batch_workspace(client, batch_id):
     """Assemble the caller-visible, read-only durable Batch workspace."""
     batch_rows = (client.table("batches").select(
-        "id, batch_reference, family_id, plant_id, owner_user_id, sector_id, status, "
+        "id, batch_reference, family_id, customer_party_id, plant_id, owner_user_id, sector_id, status, "
         "price_validity_from, price_validity_to, content_version, created_at, created_by, "
         "pricing_date, pricing_basis_release_id, pricing_basis_is_deliberate"
     ).eq("id", batch_id).limit(1).execute()).data or []
@@ -4210,6 +4250,10 @@ def _read_batch_workspace(client, batch_id):
     batch["family"] = one(
         "customer_family", "customer_families",
         "id, group_customer_code, name, status, content_version", batch["family_id"])
+    batch["customer_party"] = one(
+        "customer_party", "parties",
+        "id, customer_code, display_name, lifecycle_state, status",
+        batch.get("customer_party_id"))
     batch["owner"] = one(
         "owner", "app_users", "id, display_name, status", batch["owner_user_id"])
     batch["sector"] = one(
@@ -4286,7 +4330,7 @@ def _read_batch_workspace(client, batch_id):
     deliveries, deliveries_denied = _optional_caller_rows(
         client.table("delivery_groups").select(
             "id, pricing_group_id, batch_id, label, bill_to_location_id, "
-            "ship_to_location_id, route_notes, status"
+            "ship_to_location_id, destination_text, billing_text, route_notes, status"
         ).eq("batch_id", batch_id))
     if deliveries_denied:
         denied.append("delivery_groups")
@@ -4426,9 +4470,12 @@ def _read_batch_row_options(client, batch_id):
         parties = (client.table("parties")
                    .select("id, customer_code, display_name, lifecycle_state, status")
                    .in_("id", sorted(family_party_ids))
-                   .eq("status", "active").execute()).data or []
+                   .in_("status", ["proposed", "active"]).execute()).data or []
     party_by_id = {party["id"]: party for party in parties
-                   if party.get("id") in family_party_ids}
+                   if party.get("id") in family_party_ids and
+                   ((party.get("lifecycle_state") == "customer" and party.get("status") == "active")
+                    or (party.get("lifecycle_state") == "prospect"
+                        and party.get("status") in ("proposed", "active")))}
 
     skus = (client.table("skus")
             .select("id, plant_id, party_id, plant_item_code, status, replacement_sku_id, content_version")
@@ -4439,7 +4486,8 @@ def _read_batch_row_options(client, batch_id):
 
     versions = (client.table("sku_versions").select(
         "id, sku_id, plant_id, version_no, construction_version_id, is_price_driving, "
-        "length_mm, width_mm, height_mm, box_type, ups, spec_bs, spec_bct, spec_ect, approved_at"
+        "length_mm, width_mm, height_mm, box_type, ups, spec_bs, spec_bct, spec_ect, "
+        "item_name, item_short_name, approved_at"
     ).eq("plant_id", batch["plant_id"]).execute()).data or []
     # Amendment 04 D-01: an unapproved version is quotable too; it is labelled, never hidden.
     versions = [{**version, "approved": version.get("approved_at") is not None} for version in versions
@@ -4483,6 +4531,14 @@ def _read_batch_row_options(client, batch_id):
         if reference.get("sku_id") in sku_ids:
             references_by_sku.setdefault(reference["sku_id"], []).append(reference)
 
+    recent_use = {}
+    if sku_ids:
+        use_rows, _ = _optional_caller_rows(client.table("batch_rows")
+            .select("sku_id, created_at").in_("sku_id", sorted(sku_ids))
+            .eq("status", "active").order("created_at", desc=True).limit(500))
+        for row in use_rows:
+            recent_use.setdefault(row.get("sku_id"), row.get("created_at"))
+
     versions_by_sku = {}
     for version in versions:
         construction_version = construction_version_by_id.get(version["construction_version_id"])
@@ -4510,6 +4566,7 @@ def _read_batch_row_options(client, batch_id):
                 references_by_sku.get(sku["id"], []),
                 key=lambda reference: (reference.get("reference_kind") or "",
                                        reference.get("reference_value") or "")),
+            "last_used_at": recent_use.get(sku["id"]),
             "versions": sku_versions,
         })
     out.sort(key=lambda sku: (
@@ -4517,7 +4574,14 @@ def _read_batch_row_options(client, batch_id):
         sku.get("plant_item_code") or "",
         sku.get("id") or 0,
     ))
-    return {"batch": batch, "skus": out}
+    construction_options = sorted(({
+        "id": version["id"], "construction_id": version.get("construction_id"),
+        "version_no": version.get("version_no"),
+        "construction": construction_by_id.get(version.get("construction_id")),
+    } for version in construction_versions if version["id"] in adopted_version_ids),
+        key=lambda item: ((item["construction"] or {}).get("construction_code") or "",
+                          item.get("version_no") or 0))
+    return {"batch": batch, "skus": out, "construction_options": construction_options}
 
 
 def _decorate_workspace_for_caller(batch):
@@ -4607,6 +4671,10 @@ _BATCH_ROW_ADDON_FIELDS = (
     "addon_moq_charge", "addon_packing", "addon_other", "addon_unloading",
 )
 _BATCH_ROW_NUMERIC_FIELDS = (*_BATCH_ROW_OVERRIDE_FIELDS, *_BATCH_ROW_ADDON_FIELDS, "fluting_bcf")
+# S3: row-owned quantities. Both are governed calculation inputs (the S7-R
+# effective-input gatherer reads them) and Send snapshots them, but no route
+# wrote them, so every durable row held null. bigint columns: whole numbers only.
+_BATCH_ROW_QUANTITY_FIELDS = ("volume", "sales_moq")
 
 
 def _batch_row_input(client, batch_id, data, existing_sku_id=None, existing_overrides=None):
@@ -4637,7 +4705,7 @@ def _batch_row_input(client, batch_id, data, existing_sku_id=None, existing_over
                     if item["id"] == sku_version_id), None)
     if sku is None or version is None:
         return None, _invalid_input(
-            "The selected SKU Version is not an approved, plant-adopted option for this Batch Family.")
+            "The selected SKU Version is not a non-withdrawn, plant-adopted option for this Batch Family.")
 
     groups = (client.table("pricing_groups").select("id, batch_id, status")
               .eq("id", pricing_group_id).eq("batch_id", batch_id).limit(1).execute()).data or []
@@ -4655,6 +4723,13 @@ def _batch_row_input(client, batch_id, data, existing_sku_id=None, existing_over
             return None, err
     if numeric_values["fluting_bcf"] is not None and numeric_values["fluting_bcf"] > 0.30:
         return None, _invalid_input("fluting_bcf must be blank or between 0 and 0.30")
+    for key in _BATCH_ROW_QUANTITY_FIELDS:
+        if key not in data and existing_overrides is not None:
+            numeric_values[key] = existing_overrides.get(key)
+            continue
+        numeric_values[key], err = _optional_nonnegative_integer(data, key)
+        if err:
+            return None, err
     return {
         "pricing_group_id": pricing_group_id,
         "sku_id": sku_id,
@@ -4705,13 +4780,21 @@ def get_batch_create_options():
     client = get_supabase_for_caller(g.access_token)
     families = (client.table("customer_families")
                 .select("id, group_customer_code, name, status")
-                .eq("status", "active").execute()).data or []
+                .in_("status", ["proposed", "active"]).execute()).data or []
     memberships = (client.table("party_family_memberships")
                    .select("party_id, family_id, is_current")
                    .eq("is_current", True).execute()).data or []
     parties = (client.table("parties")
                .select("id, customer_code, display_name, lifecycle_state, status")
-               .eq("status", "active").execute()).data or []
+               .in_("status", ["proposed", "active"]).execute()).data or []
+    parties = [party for party in parties if
+               (party.get("lifecycle_state") == "customer" and party.get("status") == "active")
+               or (party.get("lifecycle_state") == "prospect"
+                   and party.get("status") in ("proposed", "active"))]
+    locations, locations_denied = _optional_caller_rows(
+        client.table("customer_locations").select(
+            "id, party_id, location_code, bill_to_eligible, ship_to_eligible, status"
+        ).eq("status", "active"))
     plants = (client.table("plants")
               .select("id, plant_code, name, status")
               .eq("status", "active").execute()).data or []
@@ -4728,6 +4811,19 @@ def get_batch_create_options():
     plants = [plant for plant in plants if plant.get("plant_code") in maker_codes]
 
     party_by_id = {str(party["id"]): party for party in parties}
+    locations_by_party = {}
+    for location in locations:
+        if str(location.get("party_id")) in party_by_id:
+            locations_by_party.setdefault(str(location["party_id"]), []).append(location)
+    for party in parties:
+        party["delivery_locations"] = sorted(
+            (location for location in locations_by_party.get(str(party["id"]), [])
+             if location.get("ship_to_eligible")),
+            key=lambda location: location.get("location_code") or str(location.get("id")))
+        party["billing_locations"] = sorted(
+            (location for location in locations_by_party.get(str(party["id"]), [])
+             if location.get("bill_to_eligible")),
+            key=lambda location: location.get("location_code") or str(location.get("id")))
     members_by_family = {}
     for membership in memberships:
         party = party_by_id.get(str(membership.get("party_id")))
@@ -4756,6 +4852,7 @@ def get_batch_create_options():
         "sectors": sectors,
         "sectors_denied": sectors_denied,
         "family_sectors_denied": family_sectors_denied,
+        "locations_denied": locations_denied,
         "mutation": "create_batch_rpc_only",
     })
 
@@ -4763,7 +4860,7 @@ def get_batch_create_options():
 @app.route("/batches", methods=["POST"])
 @require_auth
 def create_batch_route():
-    """Create and read back one governed Batch through public.create_batch."""
+    """Create and read back a complete customer handoff in one governed RPC."""
     data = request.get_json(force=True) or {}
     family_id = _int_field(data, "family_id")
     plant_id = _int_field(data, "plant_id")
@@ -4774,18 +4871,54 @@ def create_batch_route():
     sector_id = _int_field(data, "sector_id")
     if sector_id is None or sector_id < 1:
         return _invalid_input("sector_id is required")
+    party_id = _int_field(data, "customer_party_id")
+    if party_id is None or party_id < 1:
+        return _invalid_input("customer_party_id is required")
+    ship_to_id = _int_field(data, "ship_to_location_id")
+    if data.get("ship_to_location_id") not in (None, "") and (ship_to_id is None or ship_to_id < 1):
+        return _invalid_input("ship_to_location_id must be a valid Location")
+    bill_to_id = _int_field(data, "bill_to_location_id")
+    if data.get("bill_to_location_id") not in (None, "") and (bill_to_id is None or bill_to_id < 1):
+        return _invalid_input("bill_to_location_id must be a valid Location")
+    raw_destination = data.get("delivery_destination")
+    if raw_destination is not None and not isinstance(raw_destination, str):
+        return _invalid_input("delivery_destination must be text")
+    destination_text = (raw_destination or "").strip()
+    if not ship_to_id and not destination_text:
+        return _invalid_input("delivery_destination is required when no active Ship-to Location is selected")
+    if len(destination_text) > 500:
+        return _invalid_input("delivery_destination must be 500 characters or fewer")
+    raw_billing = data.get("billing_destination")
+    if raw_billing is not None and not isinstance(raw_billing, str):
+        return _invalid_input("billing_destination must be text")
+    billing_text = (raw_billing or "").strip()
+    if not bill_to_id and not billing_text:
+        return _invalid_input("billing_destination is required when no active Bill-to Location is selected")
+    if len(billing_text) > 500:
+        return _invalid_input("billing_destination must be 500 characters or fewer")
+    payment_days = _int_field(data, "payment_terms_days")
+    if payment_days not in (30, 45, 60, 90):
+        return _invalid_input("payment_terms_days must be 30, 45, 60 or 90")
+    if "read_party_master" not in (g.caller.get("group_capabilities") or []):
+        return _error("CAPABILITY_REQUIRED")
 
     client = get_supabase_for_caller(g.access_token)
-    result, err = _rpc_call(client, "create_batch", {
+    result, err = _rpc_call(client, "create_batch_handoff", {
         "p_family": family_id,
         "p_plant": plant_id,
         "p_sector": sector_id,
+        "p_party": party_id,
+        "p_ship_to": ship_to_id,
+        "p_bill_to": bill_to_id,
+        "p_destination_text": destination_text or None,
+        "p_billing_text": billing_text or None,
+        "p_payment_terms_days": payment_days,
     })
     if err:
         return err
     batch_id = _rpc_scalar_id(result)
     if batch_id is None:
-        app.logger.error("create_batch returned an invalid scalar identity")
+        app.logger.error("create_batch_handoff returned an invalid scalar identity")
         return _error("INTERNAL_ERROR")
     return _workspace_write_response(client, batch_id, "create_batch", status=201)
 
@@ -4898,9 +5031,18 @@ def get_batch_workspace(batch_id):
 @app.route("/batches/catalogue", methods=["GET"])
 @require_auth
 def get_batch_catalogue():
-    """List the bounded caller-visible durable Batch operational window."""
+    """List caller-visible unfinished or terminal Batches, paged server-side."""
+    scope = request.args.get("scope", "open")
+    if scope not in ("open", "closed"):
+        return _invalid_input("scope must be open or closed")
+    before_id = request.args.get("before_id")
+    if before_id is not None:
+        if not before_id.isdigit() or int(before_id) < 1:
+            return _invalid_input("before_id must be a positive Batch ID")
+        before_id = int(before_id)
     try:
-        catalogue = _read_batch_catalogue(get_supabase_for_caller(g.access_token))
+        catalogue = _read_batch_catalogue(get_supabase_for_caller(g.access_token),
+                                          scope=scope, before_id=before_id)
     except APIError as exc:
         if exc.code == "42501":
             return _error("CAPABILITY_REQUIRED")
@@ -4959,6 +5101,333 @@ def get_quote_workspace():
     })
 
 
+def _evidence(value):
+    """A frozen fact, or the literal string 'unavailable' - never a fabricated zero."""
+    return value if value is not None else "unavailable"
+
+
+# No frozen descriptive product text (item name, material code) is captured
+# anywhere in effective_inputs today - only internal ids (sku_id,
+# sku_version_id). Rather than resolve a name from CURRENT SKU master data
+# (which the SD explicitly forbids for an old Quote), every comparison row
+# says so plainly and keeps the frozen id as secondary evidence.
+_DESCRIPTIVE_IDENTITY_UNAVAILABLE = "descriptive_identity_unavailable_only_frozen_id"
+
+
+def _revision_item_facts(item):
+    """Pull the D-5 comparison facts out of one frozen Quote item.
+
+    Reads only immutable calculation_snapshot evidence (typed columns plus
+    the frozen effective_inputs produced by app_private.build_effective_inputs
+    at calculate time) - never current Batch/SKU/master data. Field names are
+    literal about what each frozen value actually is: `final_rate` is the
+    quoted per-piece rate (the genuine D-5 lead fact); `total_cost` is a
+    per-piece cost-before-margin figure, not a customer order line total -
+    this schema captures no genuine frozen ORDER quantity or line total, so
+    none is fabricated here.
+    """
+    snapshot = (item or {}).get("calculation_snapshot") or {}
+    inputs = snapshot.get("effective_inputs") or {}
+    provenance = inputs.get("provenance") or {}
+    entered = inputs.get("entered") or {}
+    return {
+        "sku_id": provenance.get("sku_id"),
+        "sku_version_id": provenance.get("sku_version_id"),
+        "construction_version_id": provenance.get("construction_version_id"),
+        "descriptive_identity": _DESCRIPTIVE_IDENTITY_UNAVAILABLE,
+        "rate": snapshot.get("final_rate"),
+        "cost_before_margin_per_pc": snapshot.get("total_cost"),
+        "monthly_volume": entered.get("volume"),
+        "sales_moq": entered.get("sales_moq"),
+        "margin_pct": snapshot.get("effective_margin_pct"),
+        "input_disclosure": {
+            "waste_pct": snapshot.get("effective_waste_pct"),
+            "waste_source": snapshot.get("waste_source"),
+            "conv_rate": snapshot.get("effective_conv_rate"),
+            "conv_source": snapshot.get("conv_source"),
+            "sku_version_id": provenance.get("sku_version_id"),
+            "construction_version_id": provenance.get("construction_version_id"),
+            "construction_version_origin": provenance.get("construction_version_origin"),
+            "length_mm": entered.get("length_mm"),
+            "width_mm": entered.get("width_mm"),
+            "height_mm": entered.get("height_mm"),
+            "sales_moq": entered.get("sales_moq"),
+        },
+        "authority_disclosure": {
+            "pricing_basis_release_id": snapshot.get("pricing_basis_release_id"),
+            "calculation_default_version_id": snapshot.get("calculation_default_version_id"),
+            "engine_version": snapshot.get("engine_version"),
+            "rounding_rule_version": snapshot.get("rounding_rule_version"),
+            "interest_pct": snapshot.get("effective_interest_pct"),
+            "interest_source": snapshot.get("interest_source"),
+            "freight_value": snapshot.get("effective_freight"),
+            "freight_source": snapshot.get("freight_source"),
+            "freight_authority": snapshot.get("freight_authority"),
+            "freight_set_version_id": snapshot.get("freight_set_version_id"),
+            "freight_entry_id": snapshot.get("freight_entry_id"),
+        },
+    }
+
+
+def _numeric_movement(previous, current):
+    if not isinstance(previous, (int, float)) or not isinstance(current, (int, float)):
+        return "unavailable"
+    return current - previous
+
+
+def _index_items_by_lineage(revision):
+    return {item.get("batch_row_lineage_id"): item for item in (revision or {}).get("items", [])}
+
+
+def _index_items_by_sku(revision):
+    index = {}
+    for item in (revision or {}).get("items", []):
+        sku_id = _revision_item_facts(item).get("sku_id")
+        index.setdefault(sku_id, []).append(item)
+    return index
+
+
+def _match_revision_items(current_revision, prior_revision):
+    """Pair frozen items across two revisions with a deterministic rule.
+
+    Same Quote-family chain (an ordinary revision-to-revision comparison,
+    e.g. against source_revision_id): match by the immutable
+    batch_row_lineage_id, which is stable only within one Batch/revision
+    chain.
+
+    Cross-Batch (a Slice A "Last Quote" comparison against a different
+    Family's revision): batch_row_lineage_id values are unrelated between
+    Batches and would misclassify every row as added/removed. Match instead
+    by frozen SKU identity, and ONLY when it produces an unambiguous
+    one-to-one pairing. A SKU id repeated on either side is never guessed at
+    - both occurrences are reported explicitly as added/removed with an
+    "ambiguous_sku_duplicate" match basis, and the SKU id is surfaced so the
+    caller can disclose the limitation.
+
+    Returns (pairs, ambiguous_sku_ids) where each pair is
+    (key, prior_item_or_None, current_item_or_None, match_basis).
+    """
+    same_chain = (current_revision or {}).get("family_id") is not None and (
+        (current_revision or {}).get("family_id") == (prior_revision or {}).get("family_id"))
+
+    if same_chain:
+        current_by_key = _index_items_by_lineage(current_revision)
+        prior_by_key = _index_items_by_lineage(prior_revision)
+        keys = sorted(set(current_by_key) | set(prior_by_key), key=lambda value: (value is None, value))
+        return [(key, prior_by_key.get(key), current_by_key.get(key), "lineage") for key in keys], []
+
+    current_by_sku = _index_items_by_sku(current_revision)
+    prior_by_sku = _index_items_by_sku(prior_revision)
+    sku_ids = sorted(set(current_by_sku) | set(prior_by_sku), key=lambda value: (value is None, value))
+    pairs = []
+    ambiguous_sku_ids = []
+    for sku_id in sku_ids:
+        current_list = current_by_sku.get(sku_id, [])
+        prior_list = prior_by_sku.get(sku_id, [])
+        if sku_id is not None and len(current_list) <= 1 and len(prior_list) <= 1:
+            current_item = current_list[0] if current_list else None
+            prior_item = prior_list[0] if prior_list else None
+            key = (current_item or prior_item or {}).get("batch_row_lineage_id")
+            pairs.append((key, prior_item, current_item, "sku_identity"))
+        else:
+            # sku_id is None (identity itself unavailable) or duplicated on a
+            # side: never invent a pairing, report every occurrence as its
+            # own added/removed row instead.
+            if sku_id is not None and (len(current_list) > 1 or len(prior_list) > 1):
+                ambiguous_sku_ids.append(sku_id)
+            for item in prior_list:
+                pairs.append((item.get("batch_row_lineage_id"), item, None, "ambiguous_sku_duplicate"
+                              if sku_id is not None else "sku_identity_unavailable"))
+            for item in current_list:
+                pairs.append((item.get("batch_row_lineage_id"), None, item, "ambiguous_sku_duplicate"
+                              if sku_id is not None else "sku_identity_unavailable"))
+    return pairs, ambiguous_sku_ids
+
+
+def _build_revision_comparison(current_revision, prior_revision):
+    """S5 Slice B: one pure, price-first comparison of frozen evidence.
+
+    Every fact is read from frozen evidence; nothing here can be altered by
+    current Batch, Customer, SKU or master data. This schema has no genuine
+    frozen customer order quantity or line total, so none is fabricated -
+    "Monthly volume" and "Cost before margin / pc" are named for what they
+    actually are, and the quoted rate leads (D-5).
+    """
+    pairs, ambiguous_sku_ids = _match_revision_items(current_revision, prior_revision)
+
+    rows = []
+    for key, prior_item, current_item, match_basis in pairs:
+        if prior_item is None:
+            row_status = "added"
+        elif current_item is None:
+            row_status = "removed"
+        else:
+            row_status = "matched"
+        prior_facts = _revision_item_facts(prior_item) if prior_item else None
+        current_facts = _revision_item_facts(current_item) if current_item else None
+        prev_rate = (prior_facts or {}).get("rate")
+        curr_rate = (current_facts or {}).get("rate")
+        rows.append({
+            "batch_row_lineage_id": key,
+            "status": row_status,
+            "match_basis": match_basis,
+            "sku_id": (current_facts or prior_facts or {}).get("sku_id"),
+            "sku_version_id": (current_facts or prior_facts or {}).get("sku_version_id"),
+            "descriptive_identity": (current_facts or prior_facts or {}).get("descriptive_identity"),
+            "previous_rate": _evidence(prev_rate),
+            "current_rate": _evidence(curr_rate),
+            "rate_movement": _numeric_movement(prev_rate, curr_rate),
+            "previous_monthly_volume": _evidence((prior_facts or {}).get("monthly_volume")),
+            "current_monthly_volume": _evidence((current_facts or {}).get("monthly_volume")),
+            "quote_line_total": "not_applicable_no_frozen_order_quantity",
+            "previous_cost_before_margin_per_pc": _evidence((prior_facts or {}).get("cost_before_margin_per_pc")),
+            "current_cost_before_margin_per_pc": _evidence((current_facts or {}).get("cost_before_margin_per_pc")),
+            "previous_margin_pct": _evidence((prior_facts or {}).get("margin_pct")),
+            "current_margin_pct": _evidence((current_facts or {}).get("margin_pct")),
+            "previous_input_disclosure": (prior_facts or {}).get("input_disclosure"),
+            "current_input_disclosure": (current_facts or {}).get("input_disclosure"),
+            "previous_authority_disclosure": (prior_facts or {}).get("authority_disclosure"),
+            "current_authority_disclosure": (current_facts or {}).get("authority_disclosure"),
+        })
+
+    engines = {
+        ((row.get("previous_authority_disclosure") or {}).get("engine_version"))
+        for row in rows if row.get("previous_authority_disclosure")
+    } | {
+        ((row.get("current_authority_disclosure") or {}).get("engine_version"))
+        for row in rows if row.get("current_authority_disclosure")
+    }
+    engines.discard(None)
+    mixed_engine = len(engines) > 1
+
+    return {
+        "current_revision_id": current_revision.get("id"),
+        "prior_revision_id": prior_revision.get("id"),
+        "prior_revision_no": prior_revision.get("revision_no"),
+        "prior_standing": prior_revision.get("standing"),
+        "prior_workflow_status": prior_revision.get("workflow_status"),
+        "same_chain": (current_revision or {}).get("family_id") is not None and (
+            (current_revision or {}).get("family_id") == (prior_revision or {}).get("family_id")),
+        "mixed_engine": mixed_engine,
+        "ambiguous_sku_ids": ambiguous_sku_ids,
+        "line_total_note": "This schema records no genuine frozen customer order quantity or "
+                            "quote line total. Quoted rate leads the comparison; monthly volume "
+                            "is a calculation input, not an order quantity.",
+        "rows": rows,
+        "added_count": sum(1 for row in rows if row["status"] == "added"),
+        "removed_count": sum(1 for row in rows if row["status"] == "removed"),
+    }
+
+
+@app.route("/quotes/batches/<int:batch_id>/prior-quote", methods=["GET"])
+@require_auth
+def get_batch_prior_quote(batch_id):
+    """S5 Slice A: the exact prior Quote for this governed Batch, if any.
+
+    Never a Family-level or cross-plant substitute (see
+    app_private.resolve_batch_prior_quote). Distinguishes no-customer,
+    no-history and access-denied so the workspace can say the truth.
+    """
+    client = get_supabase_for_caller(g.access_token)
+    result, err = _rpc_call(client, "resolve_batch_prior_quote", {"p_batch": batch_id})
+    if err:
+        return err
+    rows = result.data or []
+    if rows:
+        return jsonify({
+            "status": "found",
+            "prior_quote": rows[0],
+            "authority": "caller_token_database_rpc",
+        })
+    try:
+        batch_rows = (client.table("batches").select("id, customer_party_id")
+                      .eq("id", batch_id).limit(1).execute()).data or []
+    except APIError as exc:
+        if exc.code == "42501":
+            batch_rows = []
+        else:
+            raise
+    if not batch_rows:
+        return _error("RECORD_NOT_FOUND")
+    status = "no_customer_selected" if not batch_rows[0].get("customer_party_id") else "no_history"
+    return jsonify({
+        "status": status,
+        "prior_quote": None,
+        "authority": "caller_token_database_rpc",
+    })
+
+
+@app.route("/quotes/revisions/<int:revision_id>/compare", methods=["GET"])
+@require_auth
+def get_quote_revision_compare(revision_id):
+    """S5 Slice B: price-first comparison of a revision against a prior one.
+
+    The prior revision is either this revision's own frozen
+    source_revision_id, or an explicit ?against=<revision_id> that this route
+    verifies, server-side, shares the exact same Customer/Prospect and Plant
+    as the current revision's Batch - never a guessed or Family-level match.
+    """
+    against_raw = (request.args.get("against") or "").strip()
+    against_id = None
+    if against_raw:
+        try:
+            against_id = int(against_raw)
+        except ValueError:
+            return _invalid_input("against must be a positive integer")
+        if against_id <= 0:
+            return _invalid_input("against must be a positive integer")
+
+    client = get_supabase_for_caller(g.access_token)
+    try:
+        current = _read_quote_workspace(client, revision_id=revision_id)
+    except Exception as exc:
+        if _is_upstream_timeout(exc):
+            return _error("UPSTREAM_TIMEOUT")
+        raise
+    if current is None:
+        return _error("RECORD_NOT_FOUND")
+
+    current_revision = next(
+        (row for row in current.get("revisions", []) if row["id"] == revision_id), None)
+    if current_revision is None:
+        return _error("RECORD_NOT_FOUND")
+
+    prior_id = against_id or current_revision.get("source_revision_id")
+    if prior_id is None:
+        return jsonify({
+            "comparison": None,
+            "reason": "no_source_revision",
+            "authority": "caller_token_rls_only",
+        })
+
+    try:
+        prior_family = _read_quote_workspace(client, revision_id=prior_id)
+    except Exception as exc:
+        if _is_upstream_timeout(exc):
+            return _error("UPSTREAM_TIMEOUT")
+        raise
+    if prior_family is None:
+        return _error("RECORD_NOT_FOUND")
+    prior_revision = next(
+        (row for row in prior_family.get("revisions", []) if row["id"] == prior_id), None)
+    if prior_revision is None:
+        return _error("RECORD_NOT_FOUND")
+
+    if against_id:
+        current_batch = (current.get("batch") or {})
+        prior_batch = (prior_family.get("batch") or {})
+        if (not current_batch.get("customer_party_id")
+                or current_batch.get("customer_party_id") != prior_batch.get("customer_party_id")
+                or current_batch.get("plant_id") != prior_batch.get("plant_id")):
+            return _error("RECORD_NOT_FOUND")
+
+    comparison = _build_revision_comparison(current_revision, prior_revision)
+    return jsonify({
+        "comparison": comparison,
+        "authority": "caller_token_rls_only",
+    })
+
+
 @app.route("/quotes/catalogue", methods=["GET"])
 @require_auth
 def get_quote_catalogue():
@@ -5007,7 +5476,7 @@ def get_batch_row_options(batch_id):
         return _error("RECORD_NOT_FOUND")
     return jsonify({
         **options,
-        "selection_contract": "approved_sku_version_with_plant_adopted_construction",
+        "selection_contract": "non_withdrawn_sku_version_with_plant_adopted_construction",
         "mutations": "caller_token_rls_only",
     })
 
@@ -5190,7 +5659,8 @@ def update_batch_row(batch_id, row_id):
                 .select("id, batch_id, sku_id, status, content_version, waste_override_pct, "
                         "margin_override_pct, conv_override_rate, freight_override, "
                         "addon_printing, addon_stitching, addon_coating, addon_handling, "
-                        "addon_moq_charge, addon_packing, addon_other, addon_unloading, fluting_bcf")
+                        "addon_moq_charge, addon_packing, addon_other, addon_unloading, fluting_bcf, "
+                        "volume, sales_moq")
                 .eq("id", row_id).eq("batch_id", batch_id).limit(1).execute()).data or []
     if not existing:
         return _error("RECORD_NOT_FOUND")
@@ -5206,7 +5676,7 @@ def update_batch_row(batch_id, row_id):
         return err
     updates = {key: values[key] for key in (
         "pricing_group_id", "sku_version_id", "row_type", "material_code",
-        *_BATCH_ROW_NUMERIC_FIELDS)}
+        *_BATCH_ROW_NUMERIC_FIELDS, *_BATCH_ROW_QUANTITY_FIELDS)}
     result, err = _caller_table_write(
         "update Batch row",
         lambda: client.table("batch_rows").update(updates)
@@ -5314,6 +5784,181 @@ def get_batch_row_effective_inputs(batch_id, row_id):
     })
 
 
+# ── S3 · one authoritative readiness result for a governed Batch ─────────────
+# The gatherer's PT422 refusals carry an application-authored reason code
+# (s7r_7, u2_proposed_skus_are_quotable). _rpc_call deliberately never returns
+# database text, so a blocker could not say WHICH field was missing. Only the
+# exact codes below are ever returned - anything else stays "not_ready" - and
+# each names the row, Pricing Group or Batch field the Maker has to fix.
+_READINESS_REASONS = {
+    "calculate_requires_maker": ("batch", "status",
+                                 "This Batch is submitted. Only a Maker revision can be recalculated."),
+    "row_inactive": ("row", "status", "This row is removed and is not calculated."),
+    "pricing_basis_absent": ("batch", "pricing_basis", "Select a Pricing Basis Release for this Batch."),
+    "pricing_basis_invalid": ("batch", "pricing_basis",
+                              "The selected Pricing Basis Release is not approved for this plant and pricing date."),
+    "sku_not_published": ("row", "sku", "This SKU is not quotable in its current state."),
+    "sku_withdrawn": ("row", "sku", "This SKU is withdrawn and cannot be quoted. Choose another SKU Version."),
+    "sku_version_unapproved": ("row", "sku", "This SKU Version is not approved for quotation."),
+    "dimensions_incomplete": ("row", "dimensions",
+                              "The SKU Version has no complete L x W x H. It needs a new SKU Version."),
+    "construction_reference_invalid": ("row", "construction",
+                                       "The Construction is not published and adopted at this plant."),
+    "basis_ship_to_retired": ("group", "freight_basis",
+                              "The freight-basis Ship-to location is retired. Choose another route for freight."),
+    "freight_unresolved": ("group", "freight",
+                           "Freight is unresolved for this Pricing Group and route."),
+    "supplier_credit_ambiguous": ("row", "rates",
+                                  "Supplier credit is ambiguous in the Rate Master for this row's materials."),
+}
+_CALCULATION_BLOCKERS = {
+    "not_calculated": "Not calculated yet. Recalculate before Send.",
+    "calculation_stale": "Inputs changed since the last calculation. Recalculate before Send.",
+    "unknown": "Calculation evidence is not visible to you, so this row cannot be confirmed current.",
+}
+_SENDABLE_FRESHNESS = ("fresh", "needs_send_only")
+
+
+def _calculation_freshness(calculation, binding, denied):
+    if denied:
+        return "unknown"
+    if calculation is None:
+        return "not_calculated"
+    if calculation.get("calculation_fingerprint") != binding.get("calculation_fingerprint"):
+        return "calculation_stale"
+    if calculation.get("presentation_fingerprint") != binding.get("presentation_fingerprint"):
+        return "needs_send_only"
+    return "fresh"
+
+
+def _row_readiness(client, batch_id, row):
+    """Gatherer + persisted calculation for one active row. Never writes."""
+    base = {"row_id": row["id"], "content_version": row.get("content_version"),
+            "pricing_group_id": row.get("pricing_group_id")}
+    try:
+        resolution = client.rpc("calculate_inputs", {"p_batch_row_id": row["id"]}).execute().data or {}
+    except APIError as exc:
+        if exc.code == "PT422":
+            reason = (exc.message or "").strip()
+            known = reason in _READINESS_REASONS
+            return {**base, "status": "blocked", "freshness": None,
+                    "reason": reason if known else "not_ready"}
+        if exc.code == "42501":
+            return {**base, "status": "denied", "freshness": None, "reason": "not_permitted"}
+        app.logger.error("readiness: unmapped gatherer error for Batch row %s: %s", row["id"], exc.code)
+        return {**base, "status": "unknown", "freshness": None, "reason": "unavailable"}
+    binding = resolution.get("binding") or {}
+    calculations, denied = _optional_caller_rows(
+        client.table("batch_calculations").select(
+            "id, batch_row_id, calculation_fingerprint, presentation_fingerprint, computed_at"
+        ).eq("batch_row_id", row["id"]).eq("batch_id", batch_id).limit(1))
+    calculation = calculations[0] if calculations else None
+    return {**base, "status": "ready", "reason": None,
+            "freshness": _calculation_freshness(calculation, binding, denied),
+            "calculation_id": calculation.get("id") if calculation else None,
+            "computed_at": calculation.get("computed_at") if calculation else None}
+
+
+def _batch_readiness(batch, rows):
+    """Blockers for Calculate and Send, each naming its exact target."""
+    blockers = []
+
+    def add(scope, code, field, message, blocks, row=None, group_id=None):
+        blockers.append({"scope": scope, "code": code, "field": field, "message": message,
+                         "blocks": blocks, "row_id": row["row_id"] if row else None,
+                         "pricing_group_id": group_id if group_id is not None
+                         else (row["pricing_group_id"] if row else None)})
+
+    if batch.get("status") != "working":
+        add("batch", "batch_not_working", "status", "This Batch is not in working state.",
+            ["calculate", "send"])
+    if not batch.get("caller_holds_lock"):
+        add("batch", "lock_required", "lock", "Acquire the Batch edit lock to calculate or send.",
+            ["calculate", "send"])
+    if not rows:
+        add("batch", "no_active_rows", "rows", "Add at least one product row.", ["calculate", "send"])
+
+    groups = {str(group["id"]): group for group in batch.get("pricing_groups") or []}
+    batch_level = set()
+    group_level = set()
+    for row in rows:
+        if row["status"] == "blocked":
+            scope, field, message = _READINESS_REASONS.get(
+                row["reason"], ("row", None, "This row is not ready for governed calculation."))
+            if scope == "batch":
+                if row["reason"] in batch_level:
+                    continue
+                batch_level.add(row["reason"])
+                add("batch", row["reason"], field, message, ["calculate", "send"])
+            else:
+                add(scope, row["reason"], field, message, ["calculate", "send"], row=row)
+        elif row["status"] in ("denied", "unknown"):
+            add("row", row["reason"], "calculation",
+                "This row's governed inputs could not be checked for you." if row["status"] == "denied"
+                else "This row's governed inputs could not be checked. Try again.",
+                ["calculate", "send"], row=row)
+        elif row["freshness"] not in _SENDABLE_FRESHNESS:
+            add("row", row["freshness"], "calculation", _CALCULATION_BLOCKERS[row["freshness"]],
+                ["send"], row=row)
+        group = groups.get(str(row.get("pricing_group_id")))
+        if group is None or group.get("status") != "active":
+            add("row", "pricing_group_inactive", "pricing_group",
+                "This row's Pricing Group is removed or unavailable. Reassign the row.", ["send"], row=row)
+        elif not any(route.get("status") == "active" for route in group.get("delivery_groups") or []):
+            key = ("delivery_group_absent", row.get("pricing_group_id"))
+            if key not in group_level:
+                group_level.add(key)
+                add("group", "delivery_group_absent", "delivery_route",
+                    "This Pricing Group has no active delivery route.", ["send"],
+                    group_id=row.get("pricing_group_id"))
+    return blockers
+
+
+@app.route("/batches/<int:batch_id>/readiness", methods=["GET"])
+@require_auth
+def get_batch_readiness(batch_id):
+    """Evaluate every active durable row of one Batch, as the caller, in one read.
+
+    The single readiness answer for the Batch workspace: the existing gatherer
+    per active row (whether governed Calculate can run) plus the persisted
+    calculation's freshness (whether Send can include it). It never calls the
+    calculation writer, and every blocker names its row, group or Batch field.
+    send_batch remains the enforcing check; this only reports ahead of it.
+    """
+    client = get_supabase_for_caller(g.access_token)
+    try:
+        batch = _read_batch_workspace(client, batch_id)
+    except APIError as exc:
+        if exc.code == "42501":
+            return _error("CAPABILITY_REQUIRED")
+        raise
+    except Exception as exc:
+        if _is_upstream_timeout(exc):
+            return _error("UPSTREAM_TIMEOUT")
+        raise
+    if batch is None:
+        return _error("RECORD_NOT_FOUND")
+    batch = _decorate_workspace_for_caller(batch)
+    try:
+        rows = [_row_readiness(client, batch_id, row)
+                for row in batch.get("batch_rows") or [] if row.get("status") == "active"]
+    except Exception as exc:
+        if _is_upstream_timeout(exc):
+            return _error("UPSTREAM_TIMEOUT")
+        raise
+    blockers = _batch_readiness(batch, rows)
+    return jsonify({
+        "batch_id": batch_id,
+        "batch_content_version": batch.get("content_version"),
+        "rows": rows,
+        "blockers": blockers,
+        "can_calculate": bool(rows) and not any("calculate" in item["blocks"] for item in blockers),
+        "can_send": bool(rows) and not blockers,
+        "evaluated_at": datetime.now().astimezone().isoformat(),
+        "mutation": "none",
+    })
+
+
 _CALCULATE_EXECUTOR_ERROR_MAP = {
     "AUTH_REQUIRED": "AUTH_REQUIRED",
     "42501": "CAPABILITY_REQUIRED",
@@ -5386,6 +6031,9 @@ def calculate_batch_row_route(batch_id, row_id):
 def send_batch_route(batch_id):
     """Atomically create the first immutable, unnumbered draft Quote candidate."""
     data = request.get_json(silent=True) or {}
+    if "customer_party_id" in data:
+        return _invalid_input(
+            "customer_party_id is selected on the governed Batch and cannot be supplied at Send")
     expected = _int_field(data, "expected_content_version")
     if expected is None or expected < 1:
         return _invalid_input("expected_content_version must be a positive integer")
@@ -5466,27 +6114,41 @@ def withdraw_quote_revision_route(revision_id):
         "p_revision": revision_id, "p_reason": reason.strip()})
 
 
-@app.route("/quotes/revisions/<int:revision_id>/issue", methods=["POST"])
+_SHARE_CHANNELS = (
+    "Email", "WhatsApp", "Printed/hand-delivered", "Customer portal", "Other",
+)
+
+
+@app.route("/quotes/revisions/<int:revision_id>/share", methods=["POST"])
 @require_auth
-def issue_quote_revision_route(revision_id):
+def share_quote_revision_route(revision_id):
+    """Atomically record manual customer sharing and transition to issued.
+
+    Recipient identity is intentionally absent from this request: the exact
+    Customer/Prospect was frozen at Send and is validated again in the RPC.
+    """
     data = request.get_json(silent=True) or {}
-    name = data.get("addressee_name")
-    details = data.get("addressee_details")
-    quote_date = data.get("quote_date")
-    validity = data.get("offer_validity_to")
-    if name is not None and not isinstance(name, str):
-        return _invalid_input("addressee_name must be text or null")
-    if details is not None and not isinstance(details, dict):
-        return _invalid_input("addressee_details must be an object or null")
-    if any(value is not None and not isinstance(value, str)
-           for value in (quote_date, validity)):
-        return _invalid_input("quote_date and offer_validity_to must be ISO dates or null")
-    return _quote_workflow_rpc("issue_quote_revision", {
+    channel = data.get("channel")
+    shared_on = data.get("shared_on")
+    external_reference = data.get("external_reference")
+    if not isinstance(channel, str) or channel.strip() not in _SHARE_CHANNELS:
+        return _invalid_input("channel must be one of: " + ", ".join(_SHARE_CHANNELS))
+    if not isinstance(shared_on, str):
+        return _invalid_input("shared_on must be an ISO date")
+    try:
+        parsed_date = date.fromisoformat(shared_on)
+    except ValueError:
+        return _invalid_input("shared_on must be an ISO date")
+    if not isinstance(external_reference, (str, type(None))):
+        return _invalid_input("external_reference must be text or blank")
+    reference = external_reference.strip() if isinstance(external_reference, str) else None
+    if reference and len(reference) > 200:
+        return _invalid_input("external_reference must be 200 characters or fewer")
+    return _quote_workflow_rpc("share_quote_revision", {
         "p_revision": revision_id,
-        "p_addressee_name": name.strip() if isinstance(name, str) else None,
-        "p_addressee_details": details,
-        "p_quote_date": quote_date or None,
-        "p_offer_validity_to": validity or None,
+        "p_channel": channel.strip(),
+        "p_shared_on": parsed_date.isoformat(),
+        "p_external_reference": reference or None,
     })
 
 
@@ -5497,6 +6159,60 @@ def create_quote_revision_route(revision_id):
         "create_quote_revision", {"p_source_revision": revision_id}, scalar=True, status=201)
 
 
+_CUSTOMER_OUTCOMES = ("awaiting_response", "accepted", "rejected", "expired")
+
+
+@app.route("/quotes/revisions/<int:revision_id>/outcome", methods=["POST"])
+@require_auth
+def record_customer_outcome_route(revision_id):
+    """S5 Slice C: append a customer-response event to an issued revision.
+
+    Append-only by construction: this route never updates or deletes an
+    earlier event, and it accepts no override of actor or timestamp - both
+    are database-derived inside the RPC.
+    """
+    data = request.get_json(silent=True) or {}
+    outcome = data.get("outcome")
+    if not isinstance(outcome, str) or outcome.strip() not in _CUSTOMER_OUTCOMES:
+        return _invalid_input("outcome must be one of: " + ", ".join(_CUSTOMER_OUTCOMES))
+    outcome = outcome.strip()
+
+    acceptance_date = data.get("acceptance_date")
+    parsed_acceptance_date = None
+    if acceptance_date not in (None, ""):
+        if not isinstance(acceptance_date, str):
+            return _invalid_input("acceptance_date must be an ISO date")
+        try:
+            parsed_acceptance_date = date.fromisoformat(acceptance_date)
+        except ValueError:
+            return _invalid_input("acceptance_date must be an ISO date")
+
+    acceptance_reference = data.get("acceptance_reference")
+    if not isinstance(acceptance_reference, (str, type(None))):
+        return _invalid_input("acceptance_reference must be text or blank")
+    reference = acceptance_reference.strip() if isinstance(acceptance_reference, str) else None
+    if reference and len(reference) > 200:
+        return _invalid_input("acceptance_reference must be 200 characters or fewer")
+
+    note = data.get("note")
+    if not isinstance(note, (str, type(None))):
+        return _invalid_input("note must be text or blank")
+    note_value = note.strip() if isinstance(note, str) else None
+    if note_value and len(note_value) > 2000:
+        return _invalid_input("note must be 2000 characters or fewer")
+
+    if outcome != "accepted" and (parsed_acceptance_date is not None or reference):
+        return _invalid_input("acceptance_date and acceptance_reference apply only to accepted")
+
+    return _quote_workflow_rpc("record_customer_outcome", {
+        "p_revision": revision_id,
+        "p_outcome": outcome,
+        "p_acceptance_date": parsed_acceptance_date.isoformat() if parsed_acceptance_date else None,
+        "p_acceptance_reference": reference or None,
+        "p_note": note_value or None,
+    }, scalar=True, status=201)
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # The governed Quote export — the master workbook for an APPROVED Quote
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -5504,7 +6220,7 @@ def create_quote_revision_route(revision_id):
 _PP_ROW_TYPES = ("Plate", "Part-L", "Part-W")
 
 
-def _spec_from_snapshot(snapshot, row):
+def _spec_from_snapshot(snapshot):
     """Rebuild one export row from FROZEN evidence only.
 
     Every number comes from the snapshot the Calculate produced: `entered` holds
@@ -5517,6 +6233,7 @@ def _spec_from_snapshot(snapshot, row):
     inputs   = snapshot.get("effective_inputs") or {}
     entered  = inputs.get("entered") or {}
     resolved = inputs.get("resolved") or {}
+    provenance = inputs.get("provenance") or {}
     add_ons  = entered.get("add_ons") or {}
 
     def value_of(key):
@@ -5528,12 +6245,12 @@ def _spec_from_snapshot(snapshot, row):
         layer = (entered.get("layers") or {}).get(key) or {}
         layers[key] = {"code": layer.get("code") or "", "gsm": layer.get("gsm") or ""}
 
-    row_type = (row or {}).get("row_type") or "Box"
+    row_type = provenance.get("row_type") or "Box"
     is_pp = row_type in _PP_ROW_TYPES
     waste, conv = value_of("waste"), value_of("conv")
     spec = {
         "rowType": row_type,
-        "material_code": (row or {}).get("material_code") or "",
+        "material_code": entered.get("material_code") or "",
         "product": entered.get("item_name") or "",
         "L": entered.get("length_mm"), "W": entered.get("width_mm"), "H": entered.get("height_mm"),
         "ply": entered.get("ply"), "ups": entered.get("ups"), "boxType": entered.get("box_type"),
@@ -5649,16 +6366,18 @@ def export_quote_revision_route(revision_id):
             "only an approved or issued Quote revision can be exported; this one is "
             + str(revision.get("workflow_status")))
 
+    recipient_name = revision.get("addressee_name")
+    recipient_details = revision.get("addressee_details") or {}
+    if (not isinstance(recipient_name, str) or not recipient_name.strip()
+            or recipient_details.get("identity_authority") != "batches.customer_party_id"
+            or recipient_details.get("party_id") is None):
+        return _invalid_input(
+            "exact recipient identity is unavailable for this legacy Quote revision; "
+            "it cannot be presented as the selected Customer")
+
     items, snapshots_missing = [], 0
     batch = quote.get("batch") or {}
-    rows_by_lineage = {}
-    if batch.get("id") is not None:
-        rows, _denied = _optional_caller_rows(client.table("batch_rows").select(
-            "lineage_id, material_code, row_type").eq("batch_id", batch["id"]))
-        rows_by_lineage = {str(row.get("lineage_id")): row for row in rows}
-
     release_id = freight_set_version_id = None
-    customer_family = batch.get("customer_family") or {}
     for item in revision.get("items") or []:
         snapshot = item.get("calculation_snapshot")
         if not snapshot:
@@ -5666,10 +6385,11 @@ def export_quote_revision_route(revision_id):
             continue
         release_id = release_id or snapshot.get("pricing_basis_release_id")
         freight_set_version_id = freight_set_version_id or snapshot.get("freight_set_version_id")
-        spec = _spec_from_snapshot(
-            snapshot, rows_by_lineage.get(str(item.get("batch_row_lineage_id"))))
-        spec.setdefault("client", customer_family.get("name") or "")
-        spec.setdefault("plant", (batch.get("plant") or {}).get("name") or "")
+        spec = _spec_from_snapshot(snapshot)
+        spec.setdefault("client", recipient_name.strip())
+        # A current Batch or Plant-master name is not frozen document evidence.
+        # Older snapshots without a frozen producing-plant label stay blank.
+        spec.setdefault("plant", "")
         items.append({"spec": spec})
     if snapshots_missing:
         # Partial evidence cannot become a customer document: a workbook missing
@@ -6016,6 +6736,215 @@ def set_batch_pricing_basis_route(batch_id):
     if batch is None:
         return _error("RECORD_NOT_FOUND")
     return jsonify({"batch": batch, "mutation": "set_batch_pricing_basis"})
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ROUTES: /masters/sectors  — U5 governed Sector master.
+#
+# Before U5 no propose/approve path for Sectors existed anywhere: the nineteen
+# live Sectors arrived only through the Wave B seed migration, while the
+# Commercial Policies screen edited an unrelated browser-local list that no
+# other screen read. That is what made a Sector added in Commercial Policies
+# invisible to the Customer Families dropdown.
+#
+# Read gate matches the RLS predicate on `sectors` exactly: read_party_master
+# OR read_construction_library. As with /masters/customer-families, the route
+# checks it explicitly from `g.caller` rather than relying on RLS alone, so a
+# genuine denial is a 403 and never an empty "no sectors exist" list.
+#
+# Every mutation is a thin forwarder to a governed `public.*` invoker wrapper.
+# Authority, the draft -> approved transition and CDM-31 immutability are all
+# decided in the database; nothing here re-implements them.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_SECTOR_READ_CAPS = ("read_party_master", "read_construction_library")
+
+
+def _sector_commercials(data):
+    """Validate the six commercial values one Sector version carries."""
+    waste_cbb, err = _optional_nonnegative_numeric(data, "waste_cbb_pct", "99.999")
+    if err:
+        return None, err
+    waste_pp, err = _optional_nonnegative_numeric(data, "waste_pp_pct", "99.999")
+    if err:
+        return None, err
+    conv_box, err = _optional_nonnegative_numeric(data, "conv_box_rate", "99999999.9999")
+    if err:
+        return None, err
+    conv_pp, err = _optional_nonnegative_numeric(data, "conv_pp_rate", "99999999.9999")
+    if err:
+        return None, err
+
+    # margin_pct is NOT NULL by the Sector Margin ruling: a default target
+    # margin is a property every Sector maintains, so blank is not a state.
+    margin, err = _optional_nonnegative_numeric(data, "margin_pct", "99.999")
+    if err:
+        return None, err
+    if margin is None:
+        return None, _invalid_input("margin_pct is required for every Sector")
+
+    spec_lang_value = data.get("spec_lang")
+    if spec_lang_value is not None and not isinstance(spec_lang_value, str):
+        return None, _invalid_input("spec_lang must be text or blank")
+    spec_lang = (spec_lang_value or "").strip()
+    if len(spec_lang) > 60:
+        return None, _invalid_input("spec_lang must be 60 characters or fewer")
+
+    return {
+        "p_waste_cbb": waste_cbb,
+        "p_waste_pp": waste_pp,
+        "p_conv_box": conv_box,
+        "p_conv_pp": conv_pp,
+        "p_margin": margin,
+        "p_spec_lang": spec_lang or None,
+    }, None
+
+
+@app.route("/masters/sectors", methods=["GET"])
+@require_auth
+def list_sectors():
+    """Sectors with their approved commercial version, read as the caller."""
+    caps = g.caller.get("group_capabilities") or []
+    if not any(cap in caps for cap in _SECTOR_READ_CAPS):
+        return jsonify({
+            "error": "read_party_master or read_construction_library capability is required"
+        }), 403
+
+    client = get_supabase_for_caller(g.access_token)
+    try:
+        sectors = (client.table("sectors")
+                   .select("id, sector_code, name, status").execute()).data or []
+        versions = (client.table("sector_versions").select(
+            "id, sector_id, version_no, waste_cbb_pct, waste_pp_pct, conv_box_rate, "
+            "conv_pp_rate, margin_pct, spec_lang, status, approved_at").execute()).data or []
+    except Exception as exc:
+        if _is_upstream_timeout(exc):
+            app.logger.error("sector master read timed out upstream: %s", exc)
+            return _error("UPSTREAM_TIMEOUT")
+        raise
+
+    by_sector = {}
+    for version in versions:
+        by_sector.setdefault(version["sector_id"], []).append(version)
+
+    rows = []
+    for sector in sectors:
+        mine = sorted(by_sector.get(sector["id"], []),
+                      key=lambda v: v.get("version_no") or 0)
+        approved = next(
+            (v for v in reversed(mine) if v.get("status") == "approved"), None)
+        rows.append({**sector, "version": approved, "versions": mine})
+    rows.sort(key=lambda r: r.get("sector_code") or "")
+
+    return jsonify({"sectors": rows, "mutations": "governed"})
+
+
+@app.route("/masters/sectors", methods=["POST"])
+@require_auth
+def propose_sector():
+    """Propose a Sector and approve its first version in one governed step."""
+    data = request.get_json(force=True) or {}
+    code = (data.get("sector_code") or "").strip().upper()
+    name = (data.get("name") or "").strip()
+    if not code:
+        return _invalid_input("sector_code is required")
+    if len(code) > 40:
+        return _invalid_input("sector_code must be 40 characters or fewer")
+    if not name:
+        return _invalid_input("name is required")
+    if len(name) > 120:
+        return _invalid_input("name must be 120 characters or fewer")
+
+    commercials, err = _sector_commercials(data)
+    if err:
+        return err
+
+    result, err = _rpc_call(
+        get_supabase_for_caller(g.access_token),
+        "propose_sector",
+        {"p_code": code, "p_name": name, **commercials},
+        # A duplicate code is a uniqueness refusal, not a missing record.
+        error_map={"23505": "TRANSITION_NOT_ALLOWED"})
+    if err:
+        return err
+    return jsonify({"id": result.data}), 201
+
+
+@app.route("/masters/sectors/<int:sector_id>/commercials", methods=["POST"])
+@require_auth
+def revise_sector_commercials(sector_id):
+    """
+    Record a new approved version of one Sector's commercial values.
+
+    An approved version is immutable (CDM-31), so this never updates the
+    version the caller read - it supersedes it with a new one. The whole row
+    moves at once; `expected_version_no` is the CAS on what the caller saw.
+    """
+    data = request.get_json(force=True) or {}
+    expected = _int_field(data, "expected_version_no")
+    if expected is None or expected < 1:
+        return _invalid_input("expected_version_no is required")
+
+    commercials, err = _sector_commercials(data)
+    if err:
+        return err
+
+    result, err = _rpc_call(
+        get_supabase_for_caller(g.access_token),
+        "revise_sector_commercials",
+        {"p_sector": sector_id, "p_expected_version_no": expected, **commercials})
+    if err:
+        return err
+    return jsonify({"version_no": result.data})
+
+
+@app.route("/masters/sectors/<int:sector_id>", methods=["PATCH"])
+@require_auth
+def rename_sector(sector_id):
+    """
+    Rename a Sector's display name.
+
+    The CODE is deliberately not editable: Costing resolves a Sector by
+    `spec.sector -> sectors.sector_code`, so changing it would orphan every
+    reference at once. A wrong code is a new Sector plus deactivation of the
+    old one.
+    """
+    data = request.get_json(force=True) or {}
+    name = (data.get("name") or "").strip()
+    if not name:
+        return _invalid_input("name is required")
+    if len(name) > 120:
+        return _invalid_input("name must be 120 characters or fewer")
+
+    _, err = _rpc_call(
+        get_supabase_for_caller(g.access_token),
+        "rename_sector", {"p_sector": sector_id, "p_name": name})
+    if err:
+        return err
+    return jsonify({"ok": True})
+
+
+@app.route("/masters/sectors/<int:sector_id>/status", methods=["POST"])
+@require_auth
+def set_sector_status(sector_id):
+    """
+    Activate or deactivate a Sector.
+
+    No Family D table has a DELETE policy (CDM-31), so there is no delete to
+    offer here. Deactivation is refused by the database while any live
+    Customer Family is still classified by that Sector.
+    """
+    data = request.get_json(force=True) or {}
+    status = (data.get("status") or "").strip()
+    if status not in ("active", "inactive"):
+        return _invalid_input("status must be active or inactive")
+
+    _, err = _rpc_call(
+        get_supabase_for_caller(g.access_token),
+        "set_sector_status", {"p_sector": sector_id, "p_status": status})
+    if err:
+        return err
+    return jsonify({"ok": True})
 
 
 @app.route("/masters/customer-families", methods=["POST"])

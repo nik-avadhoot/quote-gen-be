@@ -75,6 +75,10 @@ class FakeQuery:
         self.in_filters.append((column, set(values)))
         return self
 
+    def lt(self, column, value):
+        self.filters.append((f"{column}__lt", value))
+        return self
+
     def limit(self, maximum):
         self.maximum = maximum
         return self
@@ -89,7 +93,10 @@ class FakeQuery:
         CALLS.append((self.token, self.table, tuple(self.filters), tuple(self.in_filters)))
         rows = list(ROWS.get(self.table, []))
         for column, value in self.filters:
-            rows = [row for row in rows if str(row.get(column)) == str(value)]
+            if column.endswith("__lt"):
+                rows = [row for row in rows if row.get(column[:-4], 0) < value]
+            else:
+                rows = [row for row in rows if str(row.get(column)) == str(value)]
         for column, values in self.in_filters:
             rows = [row for row in rows if row.get(column) in values]
         if self.ordering:
@@ -195,6 +202,28 @@ with app.test_client() as client:
 bounded = response.get_json()["catalogue"]
 check(response.status_code == 200 and len(bounded["rows"]) == 50 and bounded["results_limited"] is True,
       "U4-CAT-BE-11 a 51st visible Batch proves the 50-row catalogue is incomplete")
+check(bounded["next_cursor"] == 2 and bounded["scope"] == "open",
+      "ACTIVE-1 the open-work page exposes an older-work cursor")
+with app.test_client() as client:
+    response = client.get("/batches/catalogue?before_id=2", headers=AUTH)
+check(response.status_code == 200 and [row["id"] for row in response.get_json()["catalogue"]["rows"]] == [1],
+      "ACTIVE-2 an older open Batch is reachable through server-side pagination")
+ROWS["batches"] = original_batches
+
+ROWS["batches"] = original_batches + [
+    {**original_batches[0], "id": 100, "status": "issued_locked"},
+    {**original_batches[0], "id": 101, "status": "abandoned"},
+    {**original_batches[0], "id": 102, "status": "archived"},
+    {**original_batches[0], "id": 103, "status": "approved"},
+]
+with app.test_client() as client:
+    response = client.get("/batches/catalogue", headers=AUTH)
+check(response.status_code == 200 and [row["id"] for row in response.get_json()["catalogue"]["rows"]] == [103, 72, 71],
+      "ACTIVE-3 active work includes approved-awaiting-issue but excludes terminal records before limit")
+with app.test_client() as client:
+    response = client.get("/batches/catalogue?scope=closed", headers=AUTH)
+check(response.status_code == 200 and [row["id"] for row in response.get_json()["catalogue"]["rows"]] == [102, 101, 100],
+      "ACTIVE-4 issued, abandoned and archived Batches are separate from active work")
 ROWS["batches"] = original_batches
 
 ROWS["batches"] = []

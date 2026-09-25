@@ -37,7 +37,7 @@ check(checker_actions["approve"]["enabled"] and checker_actions["return"]["enabl
 
 approved = {**batch, "status": "approved"}
 maker_actions = quote_revision_actions(maker, approved, {"workflow_status": "approved"})
-check(maker_actions["issue"]["enabled"] and maker_actions["withdraw"]["enabled"],
+check(maker_actions["share"]["enabled"] and maker_actions["withdraw"]["enabled"],
       "WD-5 owner Maker gets mounted eligible Issue and Withdraw")
 check(not maker_actions["amend"]["enabled"] and not maker_actions["reprice"]["enabled"]
       and maker_actions["amend"]["reason"] == "not_available_in_limited_beta",

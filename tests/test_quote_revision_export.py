@@ -35,7 +35,7 @@ SNAPSHOT = {
     "freight_set_version_id": 11,
     "effective_inputs": {
         "entered": {
-            "length_mm": 675, "width_mm": 450, "height_mm": 282, "ply": 5, "ups": 2,
+            "material_code": "36512", "length_mm": 675, "width_mm": 450, "height_mm": 282, "ply": 5, "ups": 2,
             "box_type": "RSC", "flute_f1": "B", "flute_f2": "C", "item_name": "DTY 5PLY 36512",
             "layers": {
                 "TOP": {"code": "35GY", "gsm": 170}, "F1": {"code": "16", "gsm": 120},
@@ -45,6 +45,7 @@ SNAPSHOT = {
             "add_ons": {"printing": 2.5, "stitching": 0, "coating": 0, "handling": 0,
                         "moq_charge": 0, "packing": 0, "other": 0, "unloading": 0},
         },
+        "provenance": {"row_type": "Box"},
         "resolved": {
             "waste": {"value": 5}, "conv": {"value": 7}, "margin": {"value": 8},
             "interest": {"value": 1.0}, "freight": {"value": 1.25},
@@ -54,16 +55,24 @@ SNAPSHOT = {
 
 QUOTE = {
     "quote_reference": "NAG/QUO/2026-27/00007",
-    "batch": {"id": 501, "plant": {"name": "Nagpur"}, "customer_family": {"name": "Indo Rama"}},
+    "batch": {"id": 501, "plant": {"name": "Nagpur"},
+              "customer_family": {"name": "Renamed Family After Send"}},
     "revisions": [{
         "id": 91, "workflow_status": "approved", "quote_date": "2026-09-22",
         "offer_validity_to": "2026-10-22",
+        "addressee_name": "Indo Rama Synthetics (India) Limited",
+        "addressee_details": {"identity_authority": "batches.customer_party_id",
+                              "identity_version": 1, "party_id": 7001,
+                              "customer_code": "CUST-7001", "lifecycle_state": "customer",
+                              "status_at_send": "active"},
         "approved_by_actor": {"display_name": "Snehal"},
         "items": [{"batch_row_lineage_id": 4001, "calculation_snapshot": SNAPSHOT}],
     }],
 }
 
 TABLE_ROWS = {
+    # Current master data has changed since Send. Official export must not read it.
+    "parties": [{"id": 7001, "display_name": "Current renamed Party master"}],
     "batch_rows": [{"lineage_id": 4001, "material_code": "36512", "row_type": "Box"}],
     "pricing_basis_releases": [{"id": 7, "rate_set_version_id": 21, "freight_set_version_id": 11}],
     "rate_entries": [
@@ -138,8 +147,11 @@ if workbook:
     cbb, rm = workbook["CBB+PP"], workbook["RATE MASTER"]
     check(cbb["D4"].value and "NAG/QUO/2026-27/00007" in str(cbb["D4"].value),
           "QE-2 the permanent Quote reference reaches the sheet")
-    check(cbb["D2"].value == "Indo Rama" and cbb["B3"].value == "Nagpur",
-          "QE-3 customer and producing plant come from the Batch, not from a typed field")
+    check(cbb["D2"].value == "Indo Rama Synthetics (India) Limited"
+          and cbb["D2"].value != QUOTE["batch"]["customer_family"]["name"]
+          and cbb["D2"].value != TABLE_ROWS["parties"][0]["display_name"]
+          and not cbb["B3"].value,
+          "QE-3 workbook uses the exact recipient frozen at Send and never substitutes a current Party, Family or Plant master value")
     check(cbb["C7"].value == "36512" and cbb["B7"].value == "Box",
           "QE-4 the row carries its material code and row type")
     check(cbb["F7"].value == 675 and cbb["G7"].value == 450 and cbb["H7"].value == 282,
@@ -178,6 +190,16 @@ check(isinstance(refused, tuple) and refused[1] == 400,
 refused = run(stub_rows={"rate_entries": []})
 check(isinstance(refused, tuple) and refused[1] == 400,
       "QE-13 an unreadable frozen Rate Set refuses rather than exporting rate-less rows")
+
+legacy_quote = {
+    **QUOTE,
+    "revisions": [{**QUOTE["revisions"][0], "addressee_name": None, "addressee_details": None}],
+}
+refused = run(quote=legacy_quote)
+body = refused[0].get_json() if isinstance(refused, tuple) else refused.get_json()
+check(isinstance(refused, tuple) and refused[1] == 400
+      and "exact recipient identity is unavailable" in (body.get("error") or ""),
+      "QE-14 legacy revision without a frozen recipient is explicit and cannot claim exact Customer identity")
 
 print(f"\n{PASSES} passed, {len(FAILURES)} failed")
 if FAILURES:
