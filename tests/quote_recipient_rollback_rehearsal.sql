@@ -1,7 +1,9 @@
 -- ═════ EXACT-RECIPIENT REHEARSAL: always ends in RAISE, so everything rolls back ═════
 --
 -- Rehearses, in ONE transaction that aborts itself, the single atomic migration
---   supabase/migrations/20260923170000_quote_revision_exact_recipient.sql
+--   supabase/migrations/20260925085415_quote_revision_exact_recipient.sql
+--   (applied on main 2026-09-25; the connector assigned this version, not the
+--   original file's 20260923170000)
 -- against the database's ACTUAL current definitions, then runs the governed
 -- S7-R/S9(b)/S9(c)/S9R suite (tests.calculation_writer) on top of it.
 --
@@ -190,7 +192,7 @@ begin
 end $drift$;
 
 -- ═════ THE MIGRATION UNDER REHEARSAL, exactly as it would ship ═════
-\ir ../supabase/migrations/20260923170000_quote_revision_exact_recipient.sql
+\ir ../supabase/migrations/20260925085415_quote_revision_exact_recipient.sql
 
 -- ═════ TAIL: structure, privileges, the governed suite, residue, then RAISE ═════
 do $rehearse$

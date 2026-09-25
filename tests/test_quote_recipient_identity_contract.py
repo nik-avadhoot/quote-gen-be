@@ -4,7 +4,7 @@ import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 SQL = (ROOT / "supabase" / "migrations" /
-       "20260923170000_quote_revision_exact_recipient.sql").read_text(encoding="utf-8")
+       "20260925085415_quote_revision_exact_recipient.sql").read_text(encoding="utf-8")
 PASSES, FAILURES = 0, []
 
 

@@ -1,6 +1,8 @@
 """Source contract for the exact-recipient gates splices.
 
-Simulates, in Python, the splices the consolidated 20260923170000 migration
+Simulates, in Python, the splices the consolidated 20260925085415 migration
+(applied on main 2026-09-25 as the connector-assigned version of the file
+originally checked in as 20260923170000_quote_revision_exact_recipient.sql)
 makes into the stored
 tests.__s9b_gates / tests.__s9c_gates definitions, using the repository source
 of those functions. It proves every anchor matches exactly once against the
@@ -13,7 +15,7 @@ import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 MIG = ROOT / "supabase" / "migrations"
-GATES = (MIG / "20260923170000_quote_revision_exact_recipient.sql").read_text(encoding="utf-8")
+GATES = (MIG / "20260925085415_quote_revision_exact_recipient.sql").read_text(encoding="utf-8")
 S9B = (MIG / "20260911081000_s9b_atomic_send_gates.sql").read_text(encoding="utf-8")
 S9C = (MIG / "20260911091000_s9c_quote_workflow_gates.sql").read_text(encoding="utf-8")
 REHEARSAL = (ROOT / "tests" / "quote_recipient_rollback_rehearsal.sql").read_text(encoding="utf-8")
@@ -79,7 +81,7 @@ numbers = sorted({int(label.split("-")[1]) for label in labels})
 check(numbers == list(range(1, 17)) and "v_s9 <> 76" in REHEARSAL,
       "S9R-SPLICE-4 S9R-1..16 are contiguous and the rehearsal expects 29 + 31 + 16 passing S9 assertions")
 check("qos.rehearsal_target" in REHEARSAL and "raise exception 'REHEARSAL ROLLED BACK" in REHEARSAL
-      and "\\ir ../supabase/migrations/20260923170000_quote_revision_exact_recipient.sql" in REHEARSAL
+      and "\\ir ../supabase/migrations/20260925085415_quote_revision_exact_recipient.sql" in REHEARSAL
       and sum(line.startswith("\\ir ") for line in REHEARSAL.splitlines()) == 1 and "PRE-7 " in REHEARSAL
       and "if exists (select 1 from app_private.attestation_keys)" in REHEARSAL
       and "setval(" in REHEARSAL,

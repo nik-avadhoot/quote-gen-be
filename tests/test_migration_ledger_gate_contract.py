@@ -25,7 +25,7 @@ MIG = ROOT / "supabase" / "migrations"
 PREFLIGHT_PATH = ROOT / "tests" / "quote_recipient_activation_preflight.sql"
 BEGIN = "-- BEGIN LOCAL MANIFEST"
 END = "-- END LOCAL MANIFEST"
-RECIPIENT = "20260923170000_quote_revision_exact_recipient.sql"
+RECIPIENT = "20260925085415_quote_revision_exact_recipient.sql"  # connector-assigned version (applied 2026-09-25)
 RECIPIENT_MD5 = "6f1840003862b1a5e77a34c2829b1ec7"
 BETA_SEED = "20260922085000_beta_seed_indorama_36512_construction_and_sku.sql"
 BETA_SEED_MD5 = "165c924db17970e40abd97f2e03f3f26"  # md5(statements[1]) on main, read 2026-09-24
@@ -103,7 +103,7 @@ check(seed.exists() and hashlib.md5(seed.read_bytes().replace(b"\r\n", b"\n")).h
       "LEDGER-3 the recovered beta seed (LF-normalised) is byte-identical to its immutable live statement")
 rec = MIG / RECIPIENT
 check(rec.exists() and hashlib.md5(rec.read_bytes().replace(b"\r\n", b"\n")).hexdigest() == RECIPIENT_MD5
-      and ("20260923170000", "quote_revision_exact_recipient", fingerprint(rec.read_text(encoding="utf-8"))) in ROWS,
+      and ("20260925085415", "quote_revision_exact_recipient", fingerprint(rec.read_text(encoding="utf-8"))) in ROWS,
       "LEDGER-4 the reviewed exact-recipient file is unchanged and present in the manifest")
 drift_sql = dict((v, (lf, mf)) for v, lf, mf in re.findall(r"\('(\d{14})', '([0-9a-f]{16})', '([0-9a-f]{16})'\)",
                                                           GATE.split("known_drift(")[1].split("),\nempty_history")[0]))

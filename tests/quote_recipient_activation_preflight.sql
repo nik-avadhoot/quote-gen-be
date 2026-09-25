@@ -12,8 +12,8 @@
 --   * db_push_ok: a CLI `supabase db push` from this checkout would apply ONLY
 --     this file, in order. It needs every live version present locally AND no
 --     unapplied local file sorting behind the live head AND this file as the only
---     unapplied one. As of 2026-09-24 it is FALSE: 20260923150000, 20260923183000
---     and 20260924044157 (Customer Pricing History, another workstream) and this
+--     unapplied one. As of 2026-09-24 it is FALSE: 20260924164751, 20260924164806
+--     and 20260924164820 (Customer Pricing History, another workstream) and this
 --     file all sort behind 20260924084505, so push refuses without --include-all,
 --     and --include-all would also apply the CPH migrations.
 --   * fresh_replay: replaying supabase/migrations onto an empty database
@@ -320,12 +320,15 @@ with manifest(version, name, fp) as (values
   ('20260922145032', 'repair_run_all_catalogue_suite_projection', '14e6816c5e89be04'),
   ('20260922150221', 'fix_u5_sector_definer_execute_grants', '4c869afb89f04697'),
   ('20260923132556', 'batch_customer_handoff', '24f5c4b5ee2c3a75'),
-  ('20260923150000', 'customer_pricing_history_p0_1', '4c1ff76518b59a1e'),
-  ('20260923170000', 'quote_revision_exact_recipient', '8dd114aa28997996'),
-  ('20260923183000', 'customer_pricing_history_p0_2', 'b57de833e05e9cfb'),
-  ('20260924044157', 'customer_pricing_history_p0_4', 'e1214ca8b8a7d407'),
   ('20260924084505', 'u4_stored_suite_sector_drift', '038828a8c01f70a4'),
-  ('20260924100057', 'customer_pricing_history_p0_4_1_sob_allocated_boxes', '867c7cd26b59acde')
+  ('20260924164751', 'customer_pricing_history_p0_1', '4c1ff76518b59a1e'),
+  ('20260924164806', 'customer_pricing_history_p0_2', 'b57de833e05e9cfb'),
+  ('20260924164820', 'customer_pricing_history_p0_4', 'e1214ca8b8a7d407'),
+  ('20260924164835', 'customer_pricing_history_p0_4_1_sob_allocated_boxes', '867c7cd26b59acde'),
+  ('20260924164850', 'customer_pricing_history_p0_5_void_round', '9e39bed02da69b1f'),
+  ('20260925085415', 'quote_revision_exact_recipient', '8dd114aa28997996'),
+  ('20260925090039', 'quote_revision_share_evidence', '6dab7bf0d9798958'),
+  ('20260925090204', 's5_record_customer_outcome', '3c0a164db64a7a7a')
 -- END LOCAL MANIFEST
 ),
 known_drift(version, live_fp, local_fp) as (values
