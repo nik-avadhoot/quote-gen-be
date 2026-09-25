@@ -3,19 +3,24 @@
 -- Rehearses, in ONE transaction that aborts itself, the full unapplied
 -- simplification dependency chain, in real order, against the database's
 -- ACTUAL current definitions - not an assumed prior state:
---   supabase/migrations/20260923170000_quote_revision_exact_recipient.sql
---   supabase/migrations/20260924173944_quote_revision_share_evidence.sql
---   supabase/migrations/20260925090000_s5_record_customer_outcome.sql
+--   supabase/migrations/20260925085415_quote_revision_exact_recipient.sql
+--   supabase/migrations/20260925090039_quote_revision_share_evidence.sql
+--   supabase/migrations/20260925090204_s5_record_customer_outcome.sql
+-- (filenames are the connector-assigned live versions; the checked-in files
+-- were originally 20260923170000/20260924173944/20260925090000)
 -- then exercises the two NEW S5 functions
 -- (app_private.record_customer_outcome, app_private.resolve_batch_prior_quote)
 -- under genuine caller identities via set_config('request.jwt.claims', ...)
 -- + set local role authenticated, the same persona-simulation convention
 -- already used by tests/cph_p0_5_qualification_rehearsal.sql.
 --
--- STATUS: authored 2026-09-25. Live migration history
--- (supabase_migrations.schema_migrations) was inspected read-only and stops
--- at 20260924164850_customer_pricing_history_p0_5_void_round; nothing after
--- that is applied anywhere.
+-- STATUS: authored 2026-09-25. All three migrations above were permanently
+-- applied to main on 2026-09-25 (connector-assigned versions 20260925085415,
+-- 20260925090039, 20260925090204) after this rehearsal rolled back clean.
+-- Rerunning this file now refuses at PRE-2..PRE-5 by design (each checks
+-- for exactly the schema this rehearsal would otherwise install); that
+-- refusal is the expected, correct outcome and is not itself re-verified
+-- here.
 --
 -- TARGET AND AUTHORIZATION (settled 2026-09-25, explicit Product Owner
 -- instruction in chat). This rehearsal is deliberately run directly against
@@ -202,9 +207,9 @@ begin
 end $capture$;
 
 -- ═════ APPLY: the three migrations, in their real dependency order ═════
-\ir ../supabase/migrations/20260923170000_quote_revision_exact_recipient.sql
-\ir ../supabase/migrations/20260924173944_quote_revision_share_evidence.sql
-\ir ../supabase/migrations/20260925090000_s5_record_customer_outcome.sql
+\ir ../supabase/migrations/20260925085415_quote_revision_exact_recipient.sql
+\ir ../supabase/migrations/20260925090039_quote_revision_share_evidence.sql
+\ir ../supabase/migrations/20260925090204_s5_record_customer_outcome.sql
 
 -- ═════ PERSONA HELPERS (generic; reused verbatim from cph_p0_5's convention) ═════
 create function pg_temp.try(p_role text, p_sub text, p_sql text) returns text

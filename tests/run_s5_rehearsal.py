@@ -32,11 +32,15 @@ STATEMENT_TIMEOUT_MS = 5 * 60 * 1000  # 5 minutes: sufficiently long, not unboun
 LOCK_TIMEOUT_MS = 5 * 1000  # 5 seconds: refuse fast rather than block production traffic
 
 EXPECTED_MIGRATION_HASHES = {
-    "20260923170000_quote_revision_exact_recipient.sql":
+    # Filenames are the connector-assigned live versions (applied 2026-09-25);
+    # the checked-in files were originally 20260923170000/20260924173944/
+    # 20260925090000. Hashes are unchanged - the connector renames nothing
+    # but its own ledger entry, never the file bytes.
+    "20260925085415_quote_revision_exact_recipient.sql":
         "0171812df38bf87e7b56cf1831e7eaf97508b547d308212f012b89e1d14c770a",
-    "20260924173944_quote_revision_share_evidence.sql":
+    "20260925090039_quote_revision_share_evidence.sql":
         "358232073c5406f76326741e6a8b95a054b8886338a8dbadd749703d0c768b48",
-    "20260925090000_s5_record_customer_outcome.sql":
+    "20260925090204_s5_record_customer_outcome.sql":
         "515fc60d630af8ea7c484ea890628ab5d6c9a98faec8474d55e461f6583450d9",
 }
 
@@ -105,9 +109,9 @@ def expand_rehearsal(verified_migrations):
         raise SystemExit(f"rehearsal file missing: {REHEARSAL_PATH}")
     text = REHEARSAL_PATH.read_text(encoding="utf-8")
     order = [
-        "20260923170000_quote_revision_exact_recipient.sql",
-        "20260924173944_quote_revision_share_evidence.sql",
-        "20260925090000_s5_record_customer_outcome.sql",
+        "20260925085415_quote_revision_exact_recipient.sql",
+        "20260925090039_quote_revision_share_evidence.sql",
+        "20260925090204_s5_record_customer_outcome.sql",
     ]
     out_lines = []
     substituted = 0
